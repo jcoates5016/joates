@@ -1,0 +1,839 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APEX Edge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#070a10; --bg2:#0c1119; --card:#111826; --card2:#161f30; --border:#233047; --border2:#2c3b56;
+    --text:#eef2fb; --dim:#8b98b3; --dim2:#5b6784;
+    --mint:#2be3b8; --mint-dim:rgba(43,227,184,.14);
+    --amber:#ffb454; --amber-dim:rgba(255,180,84,.13);
+    --red:#ff6b6b; --red-dim:rgba(255,107,107,.13);
+    --blue:#6ea8ff; --blue-dim:rgba(110,168,255,.13);
+    --radius:14px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{background:radial-gradient(1200px 800px at 10% -10%, #0e1524 0%, var(--bg) 55%);color:var(--text);
+    font:15px/1.55 "Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;}
+  .odds,.mono{font-family:"JetBrains Mono",monospace;}
+  .app{max-width:1180px;margin:0 auto;padding:0 20px 60px;}
+
+  /* header */
+  header{padding:28px 0 18px;display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;border-bottom:1px solid var(--border);}
+  .brand{display:flex;align-items:center;gap:10px;}
+  .brand .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--mint),#1aa889);display:flex;align-items:center;justify-content:center;font-weight:800;color:#04120e;font-size:16px;flex:none;}
+  .brand h1{margin:0;font-size:21px;font-weight:800;letter-spacing:-.01em;}
+  .brand h1 span{color:var(--dim);font-weight:600;}
+  .tagline{color:var(--dim);font-size:12.5px;margin-top:4px;max-width:520px;}
+  .head-right{display:flex;flex-direction:column;align-items:flex-end;gap:8px;}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.02em;}
+  .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;}
+  .badge.fresh{background:var(--mint-dim);color:var(--mint);} .badge.stale{background:var(--amber-dim);color:var(--amber);} .badge.none{background:var(--card2);color:var(--dim);}
+  button.primary{background:linear-gradient(135deg,var(--mint),#1ec9a3);color:#04120e;border:none;border-radius:10px;padding:10px 18px;font-weight:700;font-size:13.5px;cursor:pointer;box-shadow:0 4px 14px rgba(43,227,184,.18);}
+  button.primary:disabled{opacity:.55;cursor:default;box-shadow:none;}
+  button.ghost{background:transparent;border:1px solid var(--border2);color:var(--dim);border-radius:10px;padding:9px 14px;font-size:12.5px;cursor:pointer;}
+  .spinner{display:inline-block;width:11px;height:11px;border:2px solid rgba(4,18,14,.35);border-top-color:#04120e;border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .lastrun{color:var(--dim2);font-size:11.5px;}
+
+  /* nav */
+  nav{display:flex;gap:6px;padding:16px 0;flex-wrap:wrap;}
+  nav button{background:var(--card);border:1px solid var(--border);color:var(--dim);border-radius:10px;padding:9px 15px;font-size:13px;font-weight:600;cursor:pointer;}
+  nav button.active{background:var(--mint-dim);color:var(--mint);border-color:rgba(43,227,184,.35);}
+
+  .view{display:none;} .view.active{display:block;}
+  .status-line{color:var(--dim);font-size:13px;margin-bottom:14px;} .status-line.err{color:var(--amber);}
+
+  /* stat strip */
+  .stats-strip{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;}
+  .stat-pill{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 16px;min-width:100px;}
+  .stat-pill .n{font-size:19px;font-weight:800;} .stat-pill .l{color:var(--dim);font-size:11px;margin-top:1px;}
+
+  /* filters */
+  .filters{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center;}
+  input,select{background:var(--card2);border:1px solid var(--border2);color:var(--text);border-radius:9px;padding:8px 11px;font-size:13px;font-family:inherit;}
+  input:focus,select:focus{outline:none;border-color:var(--mint);}
+  .seg{display:flex;gap:2px;background:var(--card2);border:1px solid var(--border2);border-radius:9px;padding:2px;}
+  .seg button{background:none;border:none;color:var(--dim);padding:6px 12px;font-size:12.5px;border-radius:7px;cursor:pointer;font-weight:600;}
+  .seg button.active{background:var(--mint-dim);color:var(--mint);}
+
+  /* edge cards */
+  .card-list{display:flex;flex-direction:column;gap:12px;}
+  .edge-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;}
+  .edge-card.is-suspect{border-color:rgba(255,107,107,.35);}
+  .ec-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;}
+  .ec-player{font-weight:700;font-size:15.5px;} .ec-sub{color:var(--dim);font-size:12px;display:block;margin-top:1px;}
+  .ec-edge{font-family:"JetBrains Mono",monospace;font-weight:700;font-size:17px;flex:none;}
+  .ec-edge.pos{color:var(--mint);} .ec-edge.neg{color:var(--dim2);} .ec-edge.suspect{color:var(--red);text-decoration:line-through;text-decoration-color:rgba(255,107,107,.5);}
+  .ec-market{color:var(--dim);font-size:12.5px;margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+  .tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:700;letter-spacing:.02em;}
+  .tag-arb{background:var(--amber-dim);color:var(--amber);} .tag-warn{background:var(--red-dim);color:var(--red);}
+  .ec-book{display:flex;align-items:center;gap:12px;margin-top:10px;}
+  .pill{display:inline-block;padding:2px 7px;border-radius:5px;font-size:10.5px;font-weight:700;background:var(--card2);color:var(--dim);}
+  .pill.draftkings{background:var(--blue-dim);color:var(--blue);} .pill.espnbet{background:rgba(255,107,107,.16);color:var(--red);}
+  .pill.fanduel{background:var(--mint-dim);color:var(--mint);} .pill.betmgm{background:var(--amber-dim);color:var(--amber);}
+  .conf-bar{flex:1;max-width:160px;height:6px;background:var(--card2);border-radius:4px;overflow:hidden;}
+  .conf-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--mint),#1aa889);border-radius:4px;}
+  .conf-label{color:var(--dim2);font-size:10.5px;}
+  .ec-reasoning{margin:12px 0 0;font-size:13.5px;line-height:1.6;color:#d7deec;}
+  .ec-ai{margin-top:10px;padding:10px 12px;background:var(--card2);border-radius:9px;font-size:13px;border-left:3px solid var(--blue);}
+  .ec-ai-tag{display:inline-block;background:var(--blue);color:#04101f;font-weight:700;font-size:10px;padding:2px 7px;border-radius:5px;margin-right:7px;text-transform:uppercase;letter-spacing:.02em;}
+  .ec-scout{margin-top:8px;padding:10px 12px;background:rgba(255,180,84,.07);border:1px dashed rgba(255,180,84,.4);border-radius:9px;font-size:12.5px;}
+  .ec-scout .label{color:var(--amber);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.03em;display:block;margin-bottom:4px;}
+  .ec-expand{margin-top:12px;background:none;border:1px solid var(--border2);color:var(--dim);border-radius:7px;padding:5px 10px;font-size:11.5px;cursor:pointer;}
+  .ec-detail{margin-top:12px;padding-top:12px;border-top:1px dashed var(--border);}
+
+  .ec-checklist{margin-top:10px;padding:8px 10px;background:var(--card2);border-radius:8px;font-size:12px;display:flex;flex-wrap:wrap;align-items:center;gap:6px;}
+  .cl-label{color:var(--dim2);font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;margin-right:2px;}
+  .cl-item{display:inline-block;border-radius:6px;padding:2px 7px;font-size:11.5px;font-family:var(--mono,inherit);}
+  .cl-item.cl-hit{background:rgba(43,227,184,.14);color:var(--mint);}
+  .cl-item.cl-miss{background:rgba(255,107,107,.12);color:var(--red);}
+  .cl-tally{margin-left:auto;font-weight:700;color:var(--dim);}
+
+  .ec-shuffle{margin-top:12px;margin-left:8px;background:none;border:1px solid rgba(110,168,255,.4);color:var(--blue);border-radius:7px;padding:5px 10px;font-size:11.5px;cursor:pointer;}
+  .ec-parlay-writeup{margin-top:12px;}
+  .ec-parlay-leg{font-size:13px;line-height:1.55;color:#d7deec;margin:0 0 8px;}
+  .ec-parlay-leg b{color:#fff;}
+
+  .chip{display:inline-block;background:var(--card2);border:1px solid var(--border2);border-radius:20px;padding:3px 10px;font-size:11.5px;color:var(--dim);margin:2px 5px 2px 0;}
+  .chip.hit{border-color:rgba(43,227,184,.4);color:var(--mint);}
+  .chip.warn{color:var(--red);border-color:rgba(255,107,107,.35);}
+  .chip.info{color:var(--blue);border-color:rgba(110,168,255,.35);}
+  .chip-section{margin-top:8px;}
+  .chip-section .heading{color:var(--dim2);font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px;}
+
+  .gamelog-table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:4px;}
+  .gamelog-table th{text-align:left;color:var(--dim2);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;padding:3px 8px 4px 0;border-bottom:1px solid var(--border2);}
+  .gamelog-table td{padding:4px 8px 4px 0;border-bottom:1px solid var(--border);color:var(--dim);}
+  .gamelog-table tr.hit-row td:last-child{color:var(--mint);}
+  .gamelog-table tr.miss-row td:last-child{color:var(--red);}
+
+  .team-ctx{display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;}
+  .team-ctx .col{flex:1;min-width:220px;background:var(--card2);border-radius:9px;padding:11px 13px;}
+  .team-ctx .col h4{margin:0 0 6px;font-size:12.5px;}
+
+  .empty{color:var(--dim);text-align:center;padding:50px 0;font-size:13.5px;}
+
+  textarea{width:100%;min-height:140px;background:var(--card2);border:1px solid var(--border2);color:var(--text);border-radius:10px;padding:12px;font-family:inherit;font-size:13.5px;}
+
+  .setup-block{margin-bottom:20px;}
+  .setup-block .heading{color:var(--mint);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;font-weight:700;}
+  .setup-block .body{color:#c3ccdf;font-size:13px;max-width:780px;}
+  code.kv{background:var(--card2);border:1px solid var(--border2);border-radius:6px;padding:2px 6px;font-size:12px;font-family:"JetBrains Mono",monospace;}
+
+  footer{padding:30px 0 10px;color:var(--dim2);font-size:11.5px;text-align:center;}
+
+  @media (max-width:640px){
+    .team-ctx{flex-direction:column;}
+    .ec-top{flex-direction:column;}
+    .ec-edge{font-size:20px;}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div>
+      <div class="brand"><div class="mark">AE</div><h1>APEX <span>Edge</span></h1></div>
+      <div class="tagline">NFL sharp-line finder — DraftKings &amp; theScore Bet. Totals (Over) game lines and offensive player-prop Overs, graded with a full offense-vs-defense matchup picture and a plain-English case for every edge.</div>
+    </div>
+    <div class="head-right">
+      <span class="badge none" id="modeBadge">Loading</span>
+      <button class="primary" id="refreshBtn">Refresh Now</button>
+      <span class="lastrun" id="lastRun"></span>
+    </div>
+  </header>
+
+  <nav>
+    <button class="active" data-view="edge">Edge Board</button>
+    <button data-view="lines">Game Lines</button>
+    <button data-view="props">Player Props</button>
+    <button data-view="parlays">Parlays</button>
+    <button data-view="notes">Situational Notes</button>
+    <button data-view="setup">Setup</button>
+  </nav>
+
+  <!-- EDGE BOARD -->
+  <section class="view active" id="view-edge">
+    <div class="status-line" id="edgeStatus">Loading the latest snapshot…</div>
+    <div class="stats-strip" id="edgeStats"></div>
+    <div class="filters">
+      <div class="seg" id="edgeKindSeg">
+        <button class="active" data-kind="">All edges</button>
+        <button data-kind="prop">Player props</button>
+        <button data-kind="line">Game totals</button>
+      </div>
+      <input id="edgeSearch" placeholder="Search player, team, matchup…">
+    </div>
+    <div class="card-list" id="edgeList"></div>
+  </section>
+
+  <!-- GAME LINES -->
+  <section class="view" id="view-lines">
+    <div class="stats-strip" id="linesStats"></div>
+    <div class="filters">
+      <input id="lineTeamFilter" placeholder="Filter by team…">
+      <select id="lineSortFilter"><option value="edge">Sort: Edge (best first)</option><option value="arb">Sort: Arb first</option></select>
+    </div>
+    <div class="card-list" id="linesList"></div>
+  </section>
+
+  <!-- PLAYER PROPS -->
+  <section class="view" id="view-props">
+    <div class="stats-strip" id="propsStats"></div>
+    <div class="filters">
+      <input id="propTeamFilter" placeholder="Filter by team or player…">
+      <select id="propTypeFilter"><option value="">All prop types</option></select>
+      <select id="propSortFilter"><option value="mispriced">Sort: Strongest case first</option><option value="edge">Sort: Edge (best first)</option><option value="factors">Sort: Most factors</option></select>
+    </div>
+    <div class="card-list" id="propsList"></div>
+  </section>
+
+  <!-- PARLAYS -->
+  <section class="view" id="view-parlays">
+    <div class="card-list" id="parlaysList"></div>
+  </section>
+
+  <!-- NOTES -->
+  <section class="view" id="view-notes">
+    <div class="status-line">Freeform situational notes (e.g. "Player X had a baby this week"). Applied on the next refresh and folded into the reasoning + AI notes.</div>
+    <textarea id="notesBox" placeholder="One note per line..."></textarea>
+    <div style="margin-top:12px;"><button class="primary" id="saveNotesBtn">Save Notes</button> <span class="lastrun" id="notesStatus"></span></div>
+  </section>
+
+  <!-- SETUP -->
+  <section class="view" id="view-setup">
+    <div class="setup-block">
+      <div class="heading">Scope</div>
+      <div class="body">NFL only. Markets are Totals (Over) game lines and offensive player-prop Overs (passing/rushing/receiving yards &amp; TDs, receptions) — no Moneyline, no Spread, no defensive player props (tackles, sacks, INTs by a defender). That's a market-scope choice, not a data gap: this build fully tracks and scores <b>defensive matchup quality</b> — opponent-vs-position rank, EPA matchup edge, full team defensive stats — it just doesn't offer defensive player props themselves as a bet type.</div>
+    </div>
+    <div class="setup-block">
+      <div class="heading">Every factor this build computes</div>
+      <div class="body">
+        Matchup: EPA matchup edge (this offense vs. that defense), opponent-vs-position rank league-wide, combined offense-vs-offense scoring environment, key-number proximity, line movement, arbitrage, suspect-edge data-quality gate.<br><br>
+        Usage: snap%, target share, aDOT, red-zone share, goal-line share, two-minute-drill share.<br><br>
+        Form: season / last-3 / vs-opponent hit rate.<br><br>
+        Team offense &amp; defense: EPA/play (both sides), success rate (both sides), pressure rate created/allowed, third/fourth-down rate (both sides), red-zone TD rate (both sides), pace, turnovers/game.<br><br>
+        Environment: live weather forecast (wind/precip/temp), historical wet/dry split, dome/outdoor + venue split, altitude flag.<br><br>
+        Schedule: rest days, short week, travel distance, time-zone shift, primetime, neutral-site/international.<br><br>
+        Injury/personnel: self injury status, O-line injury count, practice-participation trend, starter-QB-change detection.<br><br>
+        Referee: real historical over/under tendency, computed from nflverse's own referee + total/total_line fields.<br><br>
+        Speculative-only scouting take (no free in-season data source exists for this — clearly labeled, never scored): coverage-scheme/personnel tendencies, revenge-game and contract-year narrative.
+      </div>
+    </div>
+    <div class="setup-block">
+      <div class="heading">Where the refresh actually runs</div>
+      <div class="body">This site (Netlify) only serves the frontend, reads the latest saved snapshot, and — when you click "Refresh Now" — fires a GitHub Actions workflow. The full pipeline (odds, nflverse + play-by-play, weather, AI) runs on GitHub Actions, every 30 minutes plus on-demand, and saves its result straight to this site's Netlify Blobs store. See the project README for why it's on GitHub Actions rather than a Netlify Background Function (those require a paid Netlify Pro plan; GitHub Actions doesn't).</div>
+    </div>
+    <div class="setup-block">
+      <div class="heading">Environment variables (Netlify site)</div>
+      <div class="body"><code class="kv">GH_PAT</code> <code class="kv">GH_OWNER</code> <code class="kv">GH_REPO</code> <code class="kv">GH_WORKFLOW_FILE</code> (optional, default refresh.yml) <code class="kv">GH_BRANCH</code> (optional, default main)</div>
+    </div>
+    <div class="setup-block">
+      <div class="heading">Secrets (GitHub repo → Settings → Secrets and variables → Actions)</div>
+      <div class="body"><code class="kv">SPORTSGAMEODDS_API_KEY</code> <code class="kv">ANTHROPIC_API_KEY</code> <code class="kv">CURRENT_SEASON</code> (optional) <code class="kv">ANTHROPIC_MODEL</code> (optional) <code class="kv">NETLIFY_SITE_ID</code> <code class="kv">NETLIFY_BLOBS_TOKEN</code></div>
+    </div>
+    <div class="setup-block">
+      <div class="heading">Odds data budget (Rookie tier)</div>
+      <div class="body">100,000 objects/month, 50 requests/minute, odds refreshed upstream about every 3 minutes. The GitHub Actions schedule runs every 30 minutes — well within budget — but object cost scales with events × markets per call, so keep an eye on actual usage in the SportsGameOdds dashboard for the first week or two and tune the cron schedule if needed.</div>
+    </div>
+  </section>
+
+  <footer>APEX Edge — Netlify Functions frontend, GitHub Actions refresh pipeline. Not betting advice.</footer>
+</div>
+
+<script>
+let snapshot = null;
+// Kept in sync by hand with lib/analyze.js's BOOKS — the frontend can't import server-side code, so this is
+// its own copy. The four PARLAY_BOOKS (draftkings/fanduel/betmgm/espnbet) get their own pill color; the rest
+// are best-price-comparison-only books and share a neutral pill (see the base .pill CSS rule).
+const BOOKS = {
+  draftkings: { short: "DK", label: "DraftKings" },
+  fanduel: { short: "FD", label: "FanDuel" },
+  betmgm: { short: "MGM", label: "BetMGM" },
+  caesars: { short: "CZR", label: "Caesars" },
+  espnbet: { short: "SB", label: "theScore Bet" },
+  fanatics: { short: "FAN", label: "Fanatics" },
+  betrivers: { short: "BR", label: "BetRivers" },
+  pointsbet: { short: "PB", label: "PointsBet" }
+};
+
+function fmtOdds(a){ if (a==null||isNaN(a)) return "—"; const n=Number(a); return n>0?`+${n}`:`${n}`; }
+function fmtPct(p){ if (p==null||isNaN(p)) return "—"; return (p*100).toFixed(1)+"%"; }
+function fmtNum(n, d=2){ return (n==null||isNaN(n)) ? "—" : Number(n).toFixed(d); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+/* ---------------------------------------------------------------------- */
+/* Reasoning engine — turns the computed factors into plain-English cases */
+/* instead of a wall of stat chips. Each signal contributes a weighted    */
+/* sentence; the strongest few (positive first, then a caution if real)  */
+/* are stitched together into the card's paragraph.                      */
+/* ---------------------------------------------------------------------- */
+
+function propReasoning(r){
+  const f = r.factors || {};
+  const pos = [], caution = [];
+  const who = r.player || "This player";
+  const opp = r.opponentDisp || r.opponent || "this opponent";
+
+  if (f.matchupEdge?.available){
+    const e = f.matchupEdge.edge;
+    if (e > 0.05) pos.push({ w:9, t:`${r.team || "His offense"}'s EPA/play grades ${fmtNum(e,2)} ahead of what ${opp} typically allows — a real scoring-environment tilt in this matchup.` });
+    else if (e < -0.05) caution.push({ w:6, t:`${opp}'s defense actually grades ahead of ${r.team || "this offense"} here (${fmtNum(e,2)} EPA/play) — the matchup isn't doing him favors.` });
+  }
+  if (f.defense?.available){
+    const top = Math.ceil((f.defense.ofTeams||32)*0.35), bottom = Math.floor((f.defense.ofTeams||32)*0.7);
+    if (f.defense.rank <= top) pos.push({ w:8, t:`${opp} ranks ${f.defense.rank} of ${f.defense.ofTeams} teams in what they allow to ${r.position||"this position"} league-wide — one of the softer matchups on the slate.` });
+    else if (f.defense.rank >= bottom) caution.push({ w:4, t:`${opp} ranks ${f.defense.rank} of ${f.defense.ofTeams} against ${r.position||"this position"} — tougher than average, worth weighing.` });
+  }
+  if (f.redZone?.available && f.redZone.redZoneShare >= 0.28){
+    let t = `He's handled ${fmtPct(f.redZone.redZoneShare)} of ${r.team||"his team"}'s red-zone looks this season`;
+    if (f.redZone.goalLineShare != null && f.redZone.goalLineShare >= 0.28) t += ` and ${fmtPct(f.redZone.goalLineShare)} of goal-line touches`;
+    pos.push({ w:7, t: t + " — real scoring-chance volume." });
+  }
+  if (f.secondaryInjury?.available && f.secondaryInjury.count >= 1){
+    pos.push({ w:6, t:`${opp} is down ${f.secondaryInjury.count} defensive back${f.secondaryInjury.count>1?"s":""} (${f.secondaryInjury.names.join(", ")}) — a thinner secondary is a real tailwind for the passing game, even without knowing exactly who lines up across from him.` });
+  }
+  // Form gets a sentence either way — favorable OR unfavorable — never silence. A one-line "hit rate" is exactly
+  // what produced the wrong "he's hit this in 2 of his last 3" claims this board shipped with more than once;
+  // saying nothing when the recent trend is bad is the same failure in reverse, so both directions are covered,
+  // and last-10 is reported alongside last-3 rather than instead of it since a short streak can mislead either way.
+  if (f.form?.available && f.form.n_last3 >= 3){
+    const hits3 = Math.round(f.form.rate_last3 * f.form.n_last3);
+    const label = f.form.statLabel || "this stat";
+    if (f.form.rate_last3 >= 0.66){
+      pos.push({ w:6, t:`He's cleared ${label} in ${hits3} of his last ${f.form.n_last3} games.` });
+    } else if (f.form.rate_last3 <= 0.34){
+      caution.push({ w:9, t:`He's cleared ${label} in only ${hits3} of his last ${f.form.n_last3} games — the recent trend does not support this side.` });
+    }
+    if (f.form.n_last10 >= 6 && Math.abs(f.form.rate_last10 - f.form.rate_last3) >= 0.25){
+      const hits10 = Math.round(f.form.rate_last10 * f.form.n_last10);
+      caution.push({ w:4, t:`Zoomed out, it's ${hits10} of his last ${f.form.n_last10} — a wider sample than just the last 3, worth checking against (see full breakdown below).` });
+    }
+  }
+  if (f.form?.available && f.form.n_vsOpp >= 2){
+    if (f.form.rate_vsOpp >= 0.66) pos.push({ w:5, t:`Also hit it in ${fmtPct(f.form.rate_vsOpp)} of his looks against ${opp} specifically (n=${f.form.n_vsOpp}).` });
+    else if (f.form.rate_vsOpp <= 0.34) caution.push({ w:5, t:`Only ${fmtPct(f.form.rate_vsOpp)} against ${opp} specifically (n=${f.form.n_vsOpp}) — this matchup hasn't been kind to it before.` });
+  }
+  if (f.usage?.available && (f.usage.snapPct >= 0.75 || f.usage.targetShare >= 0.22)){
+    const bits = [];
+    if (f.usage.snapPct != null) bits.push(`${fmtPct(f.usage.snapPct)} of the offense's snaps`);
+    if (f.usage.targetShare != null) bits.push(`a ${fmtPct(f.usage.targetShare)} target share`);
+    pos.push({ w:5, t:`Volume backs it up: ${bits.join(" and ")}.` });
+  }
+  if (f.tendency?.available){
+    const tLabel = f.tendency.statLabel || "production";
+    pos.push({ w:6, t:`Without ${f.tendency.teammateName} on the field, his ${tLabel} jumps to ${fmtNum(f.tendency.withoutAvg,1)}/game (vs ${fmtNum(f.tendency.withAvg,1)} with him active) — worth checking that teammate's status.` });
+  }
+  // The literal "this QB throws more yards/TDs indoors vs outdoors" split — informational rather than scored
+  // as favorable or unfavorable, since knowing which way it cuts needs this week's actual stadium roof, which
+  // isn't threaded into the reasoning engine. The number itself is what was asked for; the badge on the venue
+  // chip below carries the raw split too, in case the roof for this specific game is known some other way.
+  if (f.venue?.available && f.venue.outdoorN >= 2 && f.venue.domeN >= 2){
+    const gap = Math.abs(f.venue.outdoorAvg - f.venue.domeAvg);
+    if (gap > 0.5 && gap >= Math.max(Math.abs(f.venue.domeAvg || 0), Math.abs(f.venue.outdoorAvg || 0)) * 0.15){
+      const vLabel = f.venue.statLabel || "production";
+      pos.push({ w:3, t:`Real indoor/outdoor split on record: ${fmtNum(f.venue.outdoorAvg,1)} ${vLabel}/game outdoors vs ${fmtNum(f.venue.domeAvg,1)} in a dome (n=${f.venue.outdoorN}/${f.venue.domeN}) — worth checking this week's stadium roof against that.` });
+    }
+  }
+  if (f.scoringEnvironment?.available && f.scoringEnvironment.combinedEpaPerPlay > 0.1){
+    pos.push({ w:4, t:`Both offenses in this game grade efficient (combined ${fmtNum(f.scoringEnvironment.combinedEpaPerPlay,2)} EPA/play) — the kind of environment that tends to push scoring props over.` });
+  }
+  if (f.starterChange?.available && f.starterChange.changed){
+    caution.push({ w:8, t:`This week's starter differs from ${r.team||"the team"}'s usual QB (${f.starterChange.usualStarter}, ${f.starterChange.usualStarterGames} starts) — recent form may not carry over.` });
+  }
+  if (f.weatherForecast && (f.weatherForecast.windMph||0) >= 15 && ["pass_yds","td_pass","rec_yds","receptions"].includes(r.propType)){
+    caution.push({ w:7, t:`Wind is forecast at ${fmtNum(f.weatherForecast.windMph,0)}mph at kickoff — worth discounting a passing-game prop for that.` });
+  }
+  if (f.referee?.available && f.referee.gamesCalled >= 8 && f.referee.overRate >= 0.6){
+    pos.push({ w:4, t:`Referee ${f.referee.refereeName} has called the over in ${fmtPct(f.referee.overRate)} of ${f.referee.gamesCalled} games — a modest tailwind for scoring in general.` });
+  }
+  if (f.oLineInjury?.available && f.oLineInjury.count >= 2){
+    caution.push({ w:6, t:`${r.team||"The"} offensive line is down ${f.oLineInjury.count} players to injury — a real protection/blocking concern.` });
+  }
+  if (f.selfInjury && ["out","doubtful"].includes((f.selfInjury.status||"").toLowerCase())){
+    caution.push({ w:12, t:`${who} is listed ${f.selfInjury.status}${f.selfInjury.detail?` (${f.selfInjury.detail})`:""} — confirm he's actually playing before betting this.` });
+  }
+  if (f.marketMovement?.available && f.marketMovement.priceMove < 0){
+    pos.push({ w:5, t:`The price has shortened across the week — line movement that usually means sharp money is on this side.` });
+  }
+  if (f.schedule?.available && (f.schedule.shortWeek || f.schedule.travelMiles > 1500)){
+    caution.push({ w:3, t:`${r.team||"The team"} is dealing with ${f.schedule.shortWeek?"a short week":""}${f.schedule.shortWeek && f.schedule.travelMiles>1500?" and ":""}${f.schedule.travelMiles>1500?`a ${f.schedule.travelMiles}-mile trip`:""} — a minor drag worth noting.` });
+  }
+
+  return composeReasoning(pos, caution, `Not enough real computed signal resolved on ${who} this week to build a confident case — the edge here is a pure price comparison, not a supported lean.`);
+}
+
+function lineReasoning(r){
+  const f = r.factors || {};
+  const pos = [], caution = [];
+  const home = r.matchup ? r.matchup.split(" @ ")[1] : "the home team";
+  const away = r.matchup ? r.matchup.split(" @ ")[0] : "the away team";
+
+  const meH = f.matchupEdge?.homeOffVsAwayDef, meA = f.matchupEdge?.awayOffVsHomeDef;
+  if (meH?.available && meH.edge > 0.05) pos.push({ w:8, t:`${home}'s offense grades ${fmtNum(meH.edge,2)} EPA/play ahead of what ${away}'s defense allows — real scoring upside on one side of this total.` });
+  if (meA?.available && meA.edge > 0.05) pos.push({ w:8, t:`${away}'s offense grades ${fmtNum(meA.edge,2)} EPA/play ahead of what ${home}'s defense allows.` });
+  if (meH?.available && meH.edge < -0.08 && meA?.available && meA.edge < -0.08) caution.push({ w:6, t:`Both offenses actually grade behind the opposing defense here — this isn't the shootout profile the total might suggest.` });
+
+  if (f.scoringEnvironment?.available && f.scoringEnvironment.combinedEpaPerPlay > 0.1){
+    pos.push({ w:7, t:`Both teams' own offenses grade efficient (combined ${fmtNum(f.scoringEnvironment.combinedEpaPerPlay,2)} EPA/play, ${fmtNum(f.scoringEnvironment.combinedPlaysPerGame,0)} combined plays/game) — a real tailwind for the total.` });
+  }
+  if (f.referee?.available && f.referee.gamesCalled >= 8){
+    if (f.referee.overRate >= 0.6) pos.push({ w:5, t:`Referee ${f.referee.refereeName} has called the over in ${fmtPct(f.referee.overRate)} of ${f.referee.gamesCalled} games (avg total ${fmtNum(f.referee.avgTotal,1)} vs. an average line of ${fmtNum(f.referee.avgLine,1)}).` });
+    else if (f.referee.overRate <= 0.4) caution.push({ w:5, t:`Referee ${f.referee.refereeName} has actually trended under (${fmtPct(f.referee.overRate)} overs across ${f.referee.gamesCalled} games) — a headwind for this side.` });
+  }
+  if (f.weatherForecast && ((f.weatherForecast.windMph||0) >= 15 || (f.weatherForecast.precipProb||0) >= 50)){
+    caution.push({ w:6, t:`Forecast calls for ${fmtNum(f.weatherForecast.windMph,0)}mph wind${f.weatherForecast.precipProb>=50?` and a ${fmtNum(f.weatherForecast.precipProb,0)}% chance of precipitation`:""} at kickoff — a real drag on scoring.` });
+  }
+  if (f.keyNumber?.available && f.keyNumber.onKeyNumber){
+    caution.push({ w:3, t:`The total sits right on a key number (${f.keyNumber.nearestKeyNumber}) — expect it to be efficiently priced.` });
+  }
+  if (r.arb) pos.push({ w:9, t:`The two books actually disagree enough here that both sides can be bet profitably (an arbitrage flag) — that's a pricing gap, not a directional read.` });
+  if (f.marketMovement?.available && f.marketMovement.pointMove){
+    pos.push({ w:4, t:`The number has moved ${f.marketMovement.pointMove>0?"up":"down"} ${Math.abs(f.marketMovement.pointMove)} points across the week — line movement worth noting.` });
+  }
+
+  return composeReasoning(pos, caution, `No strong computed signal resolved for this line yet — treat the edge shown as a raw price comparison.`);
+}
+
+function composeReasoning(pos, caution, fallback){
+  pos.sort((a,b)=>b.w-a.w); caution.sort((a,b)=>b.w-a.w);
+  const parts = pos.slice(0,3).map(p=>p.t);
+  if (caution.length) parts.push(caution[0].t);
+  if (!parts.length) return fallback;
+  return parts.join(" ");
+}
+
+function confidenceScore(r, kind){
+  if (kind === "prop" && r.mispricedScore != null) return Math.max(0, Math.min(100, r.mispricedScore * 2.2));
+  const e = r.bestEdge || 0;
+  return Math.max(0, Math.min(100, e * 400 + (r.arb ? 25 : 0)));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Data loading + refresh                                                  */
+/* ---------------------------------------------------------------------- */
+
+async function loadSnapshot(){
+  const res = await fetch("/.netlify/functions/data");
+  const json = await res.json();
+  if (!json.ok){
+    document.getElementById("edgeStatus").textContent = json.error || "No snapshot yet — click Refresh Now.";
+    document.getElementById("modeBadge").textContent = "No data";
+    document.getElementById("modeBadge").className = "badge none";
+    return;
+  }
+  snapshot = json.snapshot;
+  render();
+}
+
+async function refreshNow(){
+  const btn = document.getElementById("refreshBtn");
+  const prevGeneratedAt = snapshot?.generatedAt || null;
+  const statusEl = document.getElementById("edgeStatus");
+  btn.disabled = true;
+  const started = Date.now();
+  const tick = () => { btn.innerHTML = `<span class="spinner"></span>Refreshing… ${Math.round((Date.now()-started)/1000)}s`; };
+  tick();
+  const tickTimer = setInterval(tick, 1000);
+  statusEl.textContent = "Refresh triggered on GitHub Actions — pulling odds, nflverse stats + play-by-play, weather, and running AI analysis. This can take a few minutes, plus a bit of queue time for the runner to start.";
+  statusEl.classList.remove("err");
+  try{
+    const triggerRes = await fetch("/.netlify/functions/trigger-refresh", { method:"POST" });
+    const triggerJson = await triggerRes.json().catch(() => null);
+    if (!triggerJson?.ok) throw new Error(triggerJson?.error || `Trigger failed (HTTP ${triggerRes.status})`);
+    const deadline = Date.now() + 10*60*1000;
+    let done = false;
+    while (Date.now() < deadline){
+      await new Promise(r => setTimeout(r, 5000));
+      const res = await fetch("/.netlify/functions/data");
+      const json = await res.json().catch(() => null);
+      if (json?.ok && json.snapshot?.generatedAt && json.snapshot.generatedAt !== prevGeneratedAt){
+        snapshot = json.snapshot; render(); done = true; break;
+      }
+    }
+    if (!done) statusEl.textContent = "Still working — check back in a bit. If it never finishes, check the workflow run under the GitHub repo's Actions tab.";
+  } catch(e){
+    statusEl.textContent = "Refresh failed: " + e.message;
+    statusEl.classList.add("err");
+  } finally {
+    clearInterval(tickTimer);
+    btn.disabled = false;
+    btn.textContent = "Refresh Now";
+  }
+}
+document.getElementById("refreshBtn").addEventListener("click", refreshNow);
+
+function renderStatPills(el, items){
+  el.innerHTML = items.map(i => `<div class="stat-pill"><div class="n">${i.n}</div><div class="l">${i.l}</div></div>`).join("");
+}
+
+function render(){
+  const ageMin = (Date.now() - new Date(snapshot.generatedAt).getTime())/60000;
+  const modeBadge = document.getElementById("modeBadge");
+  modeBadge.textContent = snapshot.mode==="demo" ? "Demo" : `Live · ${Math.round(ageMin)}m old`;
+  modeBadge.className = "badge " + (snapshot.mode==="demo" ? "stale" : (ageMin > 45 ? "stale" : "fresh"));
+  document.getElementById("lastRun").textContent = `Last generated: ${new Date(snapshot.generatedAt).toLocaleString()}${snapshot.week ? ` · Week ${snapshot.week}` : ""}`;
+
+  const suspectN = snapshot.stats.suspectFlags || 0;
+  const edgeStatus = document.getElementById("edgeStatus");
+  edgeStatus.textContent = `${snapshot.stats.gamesThisWeek} game(s) this week · ${snapshot.mispriced.length} scored prop edges` +
+    (suspectN ? ` · ${suspectN} row(s) flagged ⚠ unverified and excluded` : "");
+  edgeStatus.classList.toggle("err", suspectN > 0);
+
+  renderStatPills(document.getElementById("edgeStats"), [
+    {n:snapshot.stats.gamesThisWeek,l:"Games this week"},
+    {n:snapshot.stats.arbFlags,l:"Arb flags"},
+    {n:snapshot.mispriced.length,l:"Scored edges"},
+    {n:suspectN,l:"⚠ Unverified"}
+  ]);
+  renderStatPills(document.getElementById("linesStats"), [
+    {n:snapshot.stats.gamesThisWeek,l:"Games this week"},
+    {n:snapshot.stats.arbFlags,l:"Arb flags"},
+    {n:snapshot.stats.lineValueEdges,l:"Value edges >2%"}
+  ]);
+  renderStatPills(document.getElementById("propsStats"), [
+    {n:snapshot.stats.propsScanned,l:"Props scanned"},
+    {n:snapshot.stats.propsWithFactor,l:"With ≥1 real factor"},
+    {n:snapshot.stats.propValueEdges,l:"Value edges >2%"}
+  ]);
+
+  const typeSel = document.getElementById("propTypeFilter");
+  const types = [...new Set(snapshot.propRows.map(r => r.propLabel))];
+  const prevType = typeSel.value;
+  typeSel.innerHTML = `<option value="">All prop types</option>` + types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
+  typeSel.value = prevType;
+
+  applyEdgeFilters();
+  applyLineFilters();
+  applyPropFilters();
+  renderParlays();
+}
+
+/* ---------------------------------------------------------------------- */
+/* Card rendering                                                          */
+/* ---------------------------------------------------------------------- */
+
+function bookGridHTML(r){
+  return `<span>${r.bestBook?`<span class="pill ${r.bestBook}">${BOOKS[r.bestBook].short}</span> <span class="odds">${fmtOdds(r.bestPrice)}</span>`:'—'}</span>`;
+}
+
+function factorChipsHTML(f){
+  if (!f) return "";
+  const chips = [];
+  if (f.matchupEdge?.available) chips.push(`<span class="chip ${f.matchupEdge.edge>0?'hit':'warn'}" title="This offense's EPA/play minus what the opponent's defense allows">Matchup edge: ${f.matchupEdge.edge>=0?'+':''}${fmtNum(f.matchupEdge.edge,3)} EPA</span>`);
+  if (f.defense?.available) chips.push(`<span class="chip ${f.defense.rank<=Math.ceil((f.defense.ofTeams||32)*0.35)?'hit':''}" title="League-wide rank of what this opponent allows to this position">Def rank vs pos: ${f.defense.rank}/${f.defense.ofTeams}</span>`);
+  if (f.scoringEnvironment?.available) chips.push(`<span class="chip ${f.scoringEnvironment.combinedEpaPerPlay>0.1?'hit':''}" title="Both teams' own EPA/play added together">Scoring env: ${f.scoringEnvironment.combinedEpaPerPlay>=0?'+':''}${fmtNum(f.scoringEnvironment.combinedEpaPerPlay,3)} combined EPA</span>`);
+  if (f.form?.available) chips.push(`<span class="chip ${f.form.rate_last3>=0.6?'hit':(f.form.rate_last3<=0.34?'warn':'')}">L3: ${fmtPct(f.form.rate_last3)} (n=${f.form.n_last3})</span>`);
+  if (f.form?.available && f.form.n_last10) chips.push(`<span class="chip ${f.form.rate_last10>=0.6?'hit':(f.form.rate_last10<=0.34?'warn':'')}" title="Line: ${f.form.line}">L10: ${fmtPct(f.form.rate_last10)} (n=${f.form.n_last10})</span>`);
+  if (f.form?.available && f.form.n_vsOpp) chips.push(`<span class="chip">vs Opp: ${fmtPct(f.form.rate_vsOpp)} (n=${f.form.n_vsOpp})</span>`);
+  if (f.redZone?.available) chips.push(`<span class="chip ${f.redZone.redZoneShare>=0.3?'hit':''}" title="Share of team red-zone touches">RZ share: ${fmtPct(f.redZone.redZoneShare)}</span>`);
+  if (f.redZone?.available && f.redZone.goalLineShare!=null) chips.push(`<span class="chip">Goal-line share: ${fmtPct(f.redZone.goalLineShare)}</span>`);
+  if (f.twoMinute?.available) chips.push(`<span class="chip">2-min share: ${fmtPct(f.twoMinute.share)}</span>`);
+  if (f.usage?.available && f.usage.snapPct!=null) chips.push(`<span class="chip ${f.usage.snapPct>=0.75?'hit':''}">${fmtPct(f.usage.snapPct)} snap</span>`);
+  if (f.usage?.available && f.usage.targetShare!=null) chips.push(`<span class="chip ${f.usage.targetShare>=0.22?'hit':''}">${fmtPct(f.usage.targetShare)} tgt share</span>`);
+  if (f.tendency?.available) chips.push(`<span class="chip hit" title="w/o ${esc(f.tendency.teammateName)} — ${esc(f.tendency.statLabel||'')}">w/o teammate: ${fmtNum(f.tendency.withoutAvg,1)} vs ${fmtNum(f.tendency.withAvg,1)} avg</span>`);
+  if (f.schedule?.available && f.schedule.shortWeek) chips.push(`<span class="chip warn">Short week (${f.schedule.restDays}d rest)</span>`);
+  if (f.schedule?.available && f.schedule.travelMiles>800) chips.push(`<span class="chip warn">Travel: ${f.schedule.travelMiles}mi${f.schedule.tzShiftHours?`, ${Math.abs(f.schedule.tzShiftHours)}h tz shift`:''}</span>`);
+  if (f.schedule?.available && f.schedule.highAltitude) chips.push(`<span class="chip warn">High altitude</span>`);
+  if (f.schedule?.available && f.schedule.neutralSite) chips.push(`<span class="chip info">Neutral site</span>`);
+  if (f.schedule?.available && f.schedule.primetime) chips.push(`<span class="chip info">Primetime</span>`);
+  if (f.starterChange?.available && f.starterChange.changed) chips.push(`<span class="chip warn" title="Usually ${esc(f.starterChange.usualStarter)} (${f.starterChange.usualStarterGames}g)">Starter change: ${esc(f.starterChange.thisWeekStarter)}</span>`);
+  if (f.referee?.available) chips.push(`<span class="chip" title="n=${f.referee.gamesCalled} games">Ref ${esc(f.referee.refereeName)}: ${fmtPct(f.referee.overRate)} overs</span>`);
+  if (f.weatherForecast) chips.push(`<span class="chip ${f.weatherForecast.windMph>=15?'warn':''}">${fmtNum(f.weatherForecast.tempF,0)}°F, wind ${fmtNum(f.weatherForecast.windMph,0)}mph, ${fmtNum(f.weatherForecast.precipProb,0)}% precip</span>`);
+  if (f.venue?.available && f.venue.venueN) chips.push(`<span class="chip" title="${esc(f.venue.statLabel||'')}">At venue: ${fmtNum(f.venue.venueAvg,1)} avg (n=${f.venue.venueN})</span>`);
+  if (f.venue?.available && f.venue.outdoorN >= 2 && f.venue.domeN >= 2) chips.push(`<span class="chip" title="${esc(f.venue.statLabel||'')} per game">Outdoor/dome: ${fmtNum(f.venue.outdoorAvg,1)} / ${fmtNum(f.venue.domeAvg,1)} (n=${f.venue.outdoorN}/${f.venue.domeN})</span>`);
+  if (f.weatherHistorical?.available) chips.push(`<span class="chip" title="${esc(f.weatherHistorical.statLabel||'')} per game">Wet/dry: ${fmtNum(f.weatherHistorical.wetAvg,1)} / ${fmtNum(f.weatherHistorical.dryAvg,1)} (n=${f.weatherHistorical.wetN})</span>`);
+  if (f.birthday?.nearBirthday) chips.push(`<span class="chip hit">🎂 near birthday</span>`);
+  if (f.oLineInjury?.available && f.oLineInjury.count>0) chips.push(`<span class="chip warn" title="${(f.oLineInjury.names||[]).map(esc).join(', ')}">O-line: ${f.oLineInjury.count} hurt</span>`);
+  if (f.secondaryInjury?.available && f.secondaryInjury.count>0) chips.push(`<span class="chip hit" title="${(f.secondaryInjury.names||[]).map(esc).join(', ')}">Opp. secondary: ${f.secondaryInjury.count} hurt</span>`);
+  if (f.practiceTrend?.available) chips.push(`<span class="chip">Practice: ${esc(f.practiceTrend.trend)}</span>`);
+  if (f.selfInjury) chips.push(`<span class="chip warn">${esc(f.selfInjury.status)}${f.selfInjury.detail?`: ${esc(f.selfInjury.detail)}`:''}</span>`);
+  if (f.marketMovement?.available) chips.push(`<span class="chip info">Move: ${f.marketMovement.priceMove!=null?fmtOdds(f.marketMovement.priceMove):'—'}${f.marketMovement.pointMove?` / ${f.marketMovement.pointMove>0?'+':''}${f.marketMovement.pointMove}pt`:''} (${f.marketMovement.points} pts)</span>`);
+  if (f.situationalNote) chips.push(`<span class="chip info">📝 ${esc(f.situationalNote)}</span>`);
+  return chips.length ? `<div class="chip-section"><div class="heading">Every computed factor</div>${chips.join("")}</div>` : `<div class="chip-section small" style="color:var(--dim);">No additional computed factors resolved for this row.</div>`;
+}
+
+// The literal game-by-game log behind the form factor's hit rates — every week, the real recorded stat value,
+// the line it's graded against, and hit/miss — so a number like "2 of his last 3" can be checked by eye rather
+// than taken on faith. This is the direct answer to "need to know every detail if its a sharp bet or not."
+function gameLogTableHTML(f){
+  const form = f?.form;
+  if (!form?.available || !form.gameLog?.length) return "";
+  const rows = form.gameLog.map(g => {
+    const label = form.line === 0 ? (g.hit ? "Yes" : "No") : `${g.statValue}`;
+    return `<tr class="${g.hit?'hit-row':'miss-row'}"><td>${g.season} wk ${g.week}</td><td>${esc(g.opponent||'—')}</td><td>${esc(label)}</td><td>${g.hit?'✓ Hit':'✗ Miss'}</td></tr>`;
+  }).join("");
+  const lineLabel = form.line === 0 ? "at least 1" : form.line;
+  return `<div class="chip-section">
+    <div class="heading">Last ${form.gameLog.length} games — ${esc(form.statLabel||'')} vs. line of ${lineLabel}</div>
+    <table class="gamelog-table"><thead><tr><th>Game</th><th>Opp</th><th>Result</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+}
+
+// The checklist Jon asked for directly on every prop card — not buried behind "Full breakdown" — showing the
+// exact last-5-games result against THIS bet's real line, stat by stat (anytime TD, passing/rushing/receiving
+// yards, receptions, whatever this specific prop is). Reuses the same gameLog the full 10-game table is built
+// from (most-recent-first), so the two can never disagree with each other.
+function last5ChecklistHTML(f){
+  const form = f?.form;
+  if (!form?.available || !form.gameLog?.length) return "";
+  const last5 = form.gameLog.slice(0, 5);
+  const lineLabel = form.line === 0 ? "at least 1" : form.line;
+  const items = last5.map(g => {
+    const valueLabel = form.line === 0 ? (g.hit ? "yes" : "no") : g.statValue;
+    return `<span class="cl-item ${g.hit ? 'cl-hit' : 'cl-miss'}" title="${g.season} wk ${g.week} vs ${esc(g.opponent || '—')}: ${esc(String(valueLabel))}">${g.hit ? '✓' : '✗'} wk${g.week}</span>`;
+  }).join("");
+  const hits = last5.filter(g => g.hit).length;
+  return `<div class="ec-checklist">
+    <span class="cl-label">Last ${last5.length} vs. ${lineLabel} ${esc(form.statLabel || '')}</span>
+    ${items}
+    <span class="cl-tally">${hits}/${last5.length}</span>
+  </div>`;
+}
+
+function teamContextHTML(f){
+  if (!f?.teamContext) return "";
+  const col = (label, t, sched) => `<div class="col"><h4>${label}</h4>
+    ${t ? `<div style="font-size:12.5px;">Offense EPA/play: ${fmtNum(t.offEpaPerPlay,3)} · Defense EPA/play allowed: ${fmtNum(t.defEpaPerPlayAllowed,3)}<br>
+    Pace: ${fmtNum(t.playsPerGame,1)} plays/gm · 3rd down off: ${fmtPct(t.thirdDownRate)} / def: ${fmtPct(t.thirdDownRateAllowed)}<br>
+    RZ TD off: ${fmtPct(t.redZoneTDRate)} / allowed: ${fmtPct(t.redZoneTDRateAllowed)} · Turnovers/gm: ${fmtNum(t.turnoversPerGame,2)}</div>` : `<div style="color:var(--dim);font-size:12.5px;">No team data yet.</div>`}
+    ${sched?.available ? `<div style="color:var(--dim);font-size:11.5px;margin-top:6px;">Rest: ${sched.restDays}d${sched.shortWeek?' (short week)':''} · Travel: ${sched.travelMiles}mi${sched.neutralSite?' · Neutral site':''}</div>` : ''}
+    </div>`;
+  const meH = f.matchupEdge?.homeOffVsAwayDef, meA = f.matchupEdge?.awayOffVsHomeDef;
+  return `<div class="team-ctx">${col('Home', f.teamContext.home, f.schedule?.home)}${col('Away', f.teamContext.away, f.schedule?.away)}</div>` +
+    ((meH?.available || meA?.available) ? `<div style="color:var(--dim);font-size:12px;margin-top:8px;">
+      ${meH?.available?`Home off vs. away def: ${meH.edge>=0?'+':''}${fmtNum(meH.edge,3)} EPA/play edge<br>`:''}
+      ${meA?.available?`Away off vs. home def: ${meA.edge>=0?'+':''}${fmtNum(meA.edge,3)} EPA/play edge`:''}
+    </div>` : '') +
+    (f.scoringEnvironment?.available ? `<div style="color:var(--dim);font-size:12px;margin-top:6px;">Combined offense EPA/play: ${f.scoringEnvironment.combinedEpaPerPlay>=0?'+':''}${fmtNum(f.scoringEnvironment.combinedEpaPerPlay,3)} · combined pace: ${fmtNum(f.scoringEnvironment.combinedPlaysPerGame,1)} plays/gm</div>` : '') +
+    (f.referee?.available ? `<div style="color:var(--dim);font-size:12px;margin-top:4px;">Referee ${esc(f.referee.refereeName)}: ${fmtPct(f.referee.overRate)} overs across ${f.referee.gamesCalled} games (avg total ${fmtNum(f.referee.avgTotal,1)} vs line ${fmtNum(f.referee.avgLine,1)})</div>` : '') +
+    (f.weatherForecast ? `<div style="color:var(--dim);font-size:12px;margin-top:4px;">Forecast: ${fmtNum(f.weatherForecast.tempF,0)}°F, wind ${fmtNum(f.weatherForecast.windMph,0)}mph, ${fmtNum(f.weatherForecast.precipProb,0)}% precip</div>` : '') +
+    (f.keyNumber?.available ? `<div style="color:var(--dim);font-size:12px;margin-top:4px;">Nearest key number: ${f.keyNumber.nearestKeyNumber} (${f.keyNumber.onKeyNumber?'on it':`${f.keyNumber.distance>0?'+':''}${f.keyNumber.distance} away`})</div>` : '');
+}
+
+function scoutingHTML(r){
+  if (!r.scouting) return "";
+  return `<div class="ec-scout"><span class="label">Speculative scouting take — not computed, general football knowledge only</span>${esc(r.scouting.note)}</div>`;
+}
+
+let cardSeq = 0;
+function edgeCardHTML(r, kind){
+  const idx = cardSeq++;
+  const edgeCls = r.suspect ? "suspect" : (r.bestEdge??-9)>0.01 ? "pos" : "neg";
+  const suspectTitle = "This edge is implausibly large for a two-book comparison — likely a data mismatch, not a real price. Excluded from Edge Board scoring, AI notes and parlays.";
+  const title = kind === "prop"
+    ? `<span class="ec-player">${esc(r.player)}</span><span class="ec-sub">${esc(r.team||'')} vs ${esc(r.opponentDisp||r.opponent||'—')}${r.teamMismatch?' · <span style="color:var(--red)">team unverified</span>':''}</span>`
+    : `<span class="ec-player">${esc(r.matchup)}</span><span class="ec-sub">${r.kickoff?new Date(r.kickoff).toLocaleString():''}</span>`;
+  // A yes/no prop (Anytime TD) has no numeric line and its side is always "yes" in this build (the "no" side
+  // is never shown) — printing "Anytime TD yes" would be redundant noise, so the side/line suffix only shows
+  // when there's an actual threshold (an over/under prop like receiving yards, or a game line).
+  const market = kind === "prop"
+    ? (r.line != null ? `${esc(r.propLabel)} ${esc(r.side||'')} ${r.line}` : esc(r.propLabel))
+    : `${esc(r.market)} ${esc(r.side)}`;
+  const reasoning = kind === "prop" ? propReasoning(r) : lineReasoning(r);
+  const conf = confidenceScore(r, kind);
+  const detail = kind === "prop"
+    ? (gameLogTableHTML(r.factors) + factorChipsHTML(r.factors))
+    : (teamContextHTML(r.factors) + factorChipsHTML(r.factors));
+
+  return `<div class="edge-card ${r.suspect?'is-suspect':''}">
+    <div class="ec-top">
+      <div>${title}</div>
+      <div class="ec-edge ${edgeCls}">${fmtPct(r.bestEdge)}</div>
+    </div>
+    <div class="ec-market">${market}${r.arb?' <span class="tag tag-arb">ARB</span>':''}${r.suspect?` <span class="tag tag-warn" title="${suspectTitle}">⚠ unverified</span>`:''}</div>
+    <div class="ec-book">${bookGridHTML(r)}<div class="conf-bar"><i style="width:${conf}%;"></i></div><span class="conf-label">case strength</span></div>
+    <p class="ec-reasoning">${reasoning}</p>
+    ${kind === "prop" ? last5ChecklistHTML(r.factors) : ''}
+    ${r.ai ? `<div class="ec-ai"><span class="ec-ai-tag">${esc((r.ai.tag||'').replace('-',' '))}</span>${esc(r.ai.note)}</div>` : ''}
+    ${scoutingHTML(r)}
+    <button class="ec-expand" data-i="${idx}">Full breakdown ▾</button>
+    <div class="ec-detail" id="detail-${idx}" hidden>${detail}</div>
+  </div>`;
+}
+
+function wireExpanders(wrap){
+  wrap.querySelectorAll(".ec-expand").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const row = document.getElementById(`detail-${btn.dataset.i}`);
+      const open = !row.hidden;
+      row.hidden = open;
+      btn.textContent = open ? "Full breakdown ▾" : "Full breakdown ▴";
+    });
+  });
+}
+
+function renderCardList(el, rows, kindFn){
+  if (!rows.length){ el.innerHTML = `<div class="empty">Nothing here yet — check back after the next refresh.</div>`; return; }
+  cardSeq = 0;
+  el.innerHTML = rows.map(r => edgeCardHTML(r, kindFn(r))).join("");
+  wireExpanders(el);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Edge Board                                                              */
+/* ---------------------------------------------------------------------- */
+
+let edgeKindFilter = "";
+document.querySelectorAll("#edgeKindSeg button").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("#edgeKindSeg button").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");
+  edgeKindFilter = b.dataset.kind;
+  applyEdgeFilters();
+}));
+document.getElementById("edgeSearch").addEventListener("input", applyEdgeFilters);
+
+function buildEdgeBoard(){
+  const props = snapshot.mispriced.map(r => ({ row: r, kind: "prop", score: r.mispricedScore ?? ((r.bestEdge||0)*100) }));
+  const lines = snapshot.gameLines.filter(r => !r.suspect && ((r.bestEdge||0) > 0.01 || r.arb))
+    .map(r => ({ row: r, kind: "line", score: (r.arb?50:0) + (r.bestEdge||0)*100 }));
+  return [...props, ...lines].sort((a,b) => b.score - a.score);
+}
+
+function applyEdgeFilters(){
+  if (!snapshot) return;
+  const q = document.getElementById("edgeSearch").value.toLowerCase();
+  let entries = buildEdgeBoard();
+  if (edgeKindFilter) entries = entries.filter(e => e.kind === edgeKindFilter);
+  if (q) entries = entries.filter(e => {
+    const r = e.row;
+    const hay = e.kind === "prop" ? `${r.player} ${r.team} ${r.opponentDisp||r.opponent}` : `${r.matchup}`;
+    return hay.toLowerCase().includes(q);
+  });
+  entries = entries.slice(0, 60);
+  renderCardList(document.getElementById("edgeList"), entries.map(e => e.row), (r) => (entries.find(e => e.row === r) || {}).kind);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Game Lines / Player Props tabs                                          */
+/* ---------------------------------------------------------------------- */
+
+function applyLineFilters(){
+  if (!snapshot) return;
+  const team = document.getElementById("lineTeamFilter").value.toLowerCase();
+  const sf = document.getElementById("lineSortFilter").value;
+  let rows = snapshot.gameLines.filter(r => !team || r.matchup.toLowerCase().includes(team));
+  if (sf==="edge") rows.sort((a,b)=>(b.bestEdge??-9)-(a.bestEdge??-9));
+  if (sf==="arb") rows.sort((a,b)=>(b.arb?1:0)-(a.arb?1:0)||(b.bestEdge??-9)-(a.bestEdge??-9));
+  renderCardList(document.getElementById("linesList"), rows, () => "line");
+}
+["lineTeamFilter","lineSortFilter"].forEach(id => document.getElementById(id).addEventListener("input", applyLineFilters));
+
+function applyPropFilters(){
+  if (!snapshot) return;
+  const q = document.getElementById("propTeamFilter").value.toLowerCase();
+  const type = document.getElementById("propTypeFilter").value;
+  const sf = document.getElementById("propSortFilter").value;
+  let rows = snapshot.propRows.filter(r => (!q || r.player.toLowerCase().includes(q) || (r.team||'').toLowerCase().includes(q)) && (!type || r.propLabel===type));
+  const factorCount = r => r.factors ? Object.values(r.factors).filter(f=>f&&(f.available||(Array.isArray(f)&&f.length))).length : 0;
+  if (sf==="edge") rows.sort((a,b)=>(b.bestEdge??-9)-(a.bestEdge??-9));
+  if (sf==="mispriced") rows.sort((a,b)=>(b.mispricedScore??-999)-(a.mispricedScore??-999));
+  if (sf==="factors") rows.sort((a,b)=>factorCount(b)-factorCount(a));
+  renderCardList(document.getElementById("propsList"), rows, () => "prop");
+}
+["propTeamFilter","propTypeFilter","propSortFilter"].forEach(id => document.getElementById(id).addEventListener("input", applyPropFilters));
+
+/* ---------------------------------------------------------------------- */
+/* Parlays                                                                 */
+/* ---------------------------------------------------------------------- */
+
+// Full, always-present write-up for a parlay: one paragraph per leg, each built from the exact same reasoning
+// engine used on that leg's own card (propReasoning/lineReasoning), so it can never say something the card
+// itself doesn't already support — plus a lead sentence on the parlay's own math and a correlation caution
+// when legs share a game. This doesn't depend on the AI note succeeding or being present; the AI note (when it
+// resolved) is shown alongside it as a separate, clearly-labeled layer, same pattern as every other card.
+function parlayWriteupHTML(v){
+  const lead = `<p class="ec-parlay-leg">This ${esc(v.tier.label.toLowerCase())} combines ${v.legs.length} legs at ${esc(BOOKS[v.book].label)} for combined odds of ${fmtOdds(v.combinedAmerican)} (~${fmtPct(v.combinedProb)} naive combined probability, assuming independence).</p>`;
+  const legParas = v.legs.map((l, i) => {
+    const reasoning = l.kind === "prop" ? propReasoning(l.row) : lineReasoning(l.row);
+    return `<p class="ec-parlay-leg"><b>Leg ${i + 1}: ${esc(l.label)}</b> (${fmtOdds(l.price)}) — ${reasoning}</p>`;
+  }).join("");
+  const correlationNote = v.correlated
+    ? `<p class="ec-parlay-leg" style="color:var(--amber);">Two or more legs share the same game here, so their outcomes aren't fully independent — treat the combined probability above as optimistic, not literal.</p>`
+    : "";
+  return `<div class="ec-parlay-writeup"><div class="chip-section"><div class="heading">Full write-up</div>${lead}${legParas}${correlationNote}</div></div>`;
+}
+
+// [primary, ...alternates] as one flat list of full parlay objects, so shuffling is just moving an index —
+// no new data, no network round-trip.
+function parlayVariants(p){
+  const { alternates, ...primary } = p;
+  return [primary, ...(alternates || [])];
+}
+
+let parlayVariantIndex = {};
+function renderParlays(){
+  const wrap = document.getElementById("parlaysList");
+  if (!snapshot.parlays?.length){ wrap.innerHTML = `<div class="empty">No parlays built this refresh.</div>`; return; }
+  wrap.innerHTML = snapshot.parlays.map(p => {
+    if (!p.ok) return `<div class="edge-card"><div class="ec-player">${esc(p.tier.label)}</div><div class="ec-market" style="color:var(--dim);">${esc(p.reason)}</div></div>`;
+    const variants = parlayVariants(p);
+    const idx = (parlayVariantIndex[p.tier.key] || 0) % variants.length;
+    const v = variants[idx];
+    return `<div class="edge-card">
+      <div class="ec-top"><div class="ec-player">${esc(p.tier.label)} <span class="pill ${v.book}">${BOOKS[v.book].short}</span></div><div class="ec-edge pos odds">${fmtOdds(v.combinedAmerican)}</div></div>
+      <div class="ec-market">${esc(p.tier.desc)}</div>
+      <div style="margin:12px 0;display:flex;flex-direction:column;gap:5px;">${v.legs.map(l => `<div style="font-size:13px;">${esc(l.label)} <span class="odds" style="color:var(--dim);">${fmtOdds(l.price)}</span></div>`).join("")}</div>
+      <div style="font-size:13px;">$100 stake → <b style="color:var(--mint);">$${v.payout}</b> profit if it hits · naive combined probability ${fmtPct(v.combinedProb)}</div>
+      ${v.correlated ? '<span class="tag tag-warn" style="margin-top:8px;display:inline-block;">Shares a game across legs</span>' : ''}
+      ${parlayWriteupHTML(v)}
+      ${v.ai ? `<div class="ec-ai"><span class="ec-ai-tag">AI take</span>${esc(v.ai.note)}</div>` : ''}
+      ${variants.length > 1 ? `<button class="ec-shuffle" data-tier="${esc(p.tier.key)}">🔀 Shuffle this build (${idx + 1}/${variants.length})</button>` : ''}
+    </div>`;
+  }).join("");
+  wrap.querySelectorAll(".ec-shuffle").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const tierKey = btn.dataset.tier;
+      const p = snapshot.parlays.find(pp => pp.tier?.key === tierKey);
+      if (!p) return;
+      const variants = parlayVariants(p);
+      parlayVariantIndex[tierKey] = ((parlayVariantIndex[tierKey] || 0) + 1) % variants.length;
+      renderParlays();
+    });
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Notes                                                                   */
+/* ---------------------------------------------------------------------- */
+
+async function loadNotes(){
+  const res = await fetch("/.netlify/functions/notes");
+  const json = await res.json();
+  document.getElementById("notesBox").value = (json.notes||[]).map(n => n.text || n).join("\n");
+}
+document.getElementById("saveNotesBtn").addEventListener("click", async () => {
+  const lines = document.getElementById("notesBox").value.split("\n").map(s=>s.trim()).filter(Boolean);
+  const notes = lines.map(text => ({ text }));
+  const statusEl = document.getElementById("notesStatus");
+  statusEl.textContent = "Saving...";
+  try {
+    await fetch("/.netlify/functions/notes", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ notes }) });
+    statusEl.textContent = "Saved — applies on the next refresh.";
+  } catch(e){ statusEl.textContent = "Save failed: " + e.message; }
+});
+
+/* ---------------------------------------------------------------------- */
+/* Nav                                                                     */
+/* ---------------------------------------------------------------------- */
+
+document.querySelectorAll("nav button").forEach(b => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll("nav button").forEach(x=>x.classList.remove("active"));
+    document.querySelectorAll(".view").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active");
+    document.getElementById(`view-${b.dataset.view}`).classList.add("active");
+  });
+});
+
+loadSnapshot();
+loadNotes();
+</script>
+</body>
+</html>

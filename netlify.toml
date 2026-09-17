@@ -1,0 +1,10 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+  command = "npm install"
+
+# Scheduled function (v2, `export const config = { schedule }` inside refresh-background.js) needs no entry
+# here — Netlify reads the cron straight out of that file at deploy time.
+
+[functions]
+  node_bundler = "esbuild"

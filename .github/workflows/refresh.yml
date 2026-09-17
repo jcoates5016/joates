@@ -1,0 +1,32 @@
+name: Refresh APEX Edge data
+
+on:
+  # Every 30 minutes. On the Rookie tier (100,000 objects/month, upstream odds refreshed ~every 3 minutes)
+  # there's ample headroom for this — no comparable time limit here the way there was with Netlify Background
+  # Functions. Object cost still scales with events × markets per call in a way that can't be verified without
+  # watching real usage, so keep an eye on the SportsGameOdds dashboard for the first week and back this off
+  # (e.g. hourly) if usage runs hotter than expected.
+  schedule:
+    - cron: "*/30 * * * *"
+  # Lets the site's "Refresh Now" button (via netlify/functions/trigger-refresh.js) and manual runs from the
+  # GitHub UI/CLI kick off an off-cycle refresh.
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: node scripts/refresh.js
+        env:
+          SPORTSGAMEODDS_API_KEY: ${{ secrets.SPORTSGAMEODDS_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+          CURRENT_SEASON: ${{ secrets.CURRENT_SEASON }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          NETLIFY_BLOBS_TOKEN: ${{ secrets.NETLIFY_BLOBS_TOKEN }}
