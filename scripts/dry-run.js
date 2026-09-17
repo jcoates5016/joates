@@ -1,6 +1,13 @@
 // Runs the full pipeline against the demo dataset — no API keys needed. Confirms every factor category at
 // least runs without throwing, and prints a self-check summary.
 import { runPipeline } from "../lib/pipeline.js";
+import { estimatePropProbability } from "../lib/probability.js";
+import { gradeCompletedPicks, foldIntoLedger, summarizeLedger } from "../lib/grading.js";
+import { buildRosterIndex, buildDepthChartIndex, resolvePlayer } from "../lib/identity.js";
+import { findKeyTeammate } from "../lib/factors/index.js";
+import { buildDemoData } from "../lib/demoData.js";
+import { fetchNFLEvents } from "../lib/fetchers/odds.js";
+import { annotateGameLinesWithAI } from "../lib/ai.js";
 
 const SEASON = 2026;
 
@@ -132,6 +139,197 @@ const venueSplitIsRealStat = mahomesVenue?.available === true && mahomesVenue.st
   mahomesVenue.outdoorN >= 2 && mahomesVenue.domeN >= 2 && mahomesVenue.outdoorAvg > mahomesVenue.domeAvg + 50;
 console.log("Venue split uses the real per-prop stat, not always receiving+rushing yards (should be true):", venueSplitIsRealStat, mahomesVenue);
 
+// Regression guard for the name-format bug scripts/backtest.js caught: nflverse's play-by-play spells names
+// "X.Surname" ("D.Receiver"), never the full "Demo Receiver" every other source uses. Before identity.js's
+// pbpShortKey/shortForm fix, computePlayerRedZoneShare compared the two directly and never matched anyone,
+// silently returning a real-looking but always-~0 share. Demo Receiver has 10 team red-zone plays on record,
+// 10 of them his own touches (6 explicit rushes + 4 default-receiver filler plays) — a real share, not a
+// coincidental one, so this only passes if the short-form match actually works.
+const wrRedZone = wrRecYdsRow?.factors?.redZone;
+const redZoneShareIsReal = wrRedZone?.available === true && (wrRedZone.redZoneShare ?? 0) > 0.5;
+console.log("Red-zone share resolves a real, nonzero share via short-form PBP name matching (should be true):", redZoneShareIsReal, wrRedZone);
+
+// --- Probability model (lib/probability.js) ---
+// Regression guard for the point-score -> real-probability rework: every prop with a usable market number gets
+// a modelProb in [0,1], and trueEdge is exactly modelProb - marketProb, not some other derived quantity.
+const propsWithModel = snapshot.propRows.filter(r => r.model?.available);
+const modelShapeIsSane = propsWithModel.length > 0 && propsWithModel.every(r =>
+  r.modelProb >= 0 && r.modelProb <= 1 && Math.abs(r.trueEdge - (r.modelProb - r.marketProb)) < 0.0001 &&
+  ["low", "medium", "high", "excluded"].includes(r.confidence));
+console.log("Every prop with a market number gets a sane modelProb/trueEdge/confidence (should be true):", modelShapeIsSane, propsWithModel.length);
+
+// A hard override (player out/doubtful) must collapse the estimate near 0 regardless of how favorable every
+// other factor looks — no amount of context should make a bet on a player who might not play a good one. This
+// mirrors the old computeMispricedScore's -60 kill switch, just expressed as a probability instead of a point
+// penalty.
+const outOverrideResult = estimatePropProbability(
+  { selfInjury: { status: "Out" }, form: { available: true, n_last10: 10, rate_last10: 0.9, n_vsOpp: 3, rate_vsOpp: 0.9 } }, 0.55
+);
+const outOverrideWorks = outOverrideResult.available && outOverrideResult.modelProb <= 0.05 && outOverrideResult.confidence === "excluded";
+console.log("Self-injury OUT/doubtful hard-overrides the model near zero regardless of other factors (should be true):", outOverrideWorks, outOverrideResult);
+
+// A thin sample (a hot streak on just 2 games) must barely move the estimate away from the market's own
+// number — the whole point of anchoring to the market instead of building a probability from scratch. This is
+// what replaces the old system's flat +7-for-clearing-a-threshold bonus, which gave a 2-game fluke the exact
+// same weight as a real, deep trend.
+const thinSampleResult = estimatePropProbability({ form: { available: true, n_last10: 2, rate_last10: 1.0, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.50);
+const deepSampleResult = estimatePropProbability({ form: { available: true, n_last10: 10, rate_last10: 0.9, n_vsOpp: 3, rate_vsOpp: 0.9 } }, 0.50);
+const thinSampleStaysNearMarket = thinSampleResult.available && Math.abs(thinSampleResult.edge) < 0.08 && thinSampleResult.confidence === "low";
+const deepSampleMovesFurther = deepSampleResult.available && deepSampleResult.edge > thinSampleResult.edge;
+console.log("A 2-game hot streak barely moves off the market number and is flagged low-confidence (should be true):", thinSampleStaysNearMarket, thinSampleResult);
+console.log("A real 10+3-game trend moves the estimate further than a 2-game fluke (should be true):", deepSampleMovesFurther, deepSampleResult.edge, thinSampleResult.edge);
+
+// Regression guard: Mispriced Bets must be ranked by real statistical edge (model vs. market probability), not
+// the old flat point score — and every entry must actually clear the real minimum edge and confidence bar.
+const mispricedSortedByTrueEdge = snapshot.mispriced.every((r, i) => i === 0 || snapshot.mispriced[i - 1].trueEdge >= r.trueEdge);
+const mispricedAllClearBar = snapshot.mispriced.every(r => r.trueEdge > 0.03 && ["medium", "high"].includes(r.confidence));
+console.log("Mispriced Bets is sorted by real trueEdge, highest first (should be true):", mispricedSortedByTrueEdge, snapshot.mispriced.map(r => r.trueEdge));
+console.log("Every Mispriced Bets entry clears the real edge + confidence bar (should be true):", mispricedAllClearBar);
+
+// --- Results ledger (lib/grading.js) — unit-tested directly since demo mode has no Blobs store to round-trip through ---
+const now = new Date("2026-10-10T12:00:00Z");
+const syntheticGameLog = new Map([["demo grader", [{ season: 2026, week: 5, receiving_yards: 90, receptions: 6 }]]]);
+const syntheticPicks = [
+  { oddID: "hit-1", kind: "prop", player: "Demo Grader", playerKey: "demo grader", propType: "rec_yds", line: 59.5, side: "over",
+    kickoff: "2026-10-05T17:00:00Z", season: 2026, week: 5, modelProb: 0.65, marketProb: 0.52, edge: 0.13, confidence: "high",
+    graded: false, hit: null, actualValue: null, gradedAt: null },
+  { oddID: "miss-1", kind: "prop", player: "Demo Grader", playerKey: "demo grader", propType: "receptions", line: 7.5, side: "over",
+    kickoff: "2026-10-05T17:00:00Z", season: 2026, week: 5, modelProb: 0.58, marketProb: 0.50, edge: 0.08, confidence: "medium",
+    graded: false, hit: null, actualValue: null, gradedAt: null },
+  { oddID: "too-soon-1", kind: "prop", player: "Demo Grader", playerKey: "demo grader", propType: "rec_yds", line: 59.5, side: "over",
+    kickoff: "2026-10-10T06:00:00Z", season: 2026, week: 5, modelProb: 0.6, marketProb: 0.5, edge: 0.1, confidence: "medium",
+    graded: false, hit: null, actualValue: null, gradedAt: null }
+];
+const gradedNow = gradeCompletedPicks(syntheticPicks, syntheticGameLog, now);
+const gradingWorks = gradedNow.length === 2 && // the too-soon pick (kicked off 6h before `now`, under the 20h delay) must stay ungraded
+  syntheticPicks.find(p => p.oddID === "hit-1")?.hit === true && syntheticPicks.find(p => p.oddID === "hit-1")?.actualValue === 90 &&
+  syntheticPicks.find(p => p.oddID === "miss-1")?.hit === false &&
+  syntheticPicks.find(p => p.oddID === "too-soon-1")?.graded !== true;
+console.log("Grading correctly marks a real hit and a real miss, and leaves a too-recent game ungraded (should be true):", gradingWorks, syntheticPicks);
+
+const ledger = {};
+foldIntoLedger(ledger, gradedNow);
+const summary = summarizeLedger(ledger);
+const ledgerMathIsCorrect = summary.hasData && summary.totals.attempts === 2 && summary.totals.hits === 1 &&
+  Math.abs(summary.totals.hitRate - 0.5) < 0.0001 && summary.byConfidence.high?.attempts === 1 && summary.byConfidence.medium?.attempts === 1;
+console.log("Calibration ledger folds graded picks into correct totals + confidence buckets (should be true):", ledgerMathIsCorrect, summary);
+// Re-folding the same graded picks a second time must never happen in the live pipeline (gradeCompletedPicks
+// skips anything already marked graded) — proving that guard actually holds, since a double-fold would silently
+// double-count every historical result.
+const regradedNow = gradeCompletedPicks(syntheticPicks, syntheticGameLog, now);
+const regradeGuardWorks = regradedNow.length === 0;
+console.log("Already-graded picks are never re-graded on a later pass (should be true):", regradeGuardWorks);
+
+// --- Roster/depth-chart accuracy pass (lib/identity.js, lib/factors/index.js) ---
+// Unit-tested directly against the same fixtures buildDemoData feeds the pipeline, the same pattern already
+// used above for lib/probability.js and lib/grading.js — these fixtures don't have their own odds/props in
+// demoData's events, so there's nothing for a full pipeline run to surface them through.
+const demoRaw = buildDemoData(SEASON, [SEASON, SEASON - 1, SEASON - 2]);
+const rosterIdx = buildRosterIndex(demoRaw.rosterRows);
+const depthChartIdx = buildDepthChartIndex(demoRaw.depthChartRows);
+
+// Regression guard for the roster-index bug: roster_weekly_<season>.csv is one row per player PER WEEK, and a
+// traded player has one row per team. Building the index in raw (non-chronological) file order let whichever
+// row happened to land last win, not necessarily his current team. Demo Traded Wr's fixture is deliberately
+// scrambled and ends with a bogus postseason row — the only correct resolution is his real latest REG week (5, KC).
+const tradedRoster = rosterIdx.get("demo traded wr");
+const rosterIndexPicksLatestWeek = tradedRoster?.team === "KC" && tradedRoster?.asOfWeek === 5;
+console.log("Roster index resolves a traded player to his latest REG week's team, not raw file order (should be true):", rosterIndexPicksLatestWeek, tradedRoster);
+
+// Regression guard for the new depth-chart index: a real ranked WR2 resolves with the correct team, rank, and
+// group size (4 WRs on KC's demo depth chart: Demo Receiver, Demo Teammate Wr, Demo Traded Wr, Demo Fresh Trade Wr).
+const teammateDepthChart = depthChartIdx.get("demo teammate wr");
+const depthChartIndexWorks = teammateDepthChart?.team === "KC" && teammateDepthChart?.posRank === 2 && teammateDepthChart?.groupSize === 4;
+console.log("Depth-chart index resolves a real ranked WR2 with the correct group size (should be true):", depthChartIndexWorks, teammateDepthChart);
+
+// Regression guard for resolvePlayer's new conflict handling: Demo Fresh Trade Wr's weekly-roster row still
+// says DEN (the roster file's own weekly cadence lags a real trade), but the depth-chart fixture — standing in
+// for a scrape taken today — already shows him on KC. The fresher depth-chart source must win the team, and
+// the disagreement must be flagged so the pipeline can log it and the frontend can show it.
+const freshTradeResolved = resolvePlayer("Demo Fresh Trade Wr", new Map(), rosterIdx, depthChartIdx);
+const resolvePlayerPrefersDepthChartOnConflict = freshTradeResolved.team === "KC" && freshTradeResolved.rosterTeam === "DEN" &&
+  freshTradeResolved.depthChartTeam === "KC" && freshTradeResolved.rosterConflict === true;
+console.log("resolvePlayer prefers the fresher depth-chart team and flags the conflict (should be true):", resolvePlayerPrefersDepthChartOnConflict, freshTradeResolved);
+
+// Once the roster-index fix is in place, Demo Traded Wr's roster team (KC, from his latest week) and his
+// depth-chart team (also KC) agree — this must NOT be flagged as a conflict just because two different data
+// sources were consulted.
+const tradedResolved = resolvePlayer("Demo Traded Wr", new Map(), rosterIdx, depthChartIdx);
+const noConflictWhenBothSourcesAgree = tradedResolved.team === "KC" && tradedResolved.rosterConflict === false;
+console.log("No false roster-conflict flag once both sources agree on the same team (should be true):", noConflictWhenBothSourcesAgree, tradedResolved);
+
+// Regression guard for findKeyTeammate's new depth-chart-first behavior: Demo Receiver is the depth chart's own
+// WR1 on KC. The old volume-based heuristic can't even see him vs. Demo Teammate Wr (no game log for the
+// latter), but the real bug this closes is structural — a naive "must be rank 1" read would find nothing once
+// the player himself occupies that slot. The correct "key teammate" is the depth chart's real WR2.
+const demoReceiverPlayer = { team: "KC", position: "WR", _logKey: "demo receiver" };
+const keyTeammateUsesDepthChartRank = findKeyTeammate(demoReceiverPlayer, rosterIdx, new Map(), depthChartIdx) === "demo teammate wr";
+console.log("findKeyTeammate picks the depth chart's real WR2, not 'no result' (should be true):", keyTeammateUsesDepthChartRank);
+// And the existing QB exclusion still holds even with a depth chart available (Mahomes is depth-chart QB1 with
+// a real QB2 behind him — this must still return null, not surface a QB \"teammate out\" comparison that can't
+// happen on the field).
+const mahomesPlayer = { team: "KC", position: "QB", _logKey: "patrick mahomes" };
+const keyTeammateStillSkipsQb = findKeyTeammate(mahomesPlayer, rosterIdx, new Map(), depthChartIdx) === null;
+console.log("findKeyTeammate still returns null for QBs even with depth-chart data available (should be true):", keyTeammateStillSkipsQb);
+
+// Regression guard for the pipeline-level wiring: propRows carry the resolved depth-chart role fields, and the
+// pipeline's stats object counts real roster/depth-chart conflicts (0 expected in demo data — no prop in this
+// slate's events belongs to a fixture player with a genuine conflict).
+const anyPropHasDepthChartRole = snapshot.propRows.some(r => r.depthChartRole);
+const rosterConflictsStatIsPresent = typeof snapshot.stats.rosterConflicts === "number";
+console.log("At least one prop row carries a resolved depth-chart role (should be true):", anyPropHasDepthChartRole, snapshot.propRows.map(r => r.depthChartRole));
+console.log("Pipeline stats report a rosterConflicts count (should be true):", rosterConflictsStatIsPresent, snapshot.stats.rosterConflicts);
+
+// --- Odds-fetch resilience (lib/fetchers/odds.js) ---
+// Regression guard for a real live failure: SportsGameOdds 400s the ENTIRE request when even ONE requested
+// bookmakerID is unavailable at the account's subscription tier (confirmed live — "fanatics" tripped this
+// despite the tier's docs claiming 77 bookmakers are included, taking down every book/event in one shot, not
+// just that book's prices). fetchNFLEvents must detect that specific error shape, drop only the offending
+// bookmakerID, and retry with the rest — never fail the whole refresh over one bad book.
+const realFetch = globalThis.fetch;
+let oddsFetchCallCount = 0;
+globalThis.fetch = async (url) => {
+  oddsFetchCallCount++;
+  const requestedBooks = new URL(url).searchParams.get("bookmakerID").split(",");
+  if (requestedBooks.includes("brokenbook")) {
+    return { ok: false, status: 400, text: async () => JSON.stringify({ success: false, error: "The bookmakerID brokenbook is unavailable at your current subscription tier. Upgrade to unlock" }) };
+  }
+  return { ok: true, status: 200, json: async () => ({ success: true, data: [{ eventID: "e1" }] }) };
+};
+const oddsResult = await fetchNFLEvents("fake-key", ["draftkings", "brokenbook", "fanduel"], () => {});
+globalThis.fetch = realFetch;
+const oddsResilienceWorks = oddsFetchCallCount === 2 && oddsResult.length === 1 && oddsResult[0].eventID === "e1";
+console.log("A single unavailable bookmakerID is dropped and the request retried, not a total failure (should be true):", oddsResilienceWorks, `calls=${oddsFetchCallCount}`);
+
+// --- AI annotation concurrency (lib/ai.js) ---
+// Regression guard for a real live incident: right after this session's probability-model rebuild, every row's
+// AI-note cache hash changed at once (the hash is of the content actually sent to Claude, and that shape
+// changed), so a fully cold cache sent every batch, across every annotation pass, strictly one after another —
+// a live refresh ran past 13 minutes still waiting on sequential Anthropic round-trips. Any future change that
+// shifts enough rows' content causes the same full-cache-miss again, so batches must run several at a time
+// (bounded, not unlimited) rather than one at a time.
+const realAiFetch = globalThis.fetch;
+let aiCallsInFlight = 0, aiMaxConcurrent = 0, aiCallCount = 0;
+globalThis.fetch = async (url) => {
+  if (!String(url).includes("api.anthropic.com")) return realAiFetch(url);
+  aiCallCount++;
+  aiCallsInFlight++;
+  aiMaxConcurrent = Math.max(aiMaxConcurrent, aiCallsInFlight);
+  await new Promise(r => setTimeout(r, 30));
+  aiCallsInFlight--;
+  const fakeResults = Array.from({ length: 20 }, (_, i) => ({ id: i, tag: "pass", note: "synthetic test note" }));
+  return { ok: true, status: 200, json: async () => ({ content: [{ text: JSON.stringify(fakeResults) }] }) };
+};
+// 25 rows at annotateGameLinesWithAI's batch size of 20 makes exactly 2 batches — enough to prove they overlap.
+const syntheticGameLines = Array.from({ length: 25 }, (_, i) => ({
+  oddID: `gl-${i}`, matchup: "Demo Away @ Demo Home", market: "Total", side: "over 47.5",
+  bestEdge: 0.05, bestPrice: -110, bestBook: "draftkings", prices: {}, suspect: false, factors: {}
+}));
+await annotateGameLinesWithAI(syntheticGameLines, "fake-key", {}, () => {});
+globalThis.fetch = realAiFetch;
+const aiConcurrencyWorks = aiCallCount === 2 && aiMaxConcurrent >= 2;
+console.log("AI annotation batches run concurrently, not strictly one-at-a-time (should be true):", aiConcurrencyWorks, `calls=${aiCallCount} maxConcurrent=${aiMaxConcurrent}`);
+
 console.log("Any team mismatch in demo data (should be false):", anyMismatch);
 console.log("At least one prop resolved a real factor (should be true):", anyRealFactor);
 console.log("Every expected factor key present on a prop row (should be true):", missing.length === 0, missing.length ? `MISSING: ${missing.join(", ")}` : "");
@@ -142,7 +340,9 @@ console.log("EPA matchup-edge factor computed at least once on a game line (shou
 console.log("Scoring-environment factor computed at least once (should be true):", anyScoringEnv);
 console.log("Every game line is a Total (no Moneyline/Spread) (should be true):", !anyGameLineIsNotTotal);
 
-if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyGameLineMatchupEdge || !anyScoringEnv || anyGameLineIsNotTotal || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat) {
+if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyGameLineMatchupEdge || !anyScoringEnv || anyGameLineIsNotTotal || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat ||
+  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !ledgerMathIsCorrect || !regradeGuardWorks ||
+  !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks || !aiConcurrencyWorks) {
   console.log("\nFAILED — see above.");
   process.exit(1);
 } else {
