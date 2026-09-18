@@ -1,21 +1,21 @@
 name: Refresh APEX Edge data
 
 on:
-  # Every 30 minutes. On the Rookie tier (100,000 objects/month, upstream odds refreshed ~every 3 minutes)
-  # there's ample headroom for this — no comparable time limit here the way there was with Netlify Background
-  # Functions. Object cost still scales with events × markets per call in a way that can't be verified without
-  # watching real usage, so keep an eye on the SportsGameOdds dashboard for the first week and back this off
-  # (e.g. hourly) if usage runs hotter than expected.
-  schedule:
-    - cron: "*/30 * * * *"
-  # Lets the site's "Refresh Now" button (via netlify/functions/trigger-refresh.js) and manual runs from the
-  # GitHub UI/CLI kick off an off-cycle refresh.
+  # No `schedule:` trigger on purpose — this used to run every 30 minutes automatically, which (combined with
+  # every prop/game-line getting an AI note) was the main driver of a real Anthropic cost problem. Refreshes are
+  # manual-only now: either "Run workflow" here, or the site's "Refresh Now" button (which fires this same
+  # workflow_dispatch via netlify/functions/trigger-refresh.js) — nothing runs on its own anymore. Re-adding a
+  # `schedule:` block here is how a future auto-refresh would come back if that tradeoff changes.
   workflow_dispatch: {}
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Bumped from 20: a live cold-cache run (every AI note needing regeneration at once, right after the
+    # probability-model rebuild changed every row's cache-hash — see the CONCURRENCY comment in lib/ai.js) ran
+    # past 13 minutes before batches were parallelized. Kept as a safety margin, not the expected runtime —
+    # a normal warm-cache refresh should finish in well under this.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

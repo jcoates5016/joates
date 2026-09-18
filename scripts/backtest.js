@@ -68,10 +68,15 @@ function groupRedZonePlaysByTeam(priorPbp) {
   return byTeam;
 }
 const TD_PROP_TYPES = ["td", "td_pass", "td_rush", "td_rec"];
-// TD-style props have a real, fixed threshold in the live app (thresholdFor returns 0 — "at least 1" is the
-// whole bet) — the fixed threshold, not a trailing average, so re-deriving that here matters: a low-mean
-// counting stat clears its own trailing MEAN well under half the time by construction (Poisson-shaped — mostly
-// 0s, occasionally 1), which showed up as an artificially low ~37% baseline hit rate before this was split out.
+// This backtest has no real per-game market line to test against for a past season, only a trailing average —
+// so for every TD-flavored prop it deliberately grades against a fixed "did it happen at all" (0) threshold
+// instead, purely as a research stand-in. That's a different, DELIBERATE simplification from the live app's own
+// grading, not a claim that it matches it: the live app's real Passing/Rushing/Receiving TD props are genuine
+// Over/Under markets with an actual posted line (thresholdFor in playerSplits.js grades those against the real
+// line, same as a yardage/reception prop) — only Anytime TD ("td") is truly a 0-threshold yes/no market there.
+// The reason this fixed 0 still matters here: a low-mean counting stat clears its own trailing MEAN well under
+// half the time by construction (Poisson-shaped — mostly 0s, occasionally 1), which showed up as an
+// artificially low ~37% baseline hit rate before TD props were split out from the trailing-average approach.
 // Yardage/reception props have no such fixed threshold in real markets, so the trailing average remains the
 // least-bad available stand-in for "about where the market has this player projected."
 function backtestThreshold(propType, trailingAvg) {

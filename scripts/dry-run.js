@@ -1,6 +1,17 @@
 // Runs the full pipeline against the demo dataset — no API keys needed. Confirms every factor category at
-// least runs without throwing, and prints a self-check summary.
+// least runs without throwing, and prints a self-check summary. Player-props only now — game lines/moneylines
+// were removed from this build entirely (see analyze.js/probability.js/parlays.js/README).
 import { runPipeline } from "../lib/pipeline.js";
+import { estimatePropProbability } from "../lib/probability.js";
+import { MODEL_COEFFS } from "../lib/modelCoeffs.js";
+import { gradeCompletedPicks, foldIntoLedger, summarizeLedger } from "../lib/grading.js";
+import { buildRosterIndex, buildDepthChartIndex, resolvePlayer } from "../lib/identity.js";
+import { findKeyTeammate } from "../lib/factors/index.js";
+import { computeBestAcrossBooks } from "../lib/analyze.js";
+import { buildDemoData } from "../lib/demoData.js";
+import { fetchNFLEvents } from "../lib/fetchers/odds.js";
+import { annotatePropsWithAI, annotateScoutingTakes, selectAiEligible, roundForHash } from "../lib/ai.js";
+import { classifyKickoffWindow, summarizeEvents, buildAllParlays, buildSameGameParlays, buildSlateParlays, RISK_TIERS, MIN_LEG_PROBABILITY } from "../lib/parlays.js";
 
 const SEASON = 2026;
 
@@ -15,9 +26,6 @@ console.log(JSON.stringify(snapshot.stats, null, 2));
 console.log("\n=== SAMPLE PROP (full factor dump) ===");
 console.log(JSON.stringify(snapshot.propRows[0], null, 2));
 
-console.log("\n=== SAMPLE GAME LINE (full factor dump) ===");
-console.log(JSON.stringify(snapshot.gameLines[0], null, 2));
-
 console.log("\n=== MISPRICED COUNT ===", snapshot.mispriced.length);
 console.log("\n=== PARLAYS ===");
 snapshot.parlays.forEach(p => console.log(`${p.tier.label} -> ${p.ok ? `${p.legs.length} legs, ${p.combinedAmerican}` : p.reason}`));
@@ -27,10 +35,9 @@ snapshot.logs.forEach(l => console.log(l.msg));
 
 const factorKeys = Object.keys(snapshot.propRows[0].factors || {});
 const expected = ["form", "tendency", "venue", "weatherHistorical", "weatherForecast", "birthday",
-  "usage", "redZone", "twoMinute", "defense", "matchupEdge", "scoringEnvironment", "schedule", "starterChange",
-  "referee", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "situationalNote"];
+  "usage", "redZone", "twoMinute", "defense", "matchupEdge", "scoringEnvironment", "secondaryInjury", "schedule",
+  "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "situationalNote"];
 const missing = expected.filter(k => !factorKeys.includes(k));
-const anyGameLineIsNotTotal = snapshot.gameLines.some(r => r.market !== "Total");
 
 console.log("\n=== SELF-CHECK ===");
 const anyMismatch = snapshot.propRows.some(r => r.teamMismatch);
@@ -39,7 +46,6 @@ const anyRedZone = snapshot.propRows.some(r => r.factors.redZone?.available);
 const anyDefense = snapshot.propRows.some(r => r.factors.defense?.available);
 const anyMatchupEdge = snapshot.propRows.some(r => r.factors.matchupEdge?.available);
 const anyScoringEnv = snapshot.propRows.some(r => r.factors.scoringEnvironment?.available);
-const anyGameLineMatchupEdge = snapshot.gameLines.some(r => r.factors?.matchupEdge?.homeOffVsAwayDef?.available || r.factors?.matchupEdge?.awayOffVsHomeDef?.available);
 
 // Regression guard for the real bug caught on a live Rookie-tier refresh: SportsGameOdds publishes the
 // combined "touchdowns" stat under two different market shapes at once — a real yes/no market and a broken
@@ -57,19 +63,589 @@ const mahomesTd = anytimeTdRows.find(r => r.player === "Patrick Mahomes");
 const mahomesTdHitRateIsZero = mahomesTd ? mahomesTd.factors?.form?.rate_last3 === 0 : false;
 console.log("QB's own Anytime TD hit rate excludes his passing TDs (should be true):", mahomesTdHitRateIsZero, mahomesTd?.factors?.form);
 
+// Regression guard for the third live bug: a yardage/reception prop's "hit rate" must be graded against the
+// bet's ACTUAL line, not "recorded any stat > 0" (which is nearly always true and was silently inflating every
+// hit rate on the board). Demo Receiver's receiving yards over his last 3 demo weeks are 40, 78, 40 against a
+// 59.5-yard line — exactly 1 of those 3 clears it, so rate_last3 must be 1/3, never 3/3.
+const wrRecYdsRow = snapshot.propRows.find(r => r.propType === "rec_yds" && r.player === "Demo Receiver");
+const recYdsRateIsCorrect = wrRecYdsRow ? Math.abs((wrRecYdsRow.factors?.form?.rate_last3 ?? -1) - (1 / 3)) < 0.001 : false;
+console.log("Yardage prop hit rate is graded against the real line, not '> 0' (should be true):", recYdsRateIsCorrect, wrRecYdsRow?.line, wrRecYdsRow?.factors?.form);
+
+// Regression guard for a real live bug (caught by Jon reading his own card): Passing/Rushing/Receiving TD props
+// are real Over/Under markets with an actual posted line ("Passing TDs over 1.5"), not the same thing as
+// Anytime TD's true yes/no "did it happen at all" market — thresholdFor in playerSplits.js used to lump all
+// four TD-flavored prop types together and grade every one of them against a hardcoded 0 ("at least 1")
+// regardless of the real line, so a QB posted at "over 1.5" who threw exactly 1 TD a given week was counted as
+// having HIT that week. Mahomes's demo passing-TD line is 1.5; weeks 1-2 have him at exactly 1 TD (must be a
+// miss) and weeks 3-7 at 2 TDs (a real hit) — this only passes if the threshold is really 1.5, not 0.
+const mahomesPassTd = snapshot.propRows.find(r => r.propType === "td_pass" && r.player === "Patrick Mahomes");
+const passTdForm = mahomesPassTd?.factors?.form;
+const week1Game = passTdForm?.gameLog?.find(g => g.season === SEASON && g.week === 1);
+const week3Game = passTdForm?.gameLog?.find(g => g.season === SEASON && g.week === 3);
+const tdPropGradesAgainstRealLine = passTdForm?.line === 1.5 && week1Game?.statValue === 1 && week1Game?.hit === false &&
+  week3Game?.statValue === 2 && week3Game?.hit === true;
+console.log("Passing TDs prop is graded against its real 1.5 line, not a hardcoded 'at least 1' (should be true):", tdPropGradesAgainstRealLine, passTdForm?.line, week1Game, week3Game);
+
+// Regression guard for the fourth live request: an ACCURATE, verifiable last-10-games breakdown, not just a
+// trust-me percentage — and it must survive a season boundary. Demo Receiver has 5 current-season games plus
+// 10 prior-season 999-yard marker games pushed into statRows AFTER them (matching how a real multi-season fetch
+// concatenates). If buildGameLogIndex didn't sort chronologically, or computeFormFactor's last-10 window wasn't
+// a real 10-game cap, this would silently pass anyway — so check the actual numbers, not just availability.
+const form = wrRecYdsRow?.factors?.form;
+const gameLog = form?.gameLog || [];
+// Exactly 10 games, most recent first: all 5 current-season weeks (5 down to 1), then the 5 *newest* of the
+// 10 prior-season marker games (weeks 10 down to 6) — the 5 oldest prior-season games (weeks 1-5) must be cut.
+const expectedLast10 = [
+  { season: SEASON, week: 5 }, { season: SEASON, week: 4 }, { season: SEASON, week: 3 },
+  { season: SEASON, week: 2 }, { season: SEASON, week: 1 },
+  { season: SEASON - 1, week: 10 }, { season: SEASON - 1, week: 9 }, { season: SEASON - 1, week: 8 },
+  { season: SEASON - 1, week: 7 }, { season: SEASON - 1, week: 6 }
+];
+const last10ShapeIsCorrect = gameLog.length === 10 &&
+  expectedLast10.every((e, i) => gameLog[i]?.season === e.season && gameLog[i]?.week === e.week);
+// Last-3 must be purely current-season (weeks 3,4,5) — a year-old 999-yard marker game must never leak in just
+// because it was pushed into statRows later than these rows. gameLog is most-recent-first, so "last 3" is its
+// first 3 entries.
+const last3Rows = gameLog.slice(0, 3);
+const last3IsCurrentSeasonOnly = last3Rows.length === 3 && last3Rows.every(g => g.season === SEASON);
+// rate_last10: 5 current-season hits at weeks 2,4 (40/78 alternating pattern, hit=w%2===0) = 2 hits, plus the
+// 5 included prior-season marker games (999 yards, always a hit) = 7 of 10.
+const rate10IsCorrect = form ? Math.abs((form.rate_last10 ?? -1) - 0.7) < 0.001 : false;
+console.log("Last-10-games gameLog has the right games in the right order (should be true):", last10ShapeIsCorrect, gameLog.map(g => `${g.season}wk${g.week}`));
+console.log("Last-3-games never crosses into a prior season (should be true):", last3IsCurrentSeasonOnly, last3Rows.map(g => `${g.season}wk${g.week}`));
+console.log("Last-10 hit rate correctly caps at 10 games, not all games on record (should be true):", rate10IsCorrect, form?.rate_last10, form?.n_season);
+
+// Regression guard for the newest live request: a starting QB's stats must never be explained by his own
+// backup's presence/absence — the two never share the field while the starter is healthy, so "without him,
+// numbers jump" is a data artifact, not a signal. Demo Backup Qb is a real, resolvable candidate on KC's roster
+// (with his own thin game log) specifically so this proves findKeyTeammate is explicitly excluding QBs, not
+// just failing to find anyone.
+const mahomesTendencyIsSkipped = mahomesTd ? mahomesTd.factors?.tendency?.available === false : false;
+console.log("QB prop rows never carry backup-QB 'teammate out' tendency talk (should be true):", mahomesTendencyIsSkipped, mahomesTd?.factors?.tendency);
+
+// Regression guard for the newest live request: parlay tiers must offer real shuffle-able alternates, not just
+// a single locked-in build per tier thrown together from whichever book scored highest.
+const okTiers = snapshot.parlays.filter(p => p.ok);
+const anyParlayHasAlternates = okTiers.some(p => (p.alternates || []).length >= 1);
+console.log("At least one parlay tier offers a real shuffle alternate (should be true):", anyParlayHasAlternates, okTiers.map(p => `${p.tier.key}:${(p.alternates || []).length}`));
+
+// Regression guard for widened book coverage: FanDuel is deliberately the best number on Mahomes's passing-TDs
+// market in demoData, so this proves BOOKS/BOOK_IDS being widened past draftkings/espnbet actually flows through
+// collectAutoPrices -> computeBestAcrossBooks, not just sitting unused in the payload. (mahomesPassTd itself is
+// declared earlier, alongside the TD-prop-line regression test.)
+const widerBookCoverageWorks = mahomesPassTd?.bestBook === "fanduel";
+console.log("A non-DK/theScore-Bet book (FanDuel) can win best price now that more books are tracked (should be true):", widerBookCoverageWorks, mahomesPassTd?.bestBook, mahomesPassTd?.prices);
+
+// Regression guard for the opposing-secondary-injury factor: BUF (this event's opponent for every KC player)
+// has 2 demo CB/S injuries on record. Both a passing-yards prop and a receiving-yards prop against BUF should
+// see it; a rushing prop never should (gated out entirely in factors/index.js).
+const mahomesPassYds = snapshot.propRows.find(r => r.propType === "pass_yds" && r.player === "Patrick Mahomes");
+const secondaryInjuryWorks = mahomesPassTd?.factors?.secondaryInjury?.available === true && mahomesPassTd.factors.secondaryInjury.count === 2 &&
+  wrRecYdsRow?.factors?.secondaryInjury?.available === true && wrRecYdsRow.factors.secondaryInjury.count === 2;
+console.log("Opposing-secondary-injury factor resolves for passing/receiving props (should be true):", secondaryInjuryWorks, mahomesPassTd?.factors?.secondaryInjury, wrRecYdsRow?.factors?.secondaryInjury);
+
+// Regression guard for generalizing the venue split to the real per-prop stat: before this fix, computeVenueSplit
+// always measured (receiving+rushing yards) regardless of prop, so a QB's indoor/outdoor split on a passing-yards
+// prop was measuring the wrong stat entirely (near-zero either way). Mahomes's demo dome games (weeks 1-4, avg
+// 245 passing yards) vs. his outdoor games (weeks 5-7, avg 330) should show a real, correctly-labeled gap now.
+const mahomesVenue = mahomesPassYds?.factors?.venue;
+const venueSplitIsRealStat = mahomesVenue?.available === true && mahomesVenue.statLabel === "passing yards" &&
+  mahomesVenue.outdoorN >= 2 && mahomesVenue.domeN >= 2 && mahomesVenue.outdoorAvg > mahomesVenue.domeAvg + 50;
+console.log("Venue split uses the real per-prop stat, not always receiving+rushing yards (should be true):", venueSplitIsRealStat, mahomesVenue);
+
+// New regression guard, from wiring the venue split into an actual scored nudge (lib/probability.js): this
+// week's real game (week 5, KC @ BUF) is outdoors, and Mahomes's outdoor passing-yards average already beats
+// his dome average (the split above) — so the venue_edge nudge should actually fire on his passing-yards row,
+// not just sit computed-but-unused the way it did before this rebuild.
+const venueNudgeFiresOnRealRow = (mahomesPassYds?.modelContributors || []).some(c => /performs better outdoors/.test(c));
+console.log("Venue-vs-roof nudge actually fires on a real prop row when the split and this week's roof agree (should be true):", venueNudgeFiresOnRealRow, mahomesPassYds?.modelContributors);
+
+// Regression guard for the name-format bug scripts/backtest.js caught: nflverse's play-by-play spells names
+// "X.Surname" ("D.Receiver"), never the full "Demo Receiver" every other source uses. Before identity.js's
+// pbpShortKey/shortForm fix, computePlayerRedZoneShare compared the two directly and never matched anyone,
+// silently returning a real-looking but always-~0 share. Demo Receiver has 10 team red-zone plays on record,
+// 10 of them his own touches (6 explicit rushes + 4 default-receiver filler plays) — a real share, not a
+// coincidental one, so this only passes if the short-form match actually works.
+const wrRedZone = wrRecYdsRow?.factors?.redZone;
+const redZoneShareIsReal = wrRedZone?.available === true && (wrRedZone.redZoneShare ?? 0) > 0.5;
+console.log("Red-zone share resolves a real, nonzero share via short-form PBP name matching (should be true):", redZoneShareIsReal, wrRedZone);
+
+// --- Probability model (lib/probability.js) ---
+// Regression guard for the point-score -> real-probability rework: every prop with a usable market number gets
+// a modelProb in [0,1], and trueEdge is exactly modelProb - marketProb, not some other derived quantity.
+const propsWithModel = snapshot.propRows.filter(r => r.model?.available);
+const modelShapeIsSane = propsWithModel.length > 0 && propsWithModel.every(r =>
+  r.modelProb >= 0 && r.modelProb <= 1 && Math.abs(r.trueEdge - (r.modelProb - r.marketProb)) < 0.0001 &&
+  ["low", "medium", "high", "excluded"].includes(r.confidence));
+console.log("Every prop with a market number gets a sane modelProb/trueEdge/confidence (should be true):", modelShapeIsSane, propsWithModel.length);
+
+// A hard override (player out/doubtful) must collapse the estimate near 0 regardless of how favorable every
+// other factor looks — no amount of context should make a bet on a player who might not play a good one. This
+// mirrors the old computeMispricedScore's -60 kill switch, just expressed as a probability instead of a point
+// penalty.
+const outOverrideResult = estimatePropProbability(
+  { selfInjury: { status: "Out" }, form: { available: true, n_last10: 10, rate_last10: 0.9, n_vsOpp: 3, rate_vsOpp: 0.9 } }, 0.55
+);
+const outOverrideWorks = outOverrideResult.available && outOverrideResult.modelProb <= 0.05 && outOverrideResult.confidence === "excluded";
+console.log("Self-injury OUT/doubtful hard-overrides the model near zero regardless of other factors (should be true):", outOverrideWorks, outOverrideResult);
+
+// A thin sample (a hot streak on just 2 games) must barely move the estimate away from the market's own
+// number — the whole point of anchoring to the market instead of building a probability from scratch. This is
+// what replaces the old system's flat +7-for-clearing-a-threshold bonus, which gave a 2-game fluke the exact
+// same weight as a real, deep trend.
+const thinSampleResult = estimatePropProbability({ form: { available: true, n_last10: 2, rate_last10: 1.0, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.50);
+const deepSampleResult = estimatePropProbability({ form: { available: true, n_last10: 10, rate_last10: 0.9, n_vsOpp: 3, rate_vsOpp: 0.9 } }, 0.50);
+const thinSampleStaysNearMarket = thinSampleResult.available && Math.abs(thinSampleResult.edge) < 0.08 && thinSampleResult.confidence === "low";
+const deepSampleMovesFurther = deepSampleResult.available && deepSampleResult.edge > thinSampleResult.edge;
+console.log("A 2-game hot streak barely moves off the market number and is flagged low-confidence (should be true):", thinSampleStaysNearMarket, thinSampleResult);
+console.log("A real 10+3-game trend moves the estimate further than a 2-game fluke (should be true):", deepSampleMovesFurther, deepSampleResult.edge, thinSampleResult.edge);
+
+// --- New factor nudges (lib/probability.js) — unit-tested directly with synthetic factors, since the demo
+// pipeline can't exercise weather (gated `!demo`) or practice trend (injuryHistory stays [] in demo mode). ---
+const baseline = estimatePropProbability({ form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55).modelProb;
+
+// Weather: personal history wins when there's enough of it (2+ real wet games), even when it points the
+// OPPOSITE way from the generic positional read — a rushing prop whose own player actually does WORSE in bad
+// weather must get penalized, not boosted just because he's a runner.
+const weatherPersonalBoost = estimatePropProbability({
+  propType: "rush_yds", weatherForecast: { precipProb: 70, windMph: 5 },
+  weatherHistorical: { available: true, wetN: 3, wetAvg: 90, dryAvg: 60 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const weatherPersonalPenalty = estimatePropProbability({
+  propType: "rush_yds", weatherForecast: { precipProb: 70, windMph: 5 },
+  weatherHistorical: { available: true, wetN: 3, wetAvg: 40, dryAvg: 60 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const weatherRunFavor = estimatePropProbability({
+  propType: "rush_yds", weatherForecast: { precipProb: 70, windMph: 5 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const weatherPassPenalty = estimatePropProbability({
+  propType: "pass_yds", weatherForecast: { precipProb: 70, windMph: 5 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const goodWeatherNoNudge = estimatePropProbability({
+  propType: "pass_yds", weatherForecast: { precipProb: 10, windMph: 3 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const weatherNudgesWork = weatherPersonalBoost.modelProb > baseline && weatherPersonalPenalty.modelProb < baseline &&
+  weatherRunFavor.modelProb > baseline && weatherPassPenalty.modelProb < baseline &&
+  Math.abs(goodWeatherNoNudge.modelProb - baseline) < 0.0001 &&
+  weatherPersonalBoost.contributors.some(c => /personal history/.test(c)) &&
+  weatherRunFavor.contributors.some(c => /favors the run/.test(c)) &&
+  weatherPassPenalty.contributors.some(c => /against the passing/.test(c));
+console.log("Weather nudge: personal history wins when available, else falls back to the positional read, and never fires in good weather (should be true):", weatherNudgesWork,
+  { baseline, boost: weatherPersonalBoost.modelProb, penalty: weatherPersonalPenalty.modelProb, runFavor: weatherRunFavor.modelProb, passPenalty: weatherPassPenalty.modelProb, goodWeather: goodWeatherNoNudge.modelProb });
+
+// Venue: only fires when the split is real (2+ games each way) AND cross-referenced against THIS week's actual
+// roof — a QB who's better in a dome gets no boost from that history in an outdoor game.
+const venueMatch = estimatePropProbability({
+  propType: "pass_yds", roof: "dome", venue: { available: true, domeN: 4, outdoorN: 3, domeAvg: 300, outdoorAvg: 220 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const venueMismatch = estimatePropProbability({
+  propType: "pass_yds", roof: "outdoors", venue: { available: true, domeN: 4, outdoorN: 3, domeAvg: 300, outdoorAvg: 220 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const venueThinSample = estimatePropProbability({
+  propType: "pass_yds", roof: "dome", venue: { available: true, domeN: 1, outdoorN: 1, domeAvg: 300, outdoorAvg: 220 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const venueNudgeWorks = venueMatch.modelProb > baseline && Math.abs(venueMismatch.modelProb - baseline) < 0.0001 &&
+  Math.abs(venueThinSample.modelProb - baseline) < 0.0001;
+console.log("Venue nudge only fires when the split is real AND matches this week's actual roof (should be true):", venueNudgeWorks,
+  { baseline, match: venueMatch.modelProb, mismatch: venueMismatch.modelProb, thinSample: venueThinSample.modelProb });
+
+// Practice trend: direction matters, not just availability — worsening penalizes, improving helps, no real
+// change (or an unrecognized status string) does nothing.
+const trendDown = estimatePropProbability({ practiceTrend: { available: true, first: "Full", current: "Did Not Participate", trend: "Full -> DNP" }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const trendUp = estimatePropProbability({ practiceTrend: { available: true, first: "Did Not Participate", current: "Full", trend: "DNP -> Full" }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const trendFlat = estimatePropProbability({ practiceTrend: { available: true, first: "Limited", current: "Limited", trend: "no change" }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const practiceTrendWorks = trendDown.modelProb < baseline && trendUp.modelProb > baseline && Math.abs(trendFlat.modelProb - baseline) < 0.0001;
+console.log("Practice-trend nudge scores direction (worsening penalizes, improving helps, flat does nothing) (should be true):", practiceTrendWorks,
+  { baseline, down: trendDown.modelProb, up: trendUp.modelProb, flat: trendFlat.modelProb });
+
+// Market steam: scaled by magnitude now, not a flat bump for any move at all — a bigger shortening must move the
+// estimate further than a small one, and the scaling must actually cap out (not blow up) on an extreme move.
+const steamSmall = estimatePropProbability({ marketMovement: { available: true, priceMove: -5 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const steamBig = estimatePropProbability({ marketMovement: { available: true, priceMove: -20 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const steamExtreme = estimatePropProbability({ marketMovement: { available: true, priceMove: -400 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const steamCapMatch = estimatePropProbability({ marketMovement: { available: true, priceMove: -40 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const steamMagnitudeScalingWorks = steamSmall.modelProb > baseline && steamBig.modelProb > steamSmall.modelProb &&
+  Math.abs(steamExtreme.modelProb - steamCapMatch.modelProb) < 0.0001; // both past the 2x cap -> identical result
+console.log("Market steam is scaled by magnitude and caps out rather than blowing up on an extreme move (should be true):", steamMagnitudeScalingWorks,
+  { baseline, small: steamSmall.modelProb, big: steamBig.modelProb, extreme: steamExtreme.modelProb, capMatch: steamCapMatch.modelProb });
+
+// --- Suspect vs. stale-line value (lib/analyze.js) ---
+// A big outlier edge with real corroboration from the rest of the panel (>=2 other books, most agreeing with
+// consensus) is real, bettable stale-line value — surfaced, not thrown away. The same size outlier with NO real
+// corroboration (every other book also disagrees, or too few other books exist to tell) stays `suspect` and gets
+// excluded, on the theory that a shared data problem can affect more than one book.
+const refProb = 0.55;
+const staleValueRow = { prices: { draftkings: 250, fanduel: -122, betmgm: -125, caesars: -128, espnbet: -120 } }; // draftkings is the lone stale outlier; the other 4 tightly agree with refProb
+const staleValueResult = computeBestAcrossBooks(staleValueRow, refProb);
+const suspectRow = { prices: { draftkings: 250, fanduel: 180, betmgm: -125 } }; // fanduel also disagrees wildly -> no real corroboration
+const suspectResult = computeBestAcrossBooks(suspectRow, refProb);
+const staleVsSuspectWorks = staleValueResult.staleValue === true && staleValueResult.suspect === false &&
+  suspectResult.suspect === true && suspectResult.staleValue === false;
+console.log("A corroborated outlier is flagged staleValue (surfaced), an uncorroborated one stays suspect (excluded) (should be true):", staleVsSuspectWorks, staleValueResult, suspectResult);
+
+// Regression guard for the real live prop-row wiring: analyzePlayerProps must actually set row.suspect/
+// row.staleValue from computeBestAcrossBooks, not just compute-and-discard them.
+const anySuspectOrStaleFieldPresent = snapshot.propRows.every(r => typeof r.suspect === "boolean" && typeof r.staleValue === "boolean");
+console.log("Every prop row carries real suspect/staleValue boolean fields (should be true):", anySuspectOrStaleFieldPresent);
+
+// Regression guard: Mispriced Bets must be ranked by real statistical edge (model vs. market probability), not
+// the old flat point score — and every entry must actually clear the real minimum edge and confidence bar.
+const mispricedSortedByTrueEdge = snapshot.mispriced.every((r, i) => i === 0 || snapshot.mispriced[i - 1].trueEdge >= r.trueEdge);
+const mispricedAllClearBar = snapshot.mispriced.every(r => r.trueEdge > 0.03 && ["medium", "high"].includes(r.confidence));
+console.log("Mispriced Bets is sorted by real trueEdge, highest first (should be true):", mispricedSortedByTrueEdge, snapshot.mispriced.map(r => r.trueEdge));
+console.log("Every Mispriced Bets entry clears the real edge + confidence bar (should be true):", mispricedAllClearBar);
+
+// --- Results ledger (lib/grading.js) — unit-tested directly since demo mode has no Blobs store to round-trip through ---
+const now = new Date("2026-10-10T12:00:00Z");
+const syntheticGameLog = new Map([["demo grader", [{ season: 2026, week: 5, receiving_yards: 90, receptions: 6 }]]]);
+const syntheticPicks = [
+  { oddID: "hit-1", kind: "prop", player: "Demo Grader", playerKey: "demo grader", propType: "rec_yds", line: 59.5, side: "over",
+    kickoff: "2026-10-05T17:00:00Z", season: 2026, week: 5, modelProb: 0.65, marketProb: 0.52, edge: 0.13, confidence: "high",
+    pickPrice: -120, pickBook: "draftkings", closingPrice: null, closingBook: null, clv: null,
+    graded: false, hit: null, actualValue: null, gradedAt: null },
+  { oddID: "miss-1", kind: "prop", player: "Demo Grader", playerKey: "demo grader", propType: "receptions", line: 7.5, side: "over",
+    kickoff: "2026-10-05T17:00:00Z", season: 2026, week: 5, modelProb: 0.58, marketProb: 0.50, edge: 0.08, confidence: "medium",
+    pickPrice: -110, pickBook: "draftkings", closingPrice: null, closingBook: null, clv: null,
+    graded: false, hit: null, actualValue: null, gradedAt: null },
+  { oddID: "too-soon-1", kind: "prop", player: "Demo Grader", playerKey: "demo grader", propType: "rec_yds", line: 59.5, side: "over",
+    kickoff: "2026-10-10T06:00:00Z", season: 2026, week: 5, modelProb: 0.6, marketProb: 0.5, edge: 0.1, confidence: "medium",
+    pickPrice: -115, pickBook: "draftkings", closingPrice: null, closingBook: null, clv: null,
+    graded: false, hit: null, actualValue: null, gradedAt: null }
+];
+// CLV fixture: "hit-1" was picked at -120 (54.5% implied) and the price on record moved to -140 (58.3% implied)
+// by the time this grades — real positive closing-line value, independent of whether the pick itself hit.
+// "miss-1" shares an oddID with no price-history entry at all, so its CLV must stay null, not silently 0.
+const syntheticPriceHistory = { "hit-1|draftkings": [{ t: "2026-10-01T00:00:00Z", price: -120 }, { t: "2026-10-04T00:00:00Z", price: -140 }] };
+const gradedNow = gradeCompletedPicks(syntheticPicks, syntheticGameLog, syntheticPriceHistory, now);
+const gradingWorks = gradedNow.length === 2 && // the too-soon pick (kicked off 6h before `now`, under the 20h delay) must stay ungraded
+  syntheticPicks.find(p => p.oddID === "hit-1")?.hit === true && syntheticPicks.find(p => p.oddID === "hit-1")?.actualValue === 90 &&
+  syntheticPicks.find(p => p.oddID === "miss-1")?.hit === false &&
+  syntheticPicks.find(p => p.oddID === "too-soon-1")?.graded !== true;
+console.log("Grading correctly marks a real hit and a real miss, and leaves a too-recent game ungraded (should be true):", gradingWorks, syntheticPicks);
+
+const hitPick = syntheticPicks.find(p => p.oddID === "hit-1");
+const missPick = syntheticPicks.find(p => p.oddID === "miss-1");
+const clvWorks = hitPick?.closingPrice === -140 && hitPick?.closingBook === "draftkings" &&
+  Math.abs(hitPick.clv - (140 / 240 - 120 / 220)) < 0.001 && // americanToImpliedProb(-140) - americanToImpliedProb(-120)
+  hitPick.clv > 0 && missPick?.clv === null && missPick?.closingPrice === null;
+console.log("CLV computes from the captured pick price vs. the last known price on record, and stays null with no history (should be true):", clvWorks, hitPick?.clv, hitPick?.closingPrice, missPick?.clv);
+
+const ledger = {};
+foldIntoLedger(ledger, gradedNow);
+const summary = summarizeLedger(ledger);
+const ledgerMathIsCorrect = summary.hasData && summary.totals.attempts === 2 && summary.totals.hits === 1 &&
+  Math.abs(summary.totals.hitRate - 0.5) < 0.0001 && summary.byConfidence.high?.attempts === 1 && summary.byConfidence.medium?.attempts === 1;
+console.log("Calibration ledger folds graded picks into correct totals + confidence buckets (should be true):", ledgerMathIsCorrect, summary);
+// CLV should fold only from the one graded pick that actually has a closing price (hit-1) — miss-1's null CLV
+// must not corrupt the average or be miscounted as a real zero.
+const ledgerClvIsCorrect = summary.totals.clvCount === 1 && summary.totals.avgClv != null && Math.abs(summary.totals.avgClv - hitPick.clv) < 0.001;
+console.log("Calibration ledger folds CLV only from picks that actually have one on record (should be true):", ledgerClvIsCorrect, summary.totals);
+// Re-folding the same graded picks a second time must never happen in the live pipeline (gradeCompletedPicks
+// skips anything already marked graded) — proving that guard actually holds, since a double-fold would silently
+// double-count every historical result.
+const regradedNow = gradeCompletedPicks(syntheticPicks, syntheticGameLog, syntheticPriceHistory, now);
+const regradeGuardWorks = regradedNow.length === 0;
+console.log("Already-graded picks are never re-graded on a later pass (should be true):", regradeGuardWorks);
+
+// --- Roster/depth-chart accuracy pass (lib/identity.js, lib/factors/index.js) ---
+// Unit-tested directly against the same fixtures buildDemoData feeds the pipeline, the same pattern already
+// used above for lib/probability.js and lib/grading.js — these fixtures don't have their own odds/props in
+// demoData's events, so there's nothing for a full pipeline run to surface them through.
+const demoRaw = buildDemoData(SEASON, [SEASON, SEASON - 1, SEASON - 2]);
+const rosterIdx = buildRosterIndex(demoRaw.rosterRows);
+const depthChartIdx = buildDepthChartIndex(demoRaw.depthChartRows);
+
+// Regression guard for the roster-index bug: roster_weekly_<season>.csv is one row per player PER WEEK, and a
+// traded player has one row per team. Building the index in raw (non-chronological) file order let whichever
+// row happened to land last win, not necessarily his current team. Demo Traded Wr's fixture is deliberately
+// scrambled and ends with a bogus postseason row — the only correct resolution is his real latest REG week (5, KC).
+const tradedRoster = rosterIdx.get("demo traded wr");
+const rosterIndexPicksLatestWeek = tradedRoster?.team === "KC" && tradedRoster?.asOfWeek === 5;
+console.log("Roster index resolves a traded player to his latest REG week's team, not raw file order (should be true):", rosterIndexPicksLatestWeek, tradedRoster);
+
+// Regression guard for the new depth-chart index: a real ranked WR2 resolves with the correct team, rank, and
+// group size (4 WRs on KC's demo depth chart: Demo Receiver, Demo Teammate Wr, Demo Traded Wr, Demo Fresh Trade Wr).
+const teammateDepthChart = depthChartIdx.get("demo teammate wr");
+const depthChartIndexWorks = teammateDepthChart?.team === "KC" && teammateDepthChart?.posRank === 2 && teammateDepthChart?.groupSize === 4;
+console.log("Depth-chart index resolves a real ranked WR2 with the correct group size (should be true):", depthChartIndexWorks, teammateDepthChart);
+
+// Regression guard for resolvePlayer's new conflict handling: Demo Fresh Trade Wr's weekly-roster row still
+// says DEN (the roster file's own weekly cadence lags a real trade), but the depth-chart fixture — standing in
+// for a scrape taken today — already shows him on KC. The fresher depth-chart source must win the team, and
+// the disagreement must be flagged so the pipeline can log it and the frontend can show it.
+const freshTradeResolved = resolvePlayer("Demo Fresh Trade Wr", new Map(), rosterIdx, depthChartIdx);
+const resolvePlayerPrefersDepthChartOnConflict = freshTradeResolved.team === "KC" && freshTradeResolved.rosterTeam === "DEN" &&
+  freshTradeResolved.depthChartTeam === "KC" && freshTradeResolved.rosterConflict === true;
+console.log("resolvePlayer prefers the fresher depth-chart team and flags the conflict (should be true):", resolvePlayerPrefersDepthChartOnConflict, freshTradeResolved);
+
+// Once the roster-index fix is in place, Demo Traded Wr's roster team (KC, from his latest week) and his
+// depth-chart team (also KC) agree — this must NOT be flagged as a conflict just because two different data
+// sources were consulted.
+const tradedResolved = resolvePlayer("Demo Traded Wr", new Map(), rosterIdx, depthChartIdx);
+const noConflictWhenBothSourcesAgree = tradedResolved.team === "KC" && tradedResolved.rosterConflict === false;
+console.log("No false roster-conflict flag once both sources agree on the same team (should be true):", noConflictWhenBothSourcesAgree, tradedResolved);
+
+// Regression guard for findKeyTeammate's new depth-chart-first behavior: Demo Receiver is the depth chart's own
+// WR1 on KC. The old volume-based heuristic can't even see him vs. Demo Teammate Wr (no game log for the
+// latter), but the real bug this closes is structural — a naive "must be rank 1" read would find nothing once
+// the player himself occupies that slot. The correct "key teammate" is the depth chart's real WR2.
+const demoReceiverPlayer = { team: "KC", position: "WR", _logKey: "demo receiver" };
+const keyTeammateUsesDepthChartRank = findKeyTeammate(demoReceiverPlayer, rosterIdx, new Map(), depthChartIdx) === "demo teammate wr";
+console.log("findKeyTeammate picks the depth chart's real WR2, not 'no result' (should be true):", keyTeammateUsesDepthChartRank);
+// And the existing QB exclusion still holds even with a depth chart available (Mahomes is depth-chart QB1 with
+// a real QB2 behind him — this must still return null, not surface a QB \"teammate out\" comparison that can't
+// happen on the field).
+const mahomesPlayer = { team: "KC", position: "QB", _logKey: "patrick mahomes" };
+const keyTeammateStillSkipsQb = findKeyTeammate(mahomesPlayer, rosterIdx, new Map(), depthChartIdx) === null;
+console.log("findKeyTeammate still returns null for QBs even with depth-chart data available (should be true):", keyTeammateStillSkipsQb);
+
+// Regression guard for the pipeline-level wiring: propRows carry the resolved depth-chart role fields, and the
+// pipeline's stats object counts real roster/depth-chart conflicts (0 expected in demo data — no prop in this
+// slate's events belongs to a fixture player with a genuine conflict).
+const anyPropHasDepthChartRole = snapshot.propRows.some(r => r.depthChartRole);
+const rosterConflictsStatIsPresent = typeof snapshot.stats.rosterConflicts === "number";
+console.log("At least one prop row carries a resolved depth-chart role (should be true):", anyPropHasDepthChartRole, snapshot.propRows.map(r => r.depthChartRole));
+console.log("Pipeline stats report a rosterConflicts count (should be true):", rosterConflictsStatIsPresent, snapshot.stats.rosterConflicts);
+
+// --- Odds-fetch resilience (lib/fetchers/odds.js) ---
+// Regression guard for a real live failure: SportsGameOdds 400s the ENTIRE request when even ONE requested
+// bookmakerID is unavailable at the account's subscription tier (confirmed live — "fanatics" tripped this
+// despite the tier's docs claiming 77 bookmakers are included, taking down every book/event in one shot, not
+// just that book's prices). fetchNFLEvents must detect that specific error shape, drop only the offending
+// bookmakerID, and retry with the rest — never fail the whole refresh over one bad book.
+const realFetch = globalThis.fetch;
+let oddsFetchCallCount = 0;
+globalThis.fetch = async (url) => {
+  oddsFetchCallCount++;
+  const requestedBooks = new URL(url).searchParams.get("bookmakerID").split(",");
+  if (requestedBooks.includes("brokenbook")) {
+    return { ok: false, status: 400, text: async () => JSON.stringify({ success: false, error: "The bookmakerID brokenbook is unavailable at your current subscription tier. Upgrade to unlock" }) };
+  }
+  return { ok: true, status: 200, json: async () => ({ success: true, data: [{ eventID: "e1" }] }) };
+};
+const oddsResult = await fetchNFLEvents("fake-key", ["draftkings", "brokenbook", "fanduel"], () => {});
+globalThis.fetch = realFetch;
+const oddsResilienceWorks = oddsFetchCallCount === 2 && oddsResult.length === 1 && oddsResult[0].eventID === "e1";
+console.log("A single unavailable bookmakerID is dropped and the request retried, not a total failure (should be true):", oddsResilienceWorks, `calls=${oddsFetchCallCount}`);
+
+// --- AI annotation concurrency (lib/ai.js) ---
+// Regression guard for a real live incident: right after this session's probability-model rebuild, every row's
+// AI-note cache hash changed at once (the hash is of the content actually sent to Claude, and that shape
+// changed), so a fully cold cache sent every batch, across every annotation pass, strictly one after another —
+// a live refresh ran past 13 minutes still waiting on sequential Anthropic round-trips. Any future change that
+// shifts enough rows' content causes the same full-cache-miss again, so batches must run several at a time
+// (bounded, not unlimited) rather than one at a time.
+const realAiFetch = globalThis.fetch;
+let aiCallsInFlight = 0, aiMaxConcurrent = 0, aiCallCount = 0;
+globalThis.fetch = async (url) => {
+  if (!String(url).includes("api.anthropic.com")) return realAiFetch(url);
+  aiCallCount++;
+  aiCallsInFlight++;
+  aiMaxConcurrent = Math.max(aiMaxConcurrent, aiCallsInFlight);
+  await new Promise(r => setTimeout(r, 30));
+  aiCallsInFlight--;
+  const fakeResults = Array.from({ length: 30 }, (_, i) => ({ id: i, tag: "lean-over", note: "synthetic test note" }));
+  return { ok: true, status: 200, json: async () => ({ content: [{ text: JSON.stringify(fakeResults) }] }) };
+};
+// 65 rows at annotatePropsWithAI's batch size of 30 makes 3 batches — enough to prove they overlap.
+// `_aiSelected: true` stands in for pipeline.js's real top-AI_NOTE_LIMIT-by-modelProb selection (see the cost
+// controls test below) — annotatePropsWithAI only considers rows already marked this way.
+const syntheticProps = Array.from({ length: 65 }, (_, i) => ({
+  oddID: `p-${i}`, player: `Demo Player ${i}`, team: "KC", opponent: "BUF", propLabel: "Receiving yards", side: "over", line: 49.5,
+  bestBook: "draftkings", bestPrice: -110, suspect: false, teamMismatch: false, factors: {}, _aiSelected: true
+}));
+await annotatePropsWithAI(syntheticProps, "fake-key", {}, () => {});
+globalThis.fetch = realAiFetch;
+const aiConcurrencyWorks = aiCallCount === 3 && aiMaxConcurrent >= 2;
+console.log("AI annotation batches run concurrently, not strictly one-at-a-time (should be true):", aiConcurrencyWorks, `calls=${aiCallCount} maxConcurrent=${aiMaxConcurrent}`);
+
+// --- Anthropic cost controls (lib/ai.js) ---
+// Regression guard for a real cost review: AI notes used to go out for every non-suspect card on the board,
+// on a schedule running every 30 minutes, with the AI model itself set to the most expensive tier — a genuine
+// spend problem. selectAiEligible must pick only the real top AI_NOTE_LIMIT props by modelProb ("most likely to
+// hit"), and must still exclude a suspect/mismatched/unscored row even if its raw modelProb would otherwise put
+// it in the top slice.
+const manyProps = Array.from({ length: 60 }, (_, i) => ({
+  oddID: `p-${i}`, suspect: false, teamMismatch: false, model: { available: true }, modelProb: i / 100 // 0.00..0.59
+}));
+const edgeCaseProps = [
+  { oddID: "p-high-suspect", suspect: true, teamMismatch: false, model: { available: true }, modelProb: 0.95 }, // high prob but suspect -> excluded
+  { oddID: "p-high-mismatch", suspect: false, teamMismatch: true, model: { available: true }, modelProb: 0.93 }, // high prob but team mismatch -> excluded
+  { oddID: "p-high-unscored", suspect: false, teamMismatch: false, model: { available: false }, modelProb: null } // model never resolved -> excluded
+];
+const selected = selectAiEligible([...manyProps, ...edgeCaseProps], 50);
+const selectedIds = new Set(selected.map(r => r.oddID));
+// The top 50 props by modelProb (i=59 down to i=10) — the 3 edge-case rows never qualify at all, so they can't
+// take a slot away from a real, scoreable prop the way an eligible "always makes the cut" row used to.
+const top50PropIds = new Set(manyProps.slice(10, 60).map(r => r.oddID));
+const aiSelectionWorks = selected.length === 50 &&
+  !selectedIds.has("p-high-suspect") && !selectedIds.has("p-high-mismatch") && !selectedIds.has("p-high-unscored") &&
+  [...top50PropIds].every(id => selectedIds.has(id)) && !selectedIds.has("p-0") && !selectedIds.has("p-9") &&
+  manyProps.filter(r => r._aiSelected).length === 50;
+console.log("selectAiEligible keeps only the top AI_NOTE_LIMIT props by real modelProb, excluding suspect/mismatched/unscored regardless of their raw probability (should be true):", aiSelectionWorks, `selected=${selected.length}`);
+
+// Regression guard for the cache-loosening fix: two content objects that differ only by noise (a price moving a
+// cent, a rate drifting a fraction of a point) must hash identically via roundForHash, while a genuinely
+// different value must not.
+const noisyA = { price: -110, rate: 0.601, wind: 11, note: "x" };
+const noisyB = { price: -111, rate: 0.609, wind: 12, note: "x" };
+const realChange = { price: -110, rate: 0.75, wind: 11, note: "x" };
+const cacheLoosening = JSON.stringify(roundForHash(noisyA)) === JSON.stringify(roundForHash(noisyB)) &&
+  JSON.stringify(roundForHash(noisyA)) !== JSON.stringify(roundForHash(realChange));
+console.log("roundForHash absorbs trivial noise but still catches a real change (should be true):", cacheLoosening, roundForHash(noisyA), roundForHash(realChange));
+
+// Regression guard for the scouting-takes throttle: cacheOnly mode must reuse whatever's already cached (for
+// free) but make ZERO fresh Anthropic calls for anything not already sitting in cache, even though those rows
+// are otherwise eligible. Uncached rows just stay unset until the next full (non-throttled) run.
+const realScoutFetch = globalThis.fetch;
+let scoutCallCount = 0;
+globalThis.fetch = async (url) => {
+  if (!String(url).includes("api.anthropic.com")) return realScoutFetch(url);
+  scoutCallCount++;
+  return { ok: true, status: 200, json: async () => ({ content: [{ text: JSON.stringify([{ id: 0, note: "fresh" }]) }] }) };
+};
+const scoutRowCached = { oddID: "sc-cached", _aiSelected: true, teamMismatch: false, suspect: false, propType: "rec_yds", player: "A", team: "KC", opponent: "BUF", propLabel: "Receiving yards" };
+const scoutRowUncached = { oddID: "sc-fresh", _aiSelected: true, teamMismatch: false, suspect: false, propType: "rec_yds", player: "B", team: "KC", opponent: "BUF", propLabel: "Receiving yards" };
+const scoutCache = {};
+// Prime the cache for scoutRowCached by running once, uncached (cacheOnly: false), with only that row present.
+await annotateScoutingTakes([scoutRowCached], "fake-key", scoutCache, () => {}, { cacheOnly: false });
+const callsAfterPriming = scoutCallCount;
+// Now the "throttled" run: both rows present, cacheOnly: true. The cached row should be reapplied for free;
+// the new row should be skipped entirely, with no additional Anthropic call.
+scoutRowCached.scouting = null; // clear so we can tell whether the cache-only pass actually re-applied it
+await annotateScoutingTakes([scoutRowCached, scoutRowUncached], "fake-key", scoutCache, () => {}, { cacheOnly: true });
+const scoutingThrottleWorks = scoutCallCount === callsAfterPriming && !!scoutRowCached.scouting && scoutRowUncached.scouting === undefined;
+globalThis.fetch = realScoutFetch;
+console.log("Scouting throttle (cacheOnly) reuses cached notes for free and skips uncached rows without a new call (should be true):", scoutingThrottleWorks, `calls=${scoutCallCount}`, scoutRowCached.scouting, scoutRowUncached.scouting);
+
+// --- Same Game / Slate / cross-game parlays (lib/parlays.js) — fixed absolute-probability-band tiers ---
+// Regression guard for the kickoff-window classifier: the real live bug this guards against is a hardcoded UTC
+// offset, which would get exactly ONE of these two dates wrong. Oct 25, 2026 and Nov 1, 2026 are both real
+// Sundays, and "1:00pm Eastern" lands on a DIFFERENT UTC hour on each one (17:00 UTC vs. 18:00 UTC) because the
+// November daylight-saving change falls in between — so both must still classify as the 1:00 slate only if the
+// classifier is doing a real Eastern-time conversion, not "always subtract N hours from UTC."
+const dstSafetyWorks = classifyKickoffWindow("2026-10-25T17:00:00Z") === "sun_early" && // 1:00pm EDT (UTC-4), before the DST change
+  classifyKickoffWindow("2026-11-01T18:00:00Z") === "sun_early" &&                      // 1:00pm EST (UTC-5), after it — same wall-clock time, different UTC hour
+  classifyKickoffWindow("2026-11-01T21:05:00Z") === "sun_late" &&                       // 4:05pm ET
+  classifyKickoffWindow("2026-10-30T00:15:00Z") === null &&                             // Thursday 8:15pm ET — outside both windows
+  classifyKickoffWindow(null) === null;
+console.log("Kickoff-window classification survives the November DST change (should be true):", dstSafetyWorks);
+
+const demoEvents = summarizeEvents(snapshot.propRows);
+const eventWindows = Object.fromEntries(demoEvents.map(e => [e.eventId, e.window]));
+const demoEventWindowsAreCorrect = eventWindows["demo-1"] === "sun_early" && eventWindows["demo-1b"] === "sun_early" && eventWindows["demo-2"] === "sun_early" &&
+  eventWindows["demo-3"] === "sun_late" && eventWindows["demo-4"] === "sun_late" && eventWindows["demo-5"] === null;
+console.log("Every demo event lands in the right kickoff window (should be true):", demoEventWindowsAreCorrect, eventWindows);
+
+// Core invariant of the whole rewrite, checked generically (not by hand-deriving every leg's exact modelProb):
+// within ANY one parlay grouping (a cross-game tier set, one game's SGP tier set, or one slate's tier set),
+// every tier that built successfully must draw its legs ONLY from its own declared probability band, and no
+// single leg (by oddID) can appear in more than one of that group's tiers — the actual bug this rewrite fixes
+// (the old design let the same top legs get reused across every risk tier).
+function checkTierSetInvariants(tiers, label) {
+  const seenAcrossTiers = new Set();
+  let bandsRespected = true, noOverlap = true;
+  const details = [];
+  for (const t of tiers) {
+    if (!t.ok) { details.push(`${label} ${t.tier.key}: not ok (${t.reason})`); continue; }
+    for (const leg of t.legs) {
+      if (leg.hitProbability < t.tier.minProb || leg.hitProbability >= t.tier.maxProb) {
+        bandsRespected = false;
+        details.push(`${label} ${t.tier.key}: leg ${leg.row.oddID} hitProbability ${leg.hitProbability} outside [${t.tier.minProb},${t.tier.maxProb})`);
+      }
+      if (seenAcrossTiers.has(leg.row.oddID)) { noOverlap = false; details.push(`${label} ${t.tier.key}: leg ${leg.row.oddID} reused from another tier`); }
+      seenAcrossTiers.add(leg.row.oddID);
+    }
+  }
+  return { bandsRespected, noOverlap, details };
+}
+
+const crossGameCheck = checkTierSetInvariants(snapshot.parlays, "cross-game");
+console.log("Cross-game parlay tiers each stay inside their own probability band, with zero legs reused across tiers (should be true):",
+  crossGameCheck.bandsRespected && crossGameCheck.noOverlap, crossGameCheck.details);
+
+const sameGameParlays = buildSameGameParlays(snapshot.propRows);
+const sgpChecks = sameGameParlays.map(g => ({ eventId: g.eventId, ...checkTierSetInvariants(g.tiers, `SGP:${g.eventId}`) }));
+const allSgpRespectBandsAndDisjoint = sgpChecks.every(c => c.bandsRespected && c.noOverlap);
+console.log("Every Same Game Parlay's tiers stay inside their own band with zero cross-tier leg reuse (should be true):", allSgpRespectBandsAndDisjoint, sgpChecks.flatMap(c => c.details));
+
+const slateParlays = buildSlateParlays(snapshot.propRows);
+const slateChecks = slateParlays.map(s => ({ window: s.window, ...checkTierSetInvariants(s.tiers, `slate:${s.window}`) }));
+const allSlatesRespectBandsAndDisjoint = slateChecks.every(c => c.bandsRespected && c.noOverlap);
+console.log("Every slate parlay's tiers stay inside their own band with zero cross-tier leg reuse (should be true):", allSlatesRespectBandsAndDisjoint, slateChecks.flatMap(c => c.details));
+
+// The cross-game pool draws from every demo event, each contributing real legs deliberately placed in every one
+// of the four bands (see demoData.js's fillerGame) — so unlike a single game's own SGP, it should be able to
+// fill EVERY tier, each with the exact leg count that tier's RISK_TIERS entry calls for.
+const crossGameFillsEveryTier = RISK_TIERS.every((tier, i) => snapshot.parlays[i].ok && snapshot.parlays[i].tier.key === tier.key && snapshot.parlays[i].legs.length === tier.legs);
+console.log("The cross-game pool fills every tier at its real leg count, drawing from disjoint probability bands (should be true):", crossGameFillsEveryTier,
+  snapshot.parlays.map(p => p.ok ? `${p.tier.key}:${p.legs.length}` : `${p.tier.key}:fail(${p.reason})`));
+
+// A single filler game only ever contributes 2 real legs per band (see demoData.js) — never enough on its own
+// to fill a 3-4-leg tier — so every filler game's own SGP should honestly fail every tier, exactly the point
+// the design note on RISK_TIERS in parlays.js makes about single-game pools being unrealistic for full coverage.
+const demo5Sgp = sameGameParlays.find(g => g.eventId === "demo-5");
+const sgpReportsShortfallHonestly = demo5Sgp && demo5Sgp.tiers.every(t => t.ok === false && /fall in the .*% range|per game keeps this/.test(t.reason));
+console.log("A single filler game's SGP honestly fails every tier rather than borrowing legs from another band (should be true):", sgpReportsShortfallHonestly, demo5Sgp?.tiers.map(t => t.ok ? t.legs.length : t.reason));
+
+// The Sunday slate windows pool TWO games each (demo-1b+demo-2 for 1:00pm, demo-3+demo-4 for 4:00pm), each
+// contributing 2 real legs per band — 4 per band per window, exactly enough to fill every tier by drawing from
+// more than one game (never a single team's SGP in disguise).
+const earlySlate = slateParlays.find(s => s.window === "sun_early");
+const lateSlate = slateParlays.find(s => s.window === "sun_late");
+const slateGameCountsAreCorrect = earlySlate?.games === 3 && lateSlate?.games === 2; // sun_early: demo-1 + demo-1b + demo-2
+const slateFillsEveryTierAcrossGames = RISK_TIERS.every(tier => {
+  const t = earlySlate.tiers.find(x => x.tier.key === tier.key);
+  return t?.ok && t.legs.length === tier.legs && new Set(t.legs.map(l => l.gameKey)).size >= 2;
+});
+const lateSlateFillsEveryTierAcrossGames = RISK_TIERS.every(tier => {
+  const t = lateSlate.tiers.find(x => x.tier.key === tier.key);
+  return t?.ok && t.legs.length === tier.legs && new Set(t.legs.map(l => l.gameKey)).size >= 2;
+});
+const thursdayGameNeverJoinsASlate = slateParlays.every(s => s.tiers.every(t => !t.ok || t.legs.every(l => l.gameKey !== "demo-5")));
+console.log("Each Sunday slate window sees the right number of games (should be true):", slateGameCountsAreCorrect, `early=${earlySlate?.games} late=${lateSlate?.games}`);
+console.log("The 1:00pm slate fills every tier, drawing legs from more than one game per tier (should be true):", slateFillsEveryTierAcrossGames,
+  earlySlate?.tiers.map(t => t.ok ? `${t.tier.key}:${t.legs.length}(${new Set(t.legs.map(l => l.gameKey)).size} games)` : `${t.tier.key}:fail`));
+console.log("The 4:00pm slate fills every tier, drawing legs from more than one game per tier (should be true):", lateSlateFillsEveryTierAcrossGames,
+  lateSlate?.tiers.map(t => t.ok ? `${t.tier.key}:${t.legs.length}(${new Set(t.legs.map(l => l.gameKey)).size} games)` : `${t.tier.key}:fail`));
+console.log("The Thursday-night game never gets pooled into a Sunday slate (should be true):", thursdayGameNeverJoinsASlate);
+
+// MIN_LEG_PROBABILITY must equal the Mega band's own floor by construction — the whole tier ladder is built as
+// one continuous, non-overlapping range from that floor up to "almost guaranteed."
+const tierLadderIsContinuous = MIN_LEG_PROBABILITY === RISK_TIERS.find(t => t.key === "mega").minProb &&
+  RISK_TIERS.every((t, i) => i === 0 || t.maxProb === RISK_TIERS[i - 1].minProb);
+console.log("The four risk tiers form one continuous, non-overlapping probability ladder (should be true):", tierLadderIsContinuous, RISK_TIERS.map(t => `${t.key}:[${t.minProb},${t.maxProb})`));
+
 console.log("Any team mismatch in demo data (should be false):", anyMismatch);
 console.log("At least one prop resolved a real factor (should be true):", anyRealFactor);
 console.log("Every expected factor key present on a prop row (should be true):", missing.length === 0, missing.length ? `MISSING: ${missing.join(", ")}` : "");
 console.log("Red-zone share factor computed at least once (should be true):", anyRedZone);
 console.log("Defense-vs-position factor computed at least once (should be true):", anyDefense);
 console.log("EPA matchup-edge factor computed at least once on a prop (should be true):", anyMatchupEdge);
-console.log("EPA matchup-edge factor computed at least once on a game line (should be true):", anyGameLineMatchupEdge);
 console.log("Scoring-environment factor computed at least once (should be true):", anyScoringEnv);
-console.log("Every game line is a Total (no Moneyline/Spread) (should be true):", !anyGameLineIsNotTotal);
 
-if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyGameLineMatchupEdge || !anyScoringEnv || anyGameLineIsNotTotal || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero) {
+// New coefficients must actually be present (not just referenced) in MODEL_COEFFS — a nudge silently falling
+// back to `|| 0` because the coefficient was never added would pass every test above for the wrong reason.
+const newCoeffsPresent = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor", "weather_pass_penalty",
+  "venue_edge", "practice_trend_down", "practice_trend_up"].every(k => typeof MODEL_COEFFS[k] === "number");
+console.log("Every new hand-set coefficient is present in MODEL_COEFFS (should be true):", newCoeffsPresent);
+
+if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
+  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks ||
+  !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks || !aiConcurrencyWorks ||
+  !aiSelectionWorks || !cacheLoosening || !scoutingThrottleWorks || !newCoeffsPresent ||
+  !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
+  !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous) {
   console.log("\nFAILED — see above.");
   process.exit(1);
 } else {
-  console.log("\nOK — pipeline logic checks out: full offensive + defensive matchup analytics, Totals-Overs + player-prop-Overs scope confirmed.");
+  console.log("\nOK — pipeline logic checks out: full offensive matchup analytics, player-prop-Overs-only scope, and disjoint-probability-band parlay tiers all confirmed.");
 }

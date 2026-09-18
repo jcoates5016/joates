@@ -1,10 +1,11 @@
 {
   "name": "apex-edge",
-  "version": "3.0.0",
-  "description": "NFL sharp-line finder — full rebuild with the complete factor set (market, usage, matchup, team efficiency, environment, schedule, injury/personnel) baked in.",
+  "version": "4.0.0",
+  "description": "NFL sharp-line finder — player-props-only rebuild: every prop graded to a model probability, cross-referenced against the market for real value, with fixed-band leg-disjoint parlay tiers and closing-line-value tracking.",
   "type": "module",
   "scripts": {
-    "dry-run": "node scripts/dry-run.js"
+    "dry-run": "node scripts/dry-run.js",
+    "backtest": "node scripts/backtest.js"
   },
   "dependencies": {
     "@netlify/blobs": "^8.1.0",
