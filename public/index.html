@@ -151,6 +151,7 @@
       <span class="badge none" id="modeBadge">Loading</span>
       <button class="primary" id="refreshBtn">Refresh Now</button>
       <span class="lastrun" id="lastRun"></span>
+      <span class="lastrun" id="spendStatus" title="Only a triggered refresh (this button, or a scheduled GitHub Actions run) spends anything — just having this page open costs $0. See Setup for details."></span>
     </div>
   </header>
 
@@ -167,6 +168,7 @@
     <div class="status-line" id="edgeStatus">Loading the latest snapshot…</div>
     <div class="stats-strip" id="edgeStats"></div>
     <div id="trackRecordPanel"></div>
+    <div id="edgeBoardHistoryPanel"></div>
     <div class="filters">
       <input id="edgeSearch" placeholder="Search player, team, matchup…">
     </div>
@@ -235,6 +237,10 @@
       <div class="body"><code class="kv">SPORTSGAMEODDS_API_KEY</code> <code class="kv">ANTHROPIC_API_KEY</code> <code class="kv">CURRENT_SEASON</code> (optional) <code class="kv">ANTHROPIC_MODEL</code> (optional) <code class="kv">NETLIFY_SITE_ID</code> <code class="kv">NETLIFY_BLOBS_TOKEN</code></div>
     </div>
     <div class="setup-block">
+      <div class="heading">What actually costs Anthropic credits</div>
+      <div class="body">Loading this page costs $0 — it only reads the latest saved snapshot from Netlify Blobs, no AI calls involved. Refreshes are manual-only (no schedule runs on its own): the only things that spend anything are clicking "Refresh Now" above, or manually dispatching the GitHub Actions workflow — each one runs the AI notes/scouting-takes/parlay-takes passes once. A hard daily cap (<code class="kv">ANTHROPIC_DAILY_CAP_USD</code>, default $5, set as a GitHub Actions secret/variable to change it) tracks real spend from the API's own token-usage response and skips all AI calls for the rest of the UTC day once it's reached — the spend total next to "Refresh Now" above shows where today stands. This is a best-effort cap, not a hard guarantee: it's checked between waves of concurrent AI calls, so a refresh already mid-flight when the cap is hit can overshoot by that one wave rather than cutting off mid-call.</div>
+    </div>
+    <div class="setup-block">
       <div class="heading">Odds data budget (Rookie tier)</div>
       <div class="body">100,000 objects/month, 50 requests/minute, odds refreshed upstream about every 3 minutes. The GitHub Actions schedule runs every 30 minutes — well within budget — but object cost scales with events × markets per call, so keep an eye on actual usage in the SportsGameOdds dashboard for the first week or two and tune the cron schedule if needed.</div>
     </div>
@@ -296,6 +302,20 @@ function propReasoning(r){
   }
   if (f.secondaryInjury?.available && f.secondaryInjury.count >= 1){
     pos.push({ w:6, t:`${opp} is down ${f.secondaryInjury.count} defensive back${f.secondaryInjury.count>1?"s":""} (${f.secondaryInjury.names.join(", ")}) — a thinner secondary is a real tailwind for the passing game, even without knowing exactly who lines up across from him.` });
+  }
+  if (f.frontSevenInjury?.available && f.frontSevenInjury.count >= 1){
+    pos.push({ w:6, t:`${opp} is down ${f.frontSevenInjury.count} run-defender${f.frontSevenInjury.count>1?"s":""} (${f.frontSevenInjury.names.join(", ")}) — a thinner front seven is a real tailwind for the run game.` });
+  }
+  // Vegas's own implied game script (spread/total, read as context — not a bet type here). A big favorite tends
+  // toward a run-heavy, clock-killing plan; a big underdog tends toward more pass volume playing catch-up. Same
+  // direction the game_script_run_favor/game_script_pass_favor nudges in lib/probability.js actually score, so
+  // this never disagrees with what moved the grade %.
+  if (f.gameScript?.available){
+    if (f.gameScript.isBigFavorite && ["rush_yds","td_rush"].includes(r.propType)){
+      pos.push({ w:5, t:`${r.team||"His team"} is favored by ${fmtNum(Math.abs(f.gameScript.teamSpread),1)} points — a lopsided game script that tends to mean more clock-killing runs, especially late.` });
+    } else if (f.gameScript.isBigUnderdog && ["pass_yds","td_pass","rec_yds","receptions","td_rec"].includes(r.propType)){
+      pos.push({ w:5, t:`${r.team||"His team"} is getting ${fmtNum(f.gameScript.teamSpread,1)} points — playing from behind tends to mean more pass volume as the game goes on, a tailwind for this prop.` });
+    }
   }
   // Form gets a sentence either way — favorable OR unfavorable — never silence. A one-line "hit rate" is exactly
   // what produced the wrong "he's hit this in 2 of his last 3" claims this board shipped with more than once;
@@ -500,9 +520,46 @@ function render(){
   typeSel.value = prevType;
 
   renderTrackRecord();
+  renderEdgeBoardHistory();
+  renderSpendStatus();
   applyEdgeFilters();
   applyPropFilters();
   renderParlays();
+}
+
+// Anthropic daily spend cap transparency (lib/ai.js's createSpendGuard, wired through lib/pipeline.js). Page
+// loads never cost anything — this only moves when someone clicks Refresh Now or the scheduled GitHub Actions
+// run fires — so this is reporting a running daily total, not a live meter tied to this page being open.
+function renderSpendStatus(){
+  const el = document.getElementById("spendStatus");
+  const spend = snapshot.anthropicSpend;
+  if (!spend){ el.textContent = ""; return; }
+  const pct = spend.capUsd ? spend.spentUsd / spend.capUsd : 0;
+  el.textContent = `Anthropic spend today: $${fmtNum(spend.spentUsd,2)} / $${fmtNum(spend.capUsd,2)}` +
+    (pct >= 1 ? " — cap reached, AI notes paused until tomorrow (UTC)" : "");
+  el.style.color = pct >= 1 ? "var(--red)" : (pct >= 0.8 ? "var(--amber)" : "");
+}
+
+// Edge Board history: of what was actually flagged as a real Edge Board edge the moment it was first surfaced
+// (lib/pipeline.js's wasEdgeBoard, captured once — never overwritten on a later refresh), which ones went on to
+// hit once their games graded. Empty on a fresh deploy for the same honest reason the track-record panel above
+// is: it takes real games finishing before there's anything to show.
+function renderEdgeBoardHistory(){
+  const el = document.getElementById("edgeBoardHistoryPanel");
+  const h = snapshot.edgeBoardHistory;
+  if (!h?.total){
+    el.innerHTML = `<div class="track-record empty">No graded Edge Board history yet — this fills in once picks that were flagged here actually kick off and grade (usually about a day after the game).</div>`;
+    return;
+  }
+  const rows = h.picks.map(p => {
+    const market = p.line != null ? `${esc(p.propLabel||p.propType)} ${esc(p.side||'')} ${p.line}` : esc(p.propLabel||p.propType);
+    return `<div class="tr-tier"><span class="tr-tier-label">${esc(p.player)}</span><span>${market}</span><span class="chip ${p.hit?'hit':'warn'}">${p.hit?'✓ Hit':'✗ Miss'}</span><span class="tr-dim">${esc(fmtKickoff(p.kickoff))}</span></div>`;
+  }).join("");
+  el.innerHTML = `<div class="track-record">
+    <div class="tr-headline"><b>${h.hits}/${h.total}</b> Edge Board picks hit, most recent first</div>
+    <div class="tr-tiers">${rows}</div>
+    <div class="tr-note">Only counts picks that were a real Edge Board edge the moment they were first surfaced — not ones that only later drifted into range, or fell out of it, as the model updated through the week.</div>
+  </div>`;
 }
 
 // Honest track record: is any of this actually working, checked against real graded picks (lib/grading.js),
@@ -564,6 +621,8 @@ function factorChipsHTML(f){
   if (f.birthday?.nearBirthday) chips.push(`<span class="chip hit">🎂 near birthday</span>`);
   if (f.oLineInjury?.available && f.oLineInjury.count>0) chips.push(`<span class="chip warn" title="${(f.oLineInjury.names||[]).map(esc).join(', ')}">O-line: ${f.oLineInjury.count} hurt</span>`);
   if (f.secondaryInjury?.available && f.secondaryInjury.count>0) chips.push(`<span class="chip hit" title="${(f.secondaryInjury.names||[]).map(esc).join(', ')}">Opp. secondary: ${f.secondaryInjury.count} hurt</span>`);
+  if (f.frontSevenInjury?.available && f.frontSevenInjury.count>0) chips.push(`<span class="chip hit" title="${(f.frontSevenInjury.names||[]).map(esc).join(', ')}">Opp. front seven: ${f.frontSevenInjury.count} hurt</span>`);
+  if (f.gameScript?.available && (f.gameScript.isBigFavorite || f.gameScript.isBigUnderdog)) chips.push(`<span class="chip info" title="Vegas's own implied spread/total, read as context — not a bet offered here">Game script: ${f.gameScript.isBigFavorite ? `big favorite (−${fmtNum(Math.abs(f.gameScript.teamSpread),1)})` : `big underdog (+${fmtNum(f.gameScript.teamSpread,1)})`}</span>`);
   if (f.practiceTrend?.available) chips.push(`<span class="chip">Practice: ${esc(f.practiceTrend.trend)}</span>`);
   if (f.selfInjury) chips.push(`<span class="chip warn">${esc(f.selfInjury.status)}${f.selfInjury.detail?`: ${esc(f.selfInjury.detail)}`:''}</span>`);
   if (f.marketMovement?.available) chips.push(`<span class="chip info">Move: ${f.marketMovement.priceMove!=null?fmtOdds(f.marketMovement.priceMove):'—'}${f.marketMovement.pointMove?` / ${f.marketMovement.pointMove>0?'+':''}${f.marketMovement.pointMove}pt`:''} (${f.marketMovement.points} pts)</span>`);

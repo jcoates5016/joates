@@ -1,16 +1,17 @@
 // Runs the full pipeline against the demo dataset — no API keys needed. Confirms every factor category at
 // least runs without throwing, and prints a self-check summary. Player-props only now — game lines/moneylines
 // were removed from this build entirely (see analyze.js/probability.js/parlays.js/README).
-import { runPipeline } from "../lib/pipeline.js";
+import { runPipeline, buildEdgeBoardHistory } from "../lib/pipeline.js";
 import { estimatePropProbability } from "../lib/probability.js";
 import { MODEL_COEFFS } from "../lib/modelCoeffs.js";
 import { gradeCompletedPicks, foldIntoLedger, summarizeLedger } from "../lib/grading.js";
 import { buildRosterIndex, buildDepthChartIndex, resolvePlayer } from "../lib/identity.js";
-import { findKeyTeammate } from "../lib/factors/index.js";
-import { computeBestAcrossBooks } from "../lib/analyze.js";
+import { findKeyTeammate, computeGameScript } from "../lib/factors/index.js";
+import { computeOpposingFrontSevenInjury } from "../lib/factors/injury.js";
+import { computeBestAcrossBooks, extractGameContext } from "../lib/analyze.js";
 import { buildDemoData } from "../lib/demoData.js";
 import { fetchNFLEvents } from "../lib/fetchers/odds.js";
-import { annotatePropsWithAI, annotateScoutingTakes, selectAiEligible, roundForHash } from "../lib/ai.js";
+import { annotatePropsWithAI, annotateScoutingTakes, selectAiEligible, roundForHash, createSpendGuard, estimateCostUsd } from "../lib/ai.js";
 import { classifyKickoffWindow, summarizeEvents, buildAllParlays, buildSameGameParlays, buildSlateParlays, RISK_TIERS, MIN_LEG_PROBABILITY } from "../lib/parlays.js";
 
 const SEASON = 2026;
@@ -277,6 +278,73 @@ const steamMagnitudeScalingWorks = steamSmall.modelProb > baseline && steamBig.m
 console.log("Market steam is scaled by magnitude and caps out rather than blowing up on an extreme move (should be true):", steamMagnitudeScalingWorks,
   { baseline, small: steamSmall.modelProb, big: steamBig.modelProb, extreme: steamExtreme.modelProb, capMatch: steamCapMatch.modelProb });
 
+// --- Opposing front-seven injury (lib/factors/injury.js, run-game mirror of secondary_injury) ---
+// The raw factor function must count only real DL/LB-family positions that are actually out/doubtful — a CB/S
+// (secondary, already covered by its own factor) shouldn't count, and "Questionable" isn't the same as being
+// realistically out.
+const frontSevenInjuries = {
+  BUF: [
+    { name: "Demo Bills Corner", position: "CB", status: "Out" }, // secondary, not front seven
+    { name: "Demo Bills Edge", position: "EDGE", status: "Out" },
+    { name: "Demo Bills Lb", position: "LB", status: "Doubtful" },
+    { name: "Demo Bills Dt", position: "DT", status: "Questionable" } // questionable doesn't count as out
+  ]
+};
+const frontSevenResult = computeOpposingFrontSevenInjury("BUF", frontSevenInjuries);
+const frontSevenInjuryFactorWorks = frontSevenResult.available === true && frontSevenResult.count === 2 &&
+  frontSevenResult.names.some(n => /Edge/.test(n)) && frontSevenResult.names.some(n => /Lb/.test(n)) &&
+  !frontSevenResult.names.some(n => /Corner|Dt/.test(n));
+console.log("Opposing front-seven-injury factor counts only real DL/LB out/doubtful players, not CB/S or questionable ones (should be true):", frontSevenInjuryFactorWorks, frontSevenResult);
+
+const frontSevenNudge = estimatePropProbability({
+  propType: "rush_yds", frontSevenInjury: { available: true, count: 1 },
+  form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+}, 0.55);
+const frontSevenNudgeFires = frontSevenNudge.modelProb > baseline && frontSevenNudge.contributors.some(c => /front seven hurt/.test(c));
+console.log("Front-seven-injury nudge fires on a rushing prop when the opponent has a real DL/LB injury on record (should be true):", frontSevenNudgeFires, { baseline, nudge: frontSevenNudge.modelProb });
+
+// --- Vegas game-script context (lib/analyze.js's extractGameContext, lib/factors/index.js's computeGameScript) ---
+// A game with a real spread/total (read via SportsGameOdds' own oddID shape: points-home-game-sp-home for the
+// spread, points-all-game-ou-over for the total) resolves to correct per-team implied totals, and a spread past
+// BIG_SPREAD_THRESHOLD flags the right side as a big favorite/big underdog.
+const gameScriptEvt = {
+  odds: {
+    homeSpread: { periodID: "game", statID: "points", statEntityID: "home", betTypeID: "sp", sideID: "home", bookSpread: -7.5 },
+    gameTotal: { periodID: "game", statID: "points", statEntityID: "all", betTypeID: "ou", sideID: "over", bookOverUnder: 44.5 }
+  }
+};
+const gameContext = extractGameContext(gameScriptEvt);
+const gameContextIsCorrect = gameContext.available === true && gameContext.homeSpread === -7.5 && gameContext.total === 44.5 &&
+  Math.abs(gameContext.homeImpliedTotal - 26) < 0.001 && Math.abs(gameContext.awayImpliedTotal - 18.5) < 0.001;
+console.log("extractGameContext reads a real spread/total into correct per-team implied totals (should be true):", gameContextIsCorrect, gameContext);
+
+const noOddsContextWorks = extractGameContext({ odds: {} }).available === false;
+console.log("extractGameContext reports unavailable with no spread/total odds present (should be true):", noOddsContextWorks);
+
+const homeRow = { team: "KC", home: "KC", away: "BUF" }; // home team getting a -7.5 spread -> big favorite
+const awayRow = { team: "BUF", home: "KC", away: "BUF" }; // away team getting a +7.5 spread -> big underdog
+const gameScriptHome = computeGameScript(homeRow, gameContext);
+const gameScriptAway = computeGameScript(awayRow, gameContext);
+const gameScriptWorks = gameScriptHome.available && gameScriptHome.isBigFavorite === true && gameScriptHome.isBigUnderdog === false &&
+  Math.abs(gameScriptHome.teamSpread - (-7.5)) < 0.001 &&
+  gameScriptAway.available && gameScriptAway.isBigUnderdog === true && gameScriptAway.isBigFavorite === false &&
+  Math.abs(gameScriptAway.teamSpread - 7.5) < 0.001 &&
+  computeGameScript({ team: "MIA", home: "KC", away: "BUF" }, gameContext).available === false;
+console.log("computeGameScript flags the home team as a big favorite and the away team as a big underdog off the same spread, and skips a row belonging to neither team (should be true):", gameScriptWorks, { home: gameScriptHome, away: gameScriptAway });
+
+// The nudges themselves (lib/probability.js): a big favorite favors the run, a big underdog favors the pass —
+// scoped to the prop types that plausibly move with game script — and neither fires on a normal, non-lopsided spread.
+const gameScriptRunNudge = estimatePropProbability({ propType: "rush_yds", gameScript: gameScriptHome, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const gameScriptPassNudge = estimatePropProbability({ propType: "rec_yds", gameScript: gameScriptAway, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const closeSpreadContext = computeGameScript(homeRow, { available: true, homeSpread: -3, total: 44.5, homeImpliedTotal: 23.75, awayImpliedTotal: 20.75 });
+const gameScriptNoFireOnCloseSpread = estimatePropProbability({ propType: "rush_yds", gameScript: closeSpreadContext, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const gameScriptNudgesWork = gameScriptRunNudge.modelProb > baseline && gameScriptPassNudge.modelProb > baseline &&
+  Math.abs(gameScriptNoFireOnCloseSpread.modelProb - baseline) < 0.0001 &&
+  gameScriptRunNudge.contributors.some(c => /favors the run/.test(c)) &&
+  gameScriptPassNudge.contributors.some(c => /garbage-time passing/.test(c));
+console.log("Game-script nudge favors the run for a big favorite's rushing prop and the pass for a big underdog's receiving prop, and stays silent on a close spread (should be true):", gameScriptNudgesWork,
+  { baseline, run: gameScriptRunNudge.modelProb, pass: gameScriptPassNudge.modelProb, close: gameScriptNoFireOnCloseSpread.modelProb });
+
 // --- Suspect vs. stale-line value (lib/analyze.js) ---
 // A big outlier edge with real corroboration from the rest of the panel (>=2 other books, most agreeing with
 // consensus) is real, bettable stale-line value — surfaced, not thrown away. The same size outlier with NO real
@@ -354,6 +422,32 @@ console.log("Calibration ledger folds CLV only from picks that actually have one
 const regradedNow = gradeCompletedPicks(syntheticPicks, syntheticGameLog, syntheticPriceHistory, now);
 const regradeGuardWorks = regradedNow.length === 0;
 console.log("Already-graded picks are never re-graded on a later pass (should be true):", regradeGuardWorks);
+
+// --- Edge Board history (lib/pipeline.js's buildEdgeBoardHistory) ---
+// Only picks that were actually flagged as an Edge Board pick the moment they were first surfaced (the
+// "capture-once" `wasEdgeBoard` field, never overwritten on later refreshes) AND have since graded count toward
+// the history — a pick that never qualified, or one that qualified but hasn't kicked off/graded yet, must not
+// show up as a phantom hit or a premature miss. Sorted most-recent-kickoff-first.
+const edgeBoardFixture = [
+  { oddID: "eb-hit", wasEdgeBoard: true, graded: true, hit: true, kickoff: "2026-10-05T17:00:00Z" },
+  { oddID: "eb-miss", wasEdgeBoard: true, graded: true, hit: false, kickoff: "2026-10-12T17:00:00Z" },
+  { oddID: "eb-ungraded", wasEdgeBoard: true, graded: false, hit: null, kickoff: "2026-10-19T17:00:00Z" }, // not final yet -> excluded
+  { oddID: "not-eb", wasEdgeBoard: false, graded: true, hit: true, kickoff: "2026-10-12T18:00:00Z" } // never flagged as an edge -> excluded
+];
+const edgeBoardHistoryResult = buildEdgeBoardHistory(edgeBoardFixture);
+const edgeBoardHistoryWorks = edgeBoardHistoryResult.total === 2 && edgeBoardHistoryResult.hits === 1 &&
+  edgeBoardHistoryResult.picks.length === 2 && edgeBoardHistoryResult.picks[0].oddID === "eb-miss" && // most recent kickoff first
+  edgeBoardHistoryResult.picks[1].oddID === "eb-hit" &&
+  !edgeBoardHistoryResult.picks.some(p => p.oddID === "eb-ungraded" || p.oddID === "not-eb");
+console.log("buildEdgeBoardHistory only counts graded, actually-flagged Edge Board picks, sorted most-recent-first (should be true):", edgeBoardHistoryWorks, edgeBoardHistoryResult);
+
+// The `limit` param must actually cap the returned list to the most recent N, not just be decorative.
+const manyEdgeBoardPicks = Array.from({ length: 10 }, (_, i) => ({
+  oddID: `eb-${i}`, wasEdgeBoard: true, graded: true, hit: i % 2 === 0, kickoff: new Date(2026, 9, i + 1).toISOString()
+}));
+const limitedHistory = buildEdgeBoardHistory(manyEdgeBoardPicks, 3);
+const edgeBoardLimitWorks = limitedHistory.picks.length === 3 && limitedHistory.total === 3 && limitedHistory.picks[0].oddID === "eb-9";
+console.log("buildEdgeBoardHistory's limit caps the returned list to the most recent N picks (should be true):", edgeBoardLimitWorks, limitedHistory.picks.map(p => p.oddID));
 
 // --- Roster/depth-chart accuracy pass (lib/identity.js, lib/factors/index.js) ---
 // Unit-tested directly against the same fixtures buildDemoData feeds the pipeline, the same pattern already
@@ -502,6 +596,37 @@ const cacheLoosening = JSON.stringify(roundForHash(noisyA)) === JSON.stringify(r
   JSON.stringify(roundForHash(noisyA)) !== JSON.stringify(roundForHash(realChange));
 console.log("roundForHash absorbs trivial noise but still catches a real change (should be true):", cacheLoosening, roundForHash(noisyA), roundForHash(realChange));
 
+// Regression guard for the new daily Anthropic spend cap: real, current per-million-token pricing (Haiku 4.5
+// $1/$5, Sonnet 5 $2/$10, Opus 5 $5/$25) computed from the API's own token-usage response, never a payload-size
+// guess — and an unrecognized future model name still gets a conservative estimate rather than silently costing $0.
+const millionTokUsage = { input_tokens: 1_000_000, output_tokens: 1_000_000 };
+const costEstimatesAreCorrect =
+  Math.abs(estimateCostUsd("claude-haiku-4-5-20251001", millionTokUsage) - 6) < 0.0001 &&
+  Math.abs(estimateCostUsd("claude-sonnet-5-20250929", millionTokUsage) - 12) < 0.0001 &&
+  Math.abs(estimateCostUsd("claude-opus-5-20250915", millionTokUsage) - 30) < 0.0001 &&
+  estimateCostUsd("some-future-model", millionTokUsage) > 0 &&
+  estimateCostUsd("claude-haiku-4-5", null) === 0;
+console.log("estimateCostUsd prices Haiku/Sonnet/Opus correctly from real token usage, estimates conservatively for an unknown model, and costs $0 with no usage (should be true):", costEstimatesAreCorrect);
+
+// The spend guard must actually flip to exhausted once today's recorded spend reaches the cap (a best-effort
+// stop point checked between waves of concurrent AI calls, not a mid-batch kill switch — it can overshoot by
+// one in-flight wave, which is a documented, deliberate tradeoff, not a bug), and must roll over to a fresh $0
+// ledger on a new UTC calendar day, archiving the prior day's total into history rather than discarding it.
+const freshGuard = createSpendGuard({ date: null, spentUsd: 0, callCount: 0, history: [] }, 5);
+const notExhaustedBelowCap = freshGuard.exhausted === false;
+freshGuard.record(3);
+freshGuard.record(2.5);
+const spendGuardCapWorks = notExhaustedBelowCap && freshGuard.exhausted === true &&
+  freshGuard.snapshot().callCount === 2 && Math.abs(freshGuard.snapshot().spentUsd - 5.5) < 0.001;
+console.log("Spend guard stays open below the cap, then flips exhausted once recorded spend reaches it (should be true):", spendGuardCapWorks, freshGuard.snapshot());
+
+const todayIso = new Date().toISOString().slice(0, 10);
+const yesterdayLedger = { date: "2020-01-01", spentUsd: 4.87, callCount: 40, history: [] };
+const rolloverGuard = createSpendGuard(yesterdayLedger, 5);
+const rolloverWorks = rolloverGuard.exhausted === false && rolloverGuard.snapshot().date === todayIso &&
+  rolloverGuard.snapshot().spentUsd === 0 && rolloverGuard._ledger.history.some(h => h.date === "2020-01-01" && h.spentUsd === 4.87);
+console.log("A new UTC calendar day resets the spend guard to $0 and archives the prior day's total into history, rather than carrying its spend forward (should be true):", rolloverWorks, rolloverGuard.snapshot());
+
 // Regression guard for the scouting-takes throttle: cacheOnly mode must reuse whatever's already cached (for
 // free) but make ZERO fresh Anthropic calls for anything not already sitting in cache, even though those rows
 // are otherwise eligible. Uncached rows just stay unset until the next full (non-throttled) run.
@@ -635,13 +760,13 @@ console.log("Scoring-environment factor computed at least once (should be true):
 // New coefficients must actually be present (not just referenced) in MODEL_COEFFS — a nudge silently falling
 // back to `|| 0` because the coefficient was never added would pass every test above for the wrong reason.
 const newCoeffsPresent = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor", "weather_pass_penalty",
-  "venue_edge", "practice_trend_down", "practice_trend_up"].every(k => typeof MODEL_COEFFS[k] === "number");
+  "venue_edge", "practice_trend_down", "practice_trend_up", "front_seven_injury", "game_script_run_favor", "game_script_pass_favor"].every(k => typeof MODEL_COEFFS[k] === "number");
 console.log("Every new hand-set coefficient is present in MODEL_COEFFS (should be true):", newCoeffsPresent);
 
 if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
-  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks ||
+  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !frontSevenInjuryFactorWorks || !frontSevenNudgeFires || !gameContextIsCorrect || !noOddsContextWorks || !gameScriptWorks || !gameScriptNudgesWork || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks || !edgeBoardHistoryWorks || !edgeBoardLimitWorks ||
   !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks || !aiConcurrencyWorks ||
-  !aiSelectionWorks || !cacheLoosening || !scoutingThrottleWorks || !newCoeffsPresent ||
+  !aiSelectionWorks || !cacheLoosening || !costEstimatesAreCorrect || !spendGuardCapWorks || !rolloverWorks || !scoutingThrottleWorks || !newCoeffsPresent ||
   !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
   !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous) {
   console.log("\nFAILED — see above.");

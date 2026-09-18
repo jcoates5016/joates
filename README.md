@@ -75,6 +75,22 @@ only moves away from it when there's real, sized evidence to justify the move:
      listed at all.
    - **Market steam** — magnitude-scaled now, not a flat boolean: a price that's moved 20 cents gets a bigger
      nudge than one that's moved 2 cents, capped so a single huge move can't dominate every other signal.
+   - **Opposing front-seven injury** — the run-game mirror of the secondary-injury nudge below: how many of the
+     opponent's own DL/LB-family players (`lib/factors/injury.js`'s `FRONT_SEVEN_POSITIONS` — DE/DT/NT/DL/LB/
+     ILB/OLB/EDGE) are out or doubtful, applied to that opponent's rushing props. Same deliberately generic
+     shape as the secondary-injury nudge, for the same reason (no play-by-play personnel/assignment data exists
+     to compute a specific "this run-stopper is the one who'd have covered him" claim).
+   - **Vegas game-script context** — the odds feed's own spread/total (`lib/analyze.js`'s `extractGameContext`,
+     `lib/factors/index.js`'s `computeGameScript`), read purely as context for run/pass volume tilt, never as a
+     bet type on its own (this build still only offers player-prop Overs). A team favored by a touchdown or more
+     (`BIG_SPREAD_THRESHOLD = 6.5`) tends toward a run-heavy, clock-killing plan; a team getting a touchdown or
+     more tends toward more pass volume playing catch-up. Scoped to the prop types that plausibly move with game
+     script, the same `RUN_PROPS`/`PASS_PROPS` sets (now exported from `lib/probability.js`) the weather nudge
+     above already uses. **A caveat worth actually verifying**: SportsGameOdds' sign convention for which side a
+     spread favors couldn't be confirmed from their docs, so `extractGameContext` assumes the standard
+     sportsbook-display convention (negative = home favored). Every live refresh logs a one-time sanity-check
+     line ("Game-script check: ... reading X as favored") — check it against a real sportsbook board once, and
+     flip the sign in `extractGameContext` if it's backwards.
 3. **Hard-override to near-zero** when the player himself is out or doubtful — no amount of favorable context
    makes a bet on someone who might not play a good one.
 
@@ -103,9 +119,31 @@ a player's normal level" but a genuinely easier question than "beat the real clo
 hit rate) and essentially no signal in the single-season defense-vs-position rank or team EPA matchup edge (both
 correctly shrunk toward ~0) — which lines up with the general finding that usage metrics are stickier week to
 week than matchup-quality metrics are predictive. Coefficients with no historical feed at all (opponent secondary
-injuries, O-line injuries, a teammate-out usage bump, market steam — none of which nflverse or this odds tier
-publishes historically) are left at hand-set defaults and reported as untested, not disproven. Re-run it
-periodically as more seasons of data accumulate; it takes under a minute per season of history.
+injuries, opponent front-seven injuries, O-line injuries, a teammate-out usage bump, market steam, personal
+weather history — none of which nflverse, ESPN's injury feed, or this odds tier publishes historically) are left
+at hand-set defaults and reported as untested, not disproven.
+
+Three more nudges joined the backtestable list alongside the original nine: **`weather_run_favor`/
+`weather_pass_penalty`** now measure against real historical weather (a fresh Open-Meteo archive-API backfill,
+the same source `lib/pipeline.js`'s live personal-weather-history nudge uses — this closed a real dead-code bug:
+nothing in the codebase actually set the `_wasWetGame` flag that nudge reads until this backfill was added, so
+that branch could never fire live), **`venue_edge`** measures against the schedule's own roof column (already
+being fetched, just not previously cross-referenced against a walk-forward result), and **`game_script_run_favor`/
+`game_script_pass_favor`** measure against nflverse's own historical `spread_line`/`total_line` columns — with
+its sign convention CONFIRMED the opposite of a standard sportsbook board (positive `spread_line` = home
+favored; see `nfldata/DATASETS.md`), which `scripts/backtest.js`'s `scheduleGameScript` explicitly negates to
+match the live pipeline's own convention. Because the weather backfill now hits a real external API for every
+non-dome historical game across all requested seasons (not just this week's board, the way the live pipeline
+scopes it), a full backtest run takes noticeably longer than it used to — expect several minutes, not "under a
+minute per season."
+
+`writeCoeffsFile` (the function that regenerates `lib/modelCoeffs.js`) used to write from a hardcoded per-key
+template that predated the weather/venue/practice-trend/front-seven/game-script coefficients a later session
+added by hand — meaning running `npm run backtest` would have silently **erased** every one of them on the very
+next regeneration, a real latent bug caught (and fixed) during this pass. It now writes every key actually
+present in the merged coefficient object, with a fallback "uncategorized" section for anything it doesn't
+recognize, so a coefficient someone adds directly to `lib/modelCoeffs.js` later can no longer just vanish.
+Re-run the backtest periodically as more seasons of data accumulate.
 
 ### The results ledger — closing the feedback loop
 
@@ -135,6 +173,20 @@ outcome; a pick can lose and still have had real CLV, or hit with none at all). 
 closing price (a market that stopped updating, or a pick made after the last snapshot of the week) are left with
 `clv: null` rather than a fabricated zero, and the calibration ledger's `avgClv` is averaged only over picks that
 actually have one (`clvCount`), never silently diluted by picks with no data.
+
+### Edge Board history
+
+A pick's `wasEdgeBoard` flag is captured the same "once, never overwritten" way `pickPrice`/`pickBook` are: the
+moment a pick is first surfaced, `lib/pipeline.js`'s `buildGradablePicks` records whether it actually cleared the
+real Edge Board bar at that instant (`trueEdge > MIN_TRUE_EDGE`, medium/high confidence, no team mismatch, not
+suspect) — and the merge step preserves that answer across every later refresh of the week, even if the pick's
+own edge shrinks, grows, or disappears entirely as the model updates. `buildEdgeBoardHistory` (also in
+`lib/pipeline.js`, exported for direct unit testing the same way the CLV/grading logic is) then filters the full
+pick history down to picks that were both `wasEdgeBoard: true` and have since graded, sorts most-recent-kickoff-
+first, and reports a simple hits/total tally. This answers "of what this board actually told you was an edge
+last week, what hit" — not "of whatever still looks like an edge today," which is a different and much easier
+question to get a good-looking answer to. Shown on the Edge Board tab, right under the existing calibration
+track-record panel; empty on a fresh deploy for the same honest reason that panel is.
 
 ## What this build computes
 
@@ -170,6 +222,12 @@ actually have one (`clvCount`), never silently diluted by picks with no data.
   man corner is hurt" claim — nflverse's participation/coverage-assignment data, the only thing that could make
   a real 1-on-1 matchup computable, was confirmed discontinued for in-season release (see the speculative-bucket
   note below).
+- **Opposing front-seven injury** — the run-game mirror of the above: how many of the opponent's own DL/LB-family
+  players are out or doubtful, applied to that opponent's rushing props (`computeOpposingFrontSevenInjury` in
+  `lib/factors/injury.js`). Same generic-signal, same reasoning-engine treatment as the secondary-injury factor.
+- **Vegas game-script context** — the game's own spread/total, read as a non-bettable signal for run/pass volume
+  tilt (a big favorite skews run-heavy, a big underdog skews pass-heavy in catch-up mode) — see "Probability
+  model" above for the exact mechanics and the sign-convention caveat worth verifying against a live payload.
 - **Schedule/travel** — rest days, short week, bye, travel distance, time-zone shift, altitude, neutral-site/
   international games, primetime — pulled directly from nflverse's schedule file.
 - **Starter-QB-change detection** — compares this week's listed starter to whichever QB has started most of a
@@ -359,6 +417,50 @@ expensive Claude tier) led to four changes, all in `lib/ai.js` unless noted:
   `annotateScoutingTakes` runs in `{ cacheOnly: true }` mode — rows whose content hasn't changed still get their
   existing note reapplied for free, but nothing new is sent to Claude until the throttle window is up.
 
+### What actually spends money (and the hard daily cap)
+
+**Loading this page costs $0.** `netlify/functions/data.js` only reads the latest saved snapshot out of Netlify
+Blobs — no Anthropic call happens on page load, on a page refresh, or while the page just sits open in a tab.
+The only two things that spend anything are clicking **Refresh Now**, and manually dispatching the GitHub
+Actions workflow — both fire the exact same `workflow_dispatch` run, and per "Manual-only refresh" below, nothing
+fires on its own schedule anymore.
+
+On top of the four controls above, every refresh now enforces a hard daily spend ceiling: `estimateCostUsd`
+(`lib/ai.js`) prices every Claude response from the API's own `usage.input_tokens`/`usage.output_tokens` fields
+— never a guess from payload size — against real, current per-million-token pricing (Haiku 4.5 $1 in/$5 out,
+Sonnet $2/$10, Opus $5/$25; an unrecognized future model name still gets a conservative estimate rather than
+silently costing $0 in the ledger). `createSpendGuard` tracks a running total in a UTC-calendar-day ledger
+(persisted in Blobs via `loadSpendLedger`/`saveSpendLedger`, rolling over to a fresh $0 total — and archiving the
+prior day's total into a 30-day history — at midnight UTC), checked before every wave of concurrent AI calls in
+`annotateWithCache`. Once the day's spend reaches `ANTHROPIC_DAILY_CAP_USD` (a GitHub Actions secret/variable;
+defaults to **$5/day** if unset), every remaining AI call for that refresh — and any refresh triggered later the
+same UTC day — is skipped, logged, and the props/parlays/scouting notes simply go out without a fresh AI note
+(nothing else about the board degrades). **This is a best-effort cap, not a hard guarantee**: it's checked
+between waves of concurrent calls (`CONCURRENCY = 4`), not before each individual call, so a wave already in
+flight when the cap is crossed can still complete — meaning a single refresh can overshoot the cap by, at most,
+the cost of one wave of already-started calls. In practice that overshoot is small and bounded (a handful of
+cents, not dollars), but it's a real, documented limit worth knowing about rather than a promise this can never
+go a cent over $5 on a given day. The running total is shown on the Edge Board next to "Refresh Now," and
+explained in the Setup tab.
+
+**Should you just remove the AI notes entirely instead of capping them?** Worth weighing directly, since it was
+the other option on the table:
+- *For removing them*: it's the only way to guarantee **exactly** $0/day, no best-effort caveats at all. Every
+  other factor on this board (matchup, form, usage, injury, weather, venue, game-script, red-zone share, and so
+  on) is fully computed and scored with zero ongoing cost — the AI notes are a genuinely optional layer on top
+  of a board that already works without them; `propReasoning`'s plain-English writeup for every card is built
+  entirely from real computed factors already, with no AI involved.
+- *Against removing them*: the AI notes and scouting takes are the only place a couple of things live today —
+  the labeled-speculative scouting take (coverage-scheme reads, revenge-game/contract-year narrative — see "The
+  one speculative bucket" above, which has no computed alternative at all since the underlying NFL data doesn't
+  exist), and the parlay rationale write-up layer (`annotateParlaysWithAI`) alongside the always-present
+  computed `parlayWriteupHTML`. Removing the AI layer means losing those, not just a nice-to-have restatement of
+  numbers already on the card.
+- *The cap chosen here* keeps both, while making the actual dollar exposure small, bounded, and visible — a $5/day
+  ceiling, hit only on days with an actual triggered refresh, with real-time transparency on the site itself.
+  Lowering `ANTHROPIC_DAILY_CAP_USD` further (or to `0`, which functions as an effective full removal without
+  deleting any code) is a one-line env-var change if the tradeoff above lands differently than expected.
+
 ### Manual-only refresh
 
 `.github/workflows/refresh.yml` no longer has a `schedule:` trigger — only `workflow_dispatch`. Combined with
@@ -381,6 +483,8 @@ Split across two places now, since two different systems run this.
 - `CURRENT_SEASON` — optional, defaults to 2026.
 - `ANTHROPIC_MODEL` — optional, defaults to `claude-haiku-4-5-20251001` (see "Anthropic cost controls" above for
   why Haiku).
+- `ANTHROPIC_DAILY_CAP_USD` — optional, defaults to `5` (dollars/day). See "What actually spends money (and the
+  hard daily cap)" above.
 - `NETLIFY_SITE_ID` — your Netlify site's ID (Site configuration → General → Site details → Site ID).
 - `NETLIFY_BLOBS_TOKEN` — a Netlify personal access token (User settings → Applications → New access token).
   This is what lets the GitHub Actions job write into the same Blobs store your Netlify site reads from.

@@ -27,9 +27,13 @@ import fs from "node:fs";
 import { fetchMultiSeasonStats, fetchSchedule, fetchSnapCounts, fetchPlayByPlay } from "../lib/fetchers/nflverse.js";
 import { buildGameLogIndex, shortForm, pbpShortKey } from "../lib/identity.js";
 import { buildTeamSeasonIndex } from "../lib/factors/teamStats.js";
-import { computeDefenseVsPosition, statValueFn, PROP_TYPES } from "../lib/factors/playerSplits.js";
+import { computeDefenseVsPosition, computeVenueSplit, statValueFn, PROP_TYPES } from "../lib/factors/playerSplits.js";
 import { computeMatchupEdge, computeScoringEnvironment } from "../lib/factors/playerPbp.js";
 import { computeScheduleFactor, computeStarterChangeFactor } from "../lib/factors/schedule.js";
+import { BIG_SPREAD_THRESHOLD } from "../lib/factors/index.js";
+import { RUN_PROPS, PASS_PROPS } from "../lib/probability.js";
+import { fetchHistoricalWeather } from "../lib/fetchers/weather.js";
+import { STADIUMS } from "../lib/stadiums.js";
 import { normTeam } from "../lib/teamCodes.js";
 import { logit } from "../lib/oddsMath.js";
 import { MODEL_COEFFS as PREV_COEFFS } from "../lib/modelCoeffs.js";
@@ -42,11 +46,34 @@ const MIN_TRAILING_GAMES = 3;
 const REG_K = 30;       // shrinkage anchor, in "games" — fewer supporting games pulls the coefficient hard toward 0
 const MAX_COEFF = 0.35; // cap so a noisy factor can't swing the model further than any hand-set default did
 
-// Factors this script has real historical data for. Anything in MODEL_COEFFS not listed here is left untouched.
+// Factors this script has real historical data for. Anything in MODEL_COEFFS not listed here is left untouched
+// (see HAND_SET_NOTES below for why each of those is still hand-set, and writeCoeffsFile for how it now refuses
+// to silently drop a coefficient it doesn't recognize).
 const BACKTESTED_KEYS = [
   "form_hot", "weak_defense", "matchup_edge", "high_scoring_env",
-  "usage_high_snap", "redzone_share", "starter_change", "short_week_penalty", "travel_penalty"
+  "usage_high_snap", "redzone_share", "starter_change", "short_week_penalty", "travel_penalty",
+  // Added alongside opposing-front-seven-injury and Vegas game-script (see lib/modelCoeffs.js's own comments):
+  // weather_run_favor/weather_pass_penalty now measure against real historical weather (Open-Meteo's archive
+  // API, the same source lib/pipeline.js's live backfill uses) instead of staying hand-set forever; venue_edge
+  // measures against the schedule's own roof column, already being fetched; game_script_run_favor/
+  // game_script_pass_favor measure against nflverse's own historical spread_line/total_line columns. Personal
+  // weather history (weather_personal_boost/penalty) and front_seven_injury stay hand-set — see HAND_SET_NOTES.
+  "weather_run_favor", "weather_pass_penalty", "venue_edge", "game_script_run_favor", "game_script_pass_favor"
 ];
+
+// Why each coefficient NOT in BACKTESTED_KEYS is still hand-set — used by writeCoeffsFile to annotate the
+// generated file so the reason travels with the number instead of living only in this script's memory.
+const HAND_SET_NOTES = {
+  tendency_usage_bump: "not backtestable — no historical injury-report feed",
+  secondary_injury: "not backtestable — no historical injury-report feed",
+  oline_injury_penalty: "not backtestable — no historical injury-report feed",
+  steam_move: "not backtestable — no historical odds-movement archive",
+  weather_personal_boost: "not backtestable — no historical weather-forecast archive",
+  weather_personal_penalty: "not backtestable — no historical weather-forecast archive",
+  practice_trend_down: "not backtestable — no day-by-day historical practice-report archive",
+  practice_trend_up: "not backtestable — no day-by-day historical practice-report archive",
+  front_seven_injury: "not backtestable — no historical injury-report feed (mirrors secondary_injury)"
+};
 
 function normName(raw) { return String(raw || "").toLowerCase().replace(/[^a-z ]/g, "").replace(/\s+/g, " ").trim(); }
 function avg(a) { return a.length ? a.reduce((s, v) => s + v, 0) / a.length : null; }
@@ -90,13 +117,67 @@ function trailingRedZoneShare(rzPlaysByTeam, team, playerKey) {
   return touches.length / teamPlays.length;
 }
 
+// One historical-weather lookup per game (not per player), reusing the exact same Open-Meteo archive API and
+// wet/windy threshold the live pipeline's backfillHistoricalWeather (lib/pipeline.js) uses, so a "does the
+// weather nudge predict anything" answer here means the same thing it would live. Cached in-memory only — this
+// is a standalone script run, not the live app, so there's no Blobs store to persist it in between runs, and
+// re-running the backtest is expected to refetch it.
+async function buildWeatherCache(schedule, seasons, log) {
+  const cache = new Map();
+  const jobs = [];
+  const seen = new Set();
+  for (const g of schedule) {
+    const season = Number(g.season);
+    if (!seasons.includes(season)) continue;
+    const home = normTeam(g.home_team || g.home);
+    const week = Number(g.week);
+    if (!home || isNaN(week)) continue;
+    const key = `${home}|${season}|${week}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const roof = (g.roof || "").toLowerCase();
+    if (roof.includes("dome") || roof === "closed") { cache.set(key, false); continue; } // no API call needed for a roofed game
+    const venue = STADIUMS[home];
+    const date = g.gameday || g.game_date;
+    if (!venue || !date) continue; // leave uncached -> treated as unknown, not "good weather"
+    jobs.push({ key, lat: venue.lat, lon: venue.lon, date });
+  }
+  log(`Backfilling historical weather for ${jobs.length} past outdoor games via Open-Meteo (this is the slow part — expect several minutes, not cached between runs)...`);
+  const CONCURRENCY = 5;
+  for (let i = 0; i < jobs.length; i += CONCURRENCY) {
+    const group = jobs.slice(i, i + CONCURRENCY);
+    await Promise.all(group.map(async (j) => {
+      const result = await fetchHistoricalWeather(j.lat, j.lon, j.date, log);
+      cache.set(j.key, result?.available ? result.wasWet : null);
+    }));
+  }
+  return cache;
+}
+
+// nflverse's games.csv spread_line is CONFIRMED the opposite sign convention from a standard sportsbook board:
+// positive spread_line means the HOME team is favored (see nfldata/DATASETS.md), whereas the live pipeline's own
+// extractGameContext (lib/analyze.js) assumes the standard book convention (negative = home favored). Negating
+// here is what makes this backtest's "big favorite/big underdog" reads mean the same thing computeGameScript
+// means live — get this wrong and the whole game_script_* backtest would be silently measuring the opposite of
+// what the live nudge does.
+function scheduleGameScript(gameRow, team, homeTeam) {
+  const spreadLineRaw = Number(gameRow.spread_line);
+  const totalLineRaw = Number(gameRow.total_line);
+  if (isNaN(spreadLineRaw) || isNaN(totalLineRaw) || !homeTeam) return { available: false };
+  const homeSpread = -spreadLineRaw; // flip nflverse's home-favored-positive into the live pipeline's home-favored-negative
+  const teamSpread = team === homeTeam ? homeSpread : -homeSpread;
+  return { available: true, teamSpread, isBigFavorite: teamSpread <= -BIG_SPREAD_THRESHOLD, isBigUnderdog: teamSpread >= BIG_SPREAD_THRESHOLD };
+}
+
 async function main() {
   log(`Backtesting factor signal strength against seasons: ${SEASONS.join(", ")}`);
-  log(`(This fetches multiple seasons of full play-by-play — it can take a few minutes.)`);
+  log(`(This fetches multiple seasons of full play-by-play, plus a historical-weather backfill for the new`);
+  log(`weather_run_favor/weather_pass_penalty keys — it can take several minutes now, not just a few.)`);
 
   const [statRowsAll, scheduleRaw] = await Promise.all([fetchMultiSeasonStats(SEASONS, log), fetchSchedule(log)]);
   const hasGameType = scheduleRaw.some(r => "game_type" in r);
   const schedule = hasGameType ? scheduleRaw.filter(r => r.game_type === "REG") : scheduleRaw;
+  const weatherCache = await buildWeatherCache(schedule, SEASONS, log);
 
   const pbpBySeason = {}, snapsBySeason = {};
   for (const season of SEASONS) {
@@ -162,6 +243,12 @@ async function main() {
         const heavyRedZone = rz != null && rz >= 0.3;
 
         let shortWeek = false, longTravel = false, starterChanged = false;
+        // gameWasWet: null = unknown (no roof/venue/date to look up), true/false = a real Open-Meteo answer.
+        // roofRaw/roofKnown feed the venue_edge check below (mirrors probability.js's own venue nudge gating).
+        // gameScript: the Vegas-implied favorite/underdog read for THIS row's team, from nflverse's own
+        // historical spread_line/total_line (see scheduleGameScript's sign-convention note above).
+        let gameWasWet = null, roofRaw = null, roofKnown = false;
+        let gameScript = { available: false };
         const gameRow = seasonSchedule.find(s => Number(s.week) === week &&
           (normTeam(s.home_team || s.home) === team || normTeam(s.away_team || s.away) === team));
         if (gameRow) {
@@ -174,6 +261,11 @@ async function main() {
           const thisWeekStarter = homeTeam === team ? gameRow.home_qb_name : gameRow.away_qb_name;
           const starter = computeStarterChangeFactor(team, season, week, thisWeekStarter, seasonSchedule);
           starterChanged = starter.available && starter.changed;
+          roofRaw = (gameRow.roof || "").toLowerCase();
+          roofKnown = !!roofRaw;
+          const cached = weatherCache.get(`${homeTeam}|${season}|${week}`);
+          gameWasWet = cached === undefined ? null : cached;
+          gameScript = scheduleGameScript(gameRow, team, homeTeam);
         }
 
         for (const propType of PROP_TYPES) {
@@ -198,6 +290,29 @@ async function main() {
           record(buckets.starter_change, starterChanged, hit);
           record(buckets.short_week_penalty, shortWeek, hit);
           record(buckets.travel_penalty, longTravel, hit);
+
+          // These five are gated to the same prop types the live nudges themselves are scoped to (RUN_PROPS/
+          // PASS_PROPS from lib/probability.js) — recording them against every prop type regardless, the way the
+          // nine factors above do, would mean asking "does bad weather predict a QB's own passing yards beating
+          // HIS OWN trailing average" using rows where the nudge could never have fired live in the first place.
+          if (RUN_PROPS.has(propType)) {
+            if (gameWasWet != null) record(buckets.weather_run_favor, gameWasWet === true, hit);
+            if (gameScript.available) record(buckets.game_script_run_favor, gameScript.isBigFavorite, hit);
+          } else if (PASS_PROPS.has(propType)) {
+            if (gameWasWet != null) record(buckets.weather_pass_penalty, gameWasWet === true, hit);
+            if (gameScript.available) record(buckets.game_script_pass_favor, gameScript.isBigUnderdog, hit);
+
+            // venue_edge: only means something once a real dome-vs-outdoor split (2+ games each way) is
+            // cross-referenced against which one THIS week's game actually is — same gating as the live nudge in
+            // lib/probability.js. Built from priorGameLogIndex only (never this week's own row), so this is a
+            // real walk-forward measurement, not the player's full-season split leaking into its own test.
+            const venue = computeVenueSplit({ _logKey: logKey, team }, opponent, priorGameLogIndex, seasonSchedule, propType);
+            if (venue.available && roofKnown && venue.domeN >= 2 && venue.outdoorN >= 2) {
+              const isDomeGame = roofRaw !== "outdoors";
+              const domeBetter = venue.domeAvg > venue.outdoorAvg;
+              record(buckets.venue_edge, (isDomeGame && domeBetter) || (!isDomeGame && !domeBetter), hit);
+            }
+          }
         }
       }
     }
@@ -246,29 +361,68 @@ async function main() {
   log(`\nWrote lib/modelCoeffs.js with measured coefficients from ${SEASONS.join(", ")}.`);
 }
 
+// Cosmetic grouping only, for the generated file's section headers/blank lines — a coefficient left out of every
+// group below still gets written by the "uncategorized" fallback in writeCoeffsFile, just without a header. This
+// is the actual fix for a real latent bug: the old version of this function had a hardcoded per-key template
+// that didn't know about the weather/venue/practice-trend/front-seven/game-script coefficients a prior session
+// added to lib/modelCoeffs.js by hand — meaning running `npm run backtest` would have silently ERASED all of
+// them on the very next regeneration. Now every key in the merged coefficient object gets written somewhere.
+const CORE_KEYS = ["form_hot", "tendency_usage_bump", "usage_high_snap", "redzone_share", "weak_defense",
+  "matchup_edge", "high_scoring_env", "starter_change", "secondary_injury", "oline_injury_penalty",
+  "short_week_penalty", "travel_penalty", "steam_move"];
+const WEATHER_VENUE_KEYS = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor",
+  "weather_pass_penalty", "venue_edge", "practice_trend_down", "practice_trend_up"];
+const GAME_SCRIPT_KEYS = ["front_seven_injury", "game_script_run_favor", "game_script_pass_favor"];
+const METADATA_KEYS = ["marketPriorWeight", "generatedAt", "source", "_backtestSeasons", "_backtestSampleSizes"];
+
 function writeCoeffsFile(c) {
+  // A backtested key gets no trailing comment (matches the original convention for form_hot etc.); a hand-set
+  // key gets its reason from HAND_SET_NOTES, computed fresh each run rather than frozen in a string — so a key
+  // that migrates from hand-set to backtested (as weather_run_favor/weather_pass_penalty/venue_edge just did)
+  // automatically loses its "not backtestable" comment instead of it silently going stale.
+  const line = (key) => {
+    const note = !BACKTESTED_KEYS.includes(key) && HAND_SET_NOTES[key] ? ` // ${HAND_SET_NOTES[key]}` : "";
+    return `  ${key}: ${c[key]},${note}`;
+  };
+  const categorized = new Set([...CORE_KEYS, ...WEATHER_VENUE_KEYS, ...GAME_SCRIPT_KEYS, ...METADATA_KEYS]);
+  const uncategorized = Object.keys(c).filter(k => !categorized.has(k));
+  const uncategorizedBlock = uncategorized.length
+    ? `\n  // Added to lib/modelCoeffs.js without a matching entry in scripts/backtest.js's CORE_KEYS/
+  // WEATHER_VENUE_KEYS/GAME_SCRIPT_KEYS section lists — still written out here (never silently dropped), but
+  // add it to one of those lists so it gets a proper section header and, if it's backtestable, real coverage.
+${uncategorized.map(line).join("\n")}\n`
+    : "";
+
   const body = `// Coefficients for lib/probability.js's logistic blend — GENERATED by scripts/backtest.js on ${c.generatedAt}
 // against seasons ${JSON.stringify(c._backtestSeasons)}. Re-run that script to refresh these against more recent
 // history; don't hand-edit the backtested values below without re-running it, or this comment will start lying.
 // See scripts/backtest.js's header for exactly what this backtest can and can't prove, and README's
 // "Probability model" section for the plain-language version.
 export const MODEL_COEFFS = {
+  // Not backtested (scripts/backtest.js only touches the named factor coefficients below) — hand-set at 12
+  // "games" of trust behind the market's own number after checking it against dry-run's thin-vs-deep-sample
+  // regression test: at 6, a bare 2-game 100% streak alone moved the estimate over 12 points off the market,
+  // almost as aggressively as a real 10+3-game trend — exactly the kind of small-sample overreaction the old
+  // point-scoring system was built on. At 12, the same 2-game streak moves it ~7 points while a real deep trend
+  // still moves it ~20.
   marketPriorWeight: ${c.marketPriorWeight},
 
-  form_hot: ${c.form_hot},
-  tendency_usage_bump: ${c.tendency_usage_bump}, // not backtestable — no historical injury-report feed
-  usage_high_snap: ${c.usage_high_snap},
-  redzone_share: ${c.redzone_share},
-  weak_defense: ${c.weak_defense},
-  matchup_edge: ${c.matchup_edge},
-  high_scoring_env: ${c.high_scoring_env},
-  starter_change: ${c.starter_change},
-  secondary_injury: ${c.secondary_injury}, // not backtestable — no historical injury-report feed
-  oline_injury_penalty: ${c.oline_injury_penalty}, // not backtestable — no historical injury-report feed
-  short_week_penalty: ${c.short_week_penalty},
-  travel_penalty: ${c.travel_penalty},
-  steam_move: ${c.steam_move}, // not backtestable — no historical odds-movement archive
+${CORE_KEYS.map(line).join("\n")}
 
+  // Weather/venue/practice-trend nudges: weather_run_favor, weather_pass_penalty, and venue_edge are now
+  // backtested — the first two against Open-Meteo's historical archive (the same source lib/pipeline.js's live
+  // backfill uses), venue_edge against the schedule's own roof column, both already being fetched. Personal
+  // weather history (weather_personal_boost/penalty) and practice_trend_down/up stay hand-set: there's no
+  // per-player historical forecast archive or day-by-day practice-report history to replay them against.
+${WEATHER_VENUE_KEYS.map(line).join("\n")}
+
+  // Opposing front-seven injuries (run-game mirror of secondary_injury above) and game-script (Vegas's own
+  // implied spread/total, read as context rather than a bet — see factors/index.js's computeGameScript).
+  // game_script_run_favor/game_script_pass_favor are backtested against nflverse's own historical
+  // spread_line/total_line columns; front_seven_injury stays hand-set for the same reason secondary_injury does
+  // — no historical injury-report archive exists to replay it against.
+${GAME_SCRIPT_KEYS.map(line).join("\n")}
+${uncategorizedBlock}
   generatedAt: ${JSON.stringify(c.generatedAt)},
   source: "backtest",
   _backtestSeasons: ${JSON.stringify(c._backtestSeasons)},
