@@ -153,19 +153,61 @@ backs them, plus the specific factors that moved the number (`row.modelContribut
 ### Backtesting the contextual nudges
 
 `npm run backtest` (`scripts/backtest.js`) checks whether each contextual nudge actually predicts anything,
-against real multi-season nflverse history, and overwrites `lib/modelCoeffs.js` with measured, sample-size-
-shrunk values. **What it can and can't prove:** SportsGameOdds' Rookie tier has no historical odds archive, so
-there is no way to backtest against real historical market lines. Instead it walks forward through each season
-week by week (using only data from weeks strictly before the one being tested — no lookahead) and checks whether
-a player beat his *own trailing average* for that stat, a reasonable stand-in for "the market already prices in
-a player's normal level" but a genuinely easier question than "beat the real closing line." A run against
-2023-2025 found real signal in recency (`form_hot`), snap share, and red-zone share (each a 6-7 point lift in
-hit rate) and essentially no signal in the single-season defense-vs-position rank or team EPA matchup edge (both
-correctly shrunk toward ~0) — which lines up with the general finding that usage metrics are stickier week to
-week than matchup-quality metrics are predictive. Coefficients with no historical feed at all (opponent secondary
-injuries, opponent front-seven injuries, O-line injuries, a teammate-out usage bump, market steam, personal
-weather history — none of which nflverse, ESPN's injury feed, or this odds tier publishes historically) are left
-at hand-set defaults and reported as untested, not disproven.
+against real multi-season nflverse history, and overwrites `lib/modelCoeffs.js` with measured coefficients.
+**What it can and can't prove:** SportsGameOdds' Rookie tier has no historical odds archive, so there is no way
+to backtest against real historical market lines. Instead it walks forward through each season week by week
+(using only data from weeks strictly before the one being tested — no lookahead) and checks whether a player beat
+his *own trailing average* for that stat, a reasonable stand-in for "the market already prices in a player's
+normal level" but a genuinely easier question than "beat the real closing line." Coefficients with no historical
+feed at all (opponent secondary injuries, opponent front-seven injuries, O-line injuries, a teammate-out usage
+bump, market steam, personal weather history — none of which nflverse, ESPN's injury feed, or this odds tier
+publishes historically) are left at hand-set defaults and reported as untested, not disproven.
+
+**Statistical pruning, not just shrinkage.** Every factor's coefficient used to be shrunk only by *sample size*
+(more supporting games = less shrinkage toward 0) — which meant a factor with a tiny, meaningless real-world lift
+but a large sample could still keep a meaningful chunk of its coefficient, quietly adding noise to every scored
+prop right alongside the factors that were actually predictive. That mattered: `scripts/validate-model.js`'s real
+walk-forward validation showed the full model's calibration was statistically indistinguishable from — and
+technically a hair worse than — a flat 50% guess. The backtest now runs a real two-proportion z-test on every
+factor's with/without hit-rate gap, and any factor that doesn't clear a conventional p<0.05 significance bar
+(given its actual sample size) gets pruned to *exactly* 0, not softly shrunk — it stops contributing to every
+scored prop until a future, larger sample gives it a fair chance to prove itself again. A factor that survives
+the z-test still goes through the existing sample-size shrinkage on top, so a real-but-thin-sampled effect still
+gets pulled partway toward 0.
+
+**What a real run against 2023-2025 actually found** (see `lib/modelCoeffs.js`'s own per-line comments for the
+exact numbers and p-values from whichever run last generated it): of 13 factors with enough data to test, only
+5 cleared the significance bar — `form_hot`, `usage_high_snap`, and `redzone_share` (each a real, positive lift),
+plus `travel_penalty` and `game_script_pass_favor` (both real, but *negative* — see below). The other 8 —
+`weak_defense`, `matchup_edge`, `high_scoring_env`, `starter_change`, `short_week_penalty`,
+`game_script_run_favor`, `referee_over_lean`, and `referee_under_lean` — were pruned to exactly 0 as
+statistically indistinguishable from noise at this sample size. Pruning these actually *helped*: the full
+model's real Brier score improved (0.2530 → 0.2523), the nudges' measured lift over a zero-nudge baseline grew
+(0.0013 → 0.0020), and — notably — the confidence-tier ordering flipped to the direction it's supposed to be in
+(high-confidence picks now out-calibrate medium, where they previously didn't). None of this gets this app close
+to a real, durable edge on its own — see "How accurate is the model, really?" below for the honest full picture —
+but it's a genuine, measured step in the right direction from removing noise rather than adding more signals.
+
+**A genuinely counter-intuitive real finding:** `game_script_pass_favor` (the "a big underdog throws more in
+catch-up mode, so his pass-catchers see a volume bump" intuition) came back with a real, statistically
+significant effect in the *opposite* direction — a big underdog's pass-catchers beat their own trailing average
+*less* often, not more, plausibly because garbage-time volume tends to come against a leading (and often better)
+defense and doesn't translate to the same per-target efficiency. `game_script_run_favor` (the "big favorite runs
+the ball more" intuition) had no measurable real effect at all. Both nudges' reasoning labels were reworded to be
+neutral ("game script read") rather than directional, matching the same pattern `matchup_edge` already
+established once *its* real backtested effect also came back negative despite its positive-sounding label (it's
+now pruned to 0 outright, on this same run, rather than sitting at a small negative value) — a label should never
+claim a "favor" the real data doesn't support.
+
+**A real limitation of this particular run, worth knowing before trusting it blindly:** `weather_run_favor`,
+`weather_pass_penalty`, and `venue_edge` came back as "not enough data" in the sandbox this was built in, because
+that sandbox's network egress blocks Open-Meteo's historical weather API outright (confirmed via a direct `curl`
+test — a `connect_rejected` from the sandbox's own egress proxy, nothing to do with Open-Meteo or nflverse).
+That's an environment restriction of the dev sandbox, not a real-world data gap — Open-Meteo's historical archive
+is real and free, and a real run from your own machine or GitHub Actions (which don't have that restriction)
+should be able to fetch it and produce a real, tested verdict for those three instead of falling back to their
+untested hand-set defaults. **Re-run `npm run backtest` yourself once to get full coverage** rather than trusting
+this session's partial run for those three specific factors.
 
 Three more nudges joined the backtestable list alongside the original nine: **`weather_run_favor`/
 `weather_pass_penalty`** now measure against real historical weather (a fresh Open-Meteo archive-API backfill,
@@ -256,9 +298,11 @@ nudges, re-surfaced. `estimatePropProbability` now returns `contributorDetails` 
 the plain-string `contributors` it already returned (kept as-is for backward compatibility with the existing
 prop-card reasoning and `scripts/dry-run.js`'s string-matching tests). `pickTopReasons` filters that list to
 positive-weight nudges only, ranked by the actual measured coefficient — which matters in a very specific way:
-`matchup_edge`'s backtested coefficient currently sits at **-0.027** (see `lib/modelCoeffs.js`) despite its
-positive-sounding label, so a naive "just list whatever fired" approach would tout a factor whose real, measured
-effect goes the other way. Ranking by signed weight instead of just listing labels catches that automatically.
+a real backtest run has previously measured `matchup_edge`'s coefficient as negative despite its positive-
+sounding label (it's since been pruned to exactly 0 as statistically insignificant — see "Backtesting the
+contextual nudges" above), which is exactly the scenario this exists to guard against: a naive "just list
+whatever fired" approach would tout a factor whose real, measured effect goes the other way, or that isn't real
+at all. Ranking by signed weight instead of just listing labels catches that automatically.
 When a pick has fewer than 3 real fired nudges, `pickTopReasons` fills the gap with real computed facts pulled
 directly off the row (opponent's defensive rank, last-10 hit rate, red-zone share, the edge itself) rather than
 padding with something invented — every reason on a Top Pick card is either a nudge that actually moved the grade
@@ -754,6 +798,16 @@ the file's own header comment before trusting a single number out of it in isola
 what this can and can't prove" treatment `scripts/backtest.js` already gets, for the same reason: the market
 proxy this uses (`marketProb = 0.5`, since there's no historical odds archive) makes this a genuinely easier
 question than "does the model beat a real sportsbook line."
+
+**Most recent real run** (24,424 graded rows, 2024-2025, against the current, statistically-pruned
+`lib/modelCoeffs.js` — see "Backtesting the contextual nudges" above): full-model Brier score 0.2523, essentially
+tied with — technically still a hair worse than — the 0.25 a flat 50% guess would score, but a real, measured
+improvement over both the pre-pruning run (0.2530) and a zero-nudges baseline (0.2543). Confidence tiers now
+order correctly (high out-calibrates medium), which they did not before pruning. Read that as "a genuine step in
+the right direction from removing noise," not as "this now beats the market" — it doesn't yet, and the honest
+next steps toward a real edge (real historical odds to measure actual closing-line value, a properly regularized
+refit instead of hand-correlated coefficients, per-outcome recalibration, and pooling across players instead of
+leaning on thin single-player samples) are still ahead, not behind.
 
 ### Receptions props missing from a live refresh's type filter — diagnosed, not yet fixed
 

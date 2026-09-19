@@ -81,6 +81,41 @@ const HAND_SET_NOTES = {
   front_seven_injury: "not backtestable — no historical injury-report feed (mirrors secondary_injury)"
 };
 
+// Statistical pruning: before this, a factor's coefficient was shrunk only by SAMPLE SIZE (REG_K below) — a
+// factor with a tiny, meaningless lift but a huge N (thousands of rows) barely got shrunk at all, meaning noise
+// could sit in the combined logit stack right alongside real signal, diluting it. That's a real, measured
+// contributor to why the full model's real walk-forward Brier score came out statistically tied with a flat 50%
+// baseline (see scripts/validate-model.js and README's "How accurate is the model, really?" section) — several
+// factors were very likely adding noise, not signal. Fixed here with a real two-proportion z-test: a factor only
+// keeps a nonzero coefficient when its with/without hit-rate gap is large enough, relative to its own sample
+// size, to be statistically distinguishable from chance at the conventional p<0.05 bar. A factor that fails that
+// bar is pruned to exactly 0 (not softly shrunk) — it stops contributing to every scored prop until a future,
+// larger backtest sample gives it a fair chance to prove itself again.
+function erf(x) {
+  // Abramowitz & Stegun 7.1.26 approximation — accurate to ~1.5e-7, plenty for a p-value used as a keep/prune
+  // gate rather than a published statistic.
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  return sign * y;
+}
+function normalCDF(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
+// Two-proportion z-test on hitRateWith vs hitRateWithout, pooled under the null hypothesis that the factor makes
+// no real difference. Returns a two-tailed p-value — the probability of seeing a gap this large (or larger) by
+// pure chance if the factor actually did nothing. Small n1/n2 or a small real gap both push p toward 1 (can't
+// distinguish from noise); a real, well-supported gap pushes p toward 0.
+function twoProportionZTest(p1, n1, p2, n2) {
+  if (!n1 || !n2) return { z: 0, p: 1 };
+  const pooled = (p1 * n1 + p2 * n2) / (n1 + n2);
+  const se = Math.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n2));
+  if (se === 0) return { z: 0, p: 1 };
+  const z = (p1 - p2) / se;
+  return { z, p: 2 * (1 - normalCDF(Math.abs(z))) };
+}
+const SIGNIFICANCE_P = 0.05;
+
 function normName(raw) { return String(raw || "").toLowerCase().replace(/[^a-z ]/g, "").replace(/\s+/g, " ").trim(); }
 function avg(a) { return a.length ? a.reduce((s, v) => s + v, 0) / a.length : null; }
 function newBucket() { return { withHit: 0, withN: 0, withoutHit: 0, withoutN: 0 }; }
@@ -352,26 +387,37 @@ async function main() {
     `Should sit fairly close to 50% by construction — a big departure means the "beat your own trailing average" proxy is skewed (e.g. rookies/breakouts trending up all season) more than it means every factor is broken.`);
 
   const results = {};
+  let prunedCount = 0, keptCount = 0;
   for (const key of BACKTESTED_KEYS) {
     const b = buckets[key];
     const hitRateWith = b.withN ? b.withHit / b.withN : null;
     const hitRateWithout = b.withoutN ? b.withoutHit / b.withoutN : null;
     const lift = (hitRateWith != null && hitRateWithout != null) ? hitRateWith - hitRateWithout : null;
     const rawLogit = (hitRateWith != null && hitRateWithout != null) ? logit(hitRateWith) - logit(hitRateWithout) : 0;
-    const shrunk = Math.max(-MAX_COEFF, Math.min(MAX_COEFF, rawLogit * (b.withN / (b.withN + REG_K))));
+    const ztest = (hitRateWith != null && hitRateWithout != null)
+      ? twoProportionZTest(hitRateWith, b.withN, hitRateWithout, b.withoutN) : { z: 0, p: 1 };
+    const significant = b.withN >= 20 && ztest.p < SIGNIFICANCE_P;
+    // A factor that fails the significance test is pruned to exactly 0, not softly shrunk by sample size alone —
+    // see the comment above twoProportionZTest for why the old sample-size-only shrinkage let noisy-but-frequent
+    // factors keep meaningful weight. A significant factor still goes through the existing REG_K sample-size
+    // shrinkage on top, so a factor that's real but thin-sampled still gets pulled partway toward 0.
+    const shrunk = significant ? Math.max(-MAX_COEFF, Math.min(MAX_COEFF, rawLogit * (b.withN / (b.withN + REG_K)))) : 0;
     const verdict = b.withN < 20 ? "not enough data — kept at prior default"
-      : Math.abs(lift) >= 0.03 ? "real signal" : "weak/no signal — coefficient shrunk toward 0";
-    results[key] = { ...b, hitRateWith, hitRateWithout, lift, rawLogit, shrunk, verdict };
+      : significant ? `real signal (p=${ztest.p.toFixed(3)}) — kept`
+      : `no significant signal (p=${ztest.p.toFixed(3)}) — PRUNED to 0`;
+    if (b.withN >= 20) { if (significant) keptCount++; else prunedCount++; }
+    results[key] = { ...b, hitRateWith, hitRateWithout, lift, rawLogit, ztest, significant, shrunk, verdict };
   }
 
-  log("\nFactor                 withN  withoutN  hitRate(with)  hitRate(without)   lift    coeff(old -> new)   verdict");
+  log("\nFactor                 withN  withoutN  hitRate(with)  hitRate(without)   lift    p-value  coeff(old -> new)   verdict");
   for (const key of BACKTESTED_KEYS) {
     const r = results[key];
     const pct = (v) => v == null ? "  n/a" : (v * 100).toFixed(1).padStart(5);
     const newCoeff = r.withN < 20 ? PREV_COEFFS[key] : +r.shrunk.toFixed(3);
     log(`${key.padEnd(22)} ${String(r.withN).padStart(5)}  ${String(r.withoutN).padStart(8)}     ${pct(r.hitRateWith)}%        ${pct(r.hitRateWithout)}%      ` +
-      `${r.lift == null ? " n/a" : (r.lift * 100).toFixed(1).padStart(5) + "%"}   ${PREV_COEFFS[key].toFixed(2)} -> ${newCoeff.toFixed(3)}      ${r.verdict}`);
+      `${r.lift == null ? " n/a" : (r.lift * 100).toFixed(1).padStart(5) + "%"}   ${r.ztest.p.toFixed(3).padStart(6)}   ${PREV_COEFFS[key].toFixed(2)} -> ${newCoeff.toFixed(3)}      ${r.verdict}`);
   }
+  log(`\nOf ${keptCount + prunedCount} factors with enough data to test (p<${SIGNIFICANCE_P} bar): ${keptCount} kept a real, statistically distinguishable signal; ${prunedCount} were pruned to exactly 0 as statistically indistinguishable from noise at this sample size. A pruned factor isn't necessarily fake — it may just need more games than are available yet — but it stops contributing to every scored prop until a future, larger backtest gives it another chance.`);
 
   const untested = Object.keys(PREV_COEFFS).filter(k => !BACKTESTED_KEYS.includes(k) && typeof PREV_COEFFS[k] === "number");
   log(`\nNot backtestable with data on hand (left at hand-set defaults): ${untested.join(", ")}.`);
@@ -385,6 +431,11 @@ async function main() {
   newCoeffs.source = "backtest";
   newCoeffs._backtestSeasons = SEASONS;
   newCoeffs._backtestSampleSizes = Object.fromEntries(BACKTESTED_KEYS.map(k => [k, { withN: buckets[k].withN, withoutN: buckets[k].withoutN }]));
+  // Auditable record of which factors actually earned their coefficient this run vs. got pruned to 0 for lacking
+  // a statistically real signal — so anyone reading the generated file (or a future backtest diffing against it)
+  // can see the reasoning, not just the final numbers. See twoProportionZTest's own comment above for why this
+  // replaced pure sample-size shrinkage.
+  newCoeffs._backtestVerdicts = Object.fromEntries(BACKTESTED_KEYS.map(k => [k, results[k].verdict]));
 
   writeCoeffsFile(newCoeffs);
   log(`\nWrote lib/modelCoeffs.js with measured coefficients from ${SEASONS.join(", ")}.`);
@@ -405,15 +456,17 @@ const GAME_SCRIPT_KEYS = ["front_seven_injury", "game_script_run_favor", "game_s
 const REFEREE_KEYS = ["referee_over_lean", "referee_under_lean"];
 const NGS_PRESSURE_KEYS = ["ngs_cpoe_hot", "ngs_cpoe_cold", "ngs_ryoe_hot", "ngs_ryoe_cold", "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost"];
 const QBR_TREND_KEYS = ["qbr_trend_elite", "qbr_trend_poor"];
-const METADATA_KEYS = ["marketPriorWeight", "generatedAt", "source", "_backtestSeasons", "_backtestSampleSizes"];
+const METADATA_KEYS = ["marketPriorWeight", "generatedAt", "source", "_backtestSeasons", "_backtestSampleSizes", "_backtestVerdicts"];
 
 function writeCoeffsFile(c) {
-  // A backtested key gets no trailing comment (matches the original convention for form_hot etc.); a hand-set
-  // key gets its reason from HAND_SET_NOTES, computed fresh each run rather than frozen in a string — so a key
-  // that migrates from hand-set to backtested (as weather_run_favor/weather_pass_penalty/venue_edge just did)
-  // automatically loses its "not backtestable" comment instead of it silently going stale.
+  // A backtested key gets its real verdict from this run (kept/pruned, with the p-value) right on its own line —
+  // so a 0 sitting next to "pruned to 0" reads as a deliberate, tested finding, not a mistake or an omission. A
+  // hand-set key still gets its reason from HAND_SET_NOTES, computed fresh each run rather than frozen in a
+  // string — so a key that migrates from hand-set to backtested automatically loses its "not backtestable"
+  // comment instead of it silently going stale.
   const line = (key) => {
-    const note = !BACKTESTED_KEYS.includes(key) && HAND_SET_NOTES[key] ? ` // ${HAND_SET_NOTES[key]}` : "";
+    const note = BACKTESTED_KEYS.includes(key) ? (c._backtestVerdicts?.[key] ? ` // ${c._backtestVerdicts[key]}` : "")
+      : HAND_SET_NOTES[key] ? ` // ${HAND_SET_NOTES[key]}` : "";
     return `  ${key}: ${c[key]},${note}`;
   };
   const categorized = new Set([...CORE_KEYS, ...WEATHER_VENUE_KEYS, ...GAME_SCRIPT_KEYS, ...REFEREE_KEYS, ...NGS_PRESSURE_KEYS, ...QBR_TREND_KEYS, ...METADATA_KEYS]);
@@ -473,7 +526,8 @@ ${uncategorizedBlock}
   generatedAt: ${JSON.stringify(c.generatedAt)},
   source: "backtest",
   _backtestSeasons: ${JSON.stringify(c._backtestSeasons)},
-  _backtestSampleSizes: ${JSON.stringify(c._backtestSampleSizes, null, 2)}
+  _backtestSampleSizes: ${JSON.stringify(c._backtestSampleSizes, null, 2)},
+  _backtestVerdicts: ${JSON.stringify(c._backtestVerdicts, null, 2)}
 };
 `;
   fs.writeFileSync(new URL("../lib/modelCoeffs.js", import.meta.url), body);

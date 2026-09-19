@@ -353,7 +353,7 @@ try {
     propType: "rec_yds", gameScript: stringGameScript,
     form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
   }, 0.55);
-  stringPayloadNudgeText = nudgeResult.contributors.find(c => /garbage-time passing/.test(c));
+  stringPayloadNudgeText = nudgeResult.contributors.find(c => /game script read/.test(c));
   stringPayloadNudgeWorks = typeof stringPayloadContext.homeSpread === "number" && !isNaN(stringPayloadContext.homeSpread) &&
     stringGameScript.isBigUnderdog === true && !!stringPayloadNudgeText;
 } catch (e) {
@@ -372,17 +372,29 @@ const gameScriptWorks = gameScriptHome.available && gameScriptHome.isBigFavorite
   computeGameScript({ team: "MIA", home: "KC", away: "BUF" }, gameContext).available === false;
 console.log("computeGameScript flags the home team as a big favorite and the away team as a big underdog off the same spread, and skips a row belonging to neither team (should be true):", gameScriptWorks, { home: gameScriptHome, away: gameScriptAway });
 
-// The nudges themselves (lib/probability.js): a big favorite favors the run, a big underdog favors the pass —
-// scoped to the prop types that plausibly move with game script — and neither fires on a normal, non-lopsided spread.
+// The nudges themselves (lib/probability.js), checked against MODEL_COEFFS's real, currently-backtested values —
+// NOT the original hand-set intuition. Real walk-forward backtesting (scripts/backtest.js) found
+// game_script_run_favor has no statistically real effect (pruned to exactly 0 — a big favorite's rushing prop
+// does NOT reliably move) while game_script_pass_favor has a real effect in the OPPOSITE direction of the
+// original "garbage-time volume helps" intuition (a real, negative coefficient). So the correct real-world
+// expectation is: the run nudge fires (the code path executes, contributors mentions it) but genuinely doesn't
+// move the estimate at all; the pass nudge fires and genuinely moves the estimate DOWN, not up; and neither
+// fires on a normal, non-lopsided spread. This test intentionally tracks whatever MODEL_COEFFS currently says,
+// since that's the actual live behavior — if a future backtest re-measures either coefficient as significant and
+// positive again, this test's direction should be revisited to match, not hand-reverted.
 const gameScriptRunNudge = estimatePropProbability({ propType: "rush_yds", gameScript: gameScriptHome, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
 const gameScriptPassNudge = estimatePropProbability({ propType: "rec_yds", gameScript: gameScriptAway, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
 const closeSpreadContext = computeGameScript(homeRow, { available: true, homeSpread: -3, total: 44.5, homeImpliedTotal: 23.75, awayImpliedTotal: 20.75 });
 const gameScriptNoFireOnCloseSpread = estimatePropProbability({ propType: "rush_yds", gameScript: closeSpreadContext, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
-const gameScriptNudgesWork = gameScriptRunNudge.modelProb > baseline && gameScriptPassNudge.modelProb > baseline &&
+const expectRunDirection = MODEL_COEFFS.game_script_run_favor > 0 ? "up" : MODEL_COEFFS.game_script_run_favor < 0 ? "down" : "flat";
+const expectPassDirection = MODEL_COEFFS.game_script_pass_favor > 0 ? "up" : MODEL_COEFFS.game_script_pass_favor < 0 ? "down" : "flat";
+const matchesDirection = (v, base, dir) => dir === "up" ? v > base : dir === "down" ? v < base : Math.abs(v - base) < 0.0001;
+const gameScriptNudgesWork = matchesDirection(gameScriptRunNudge.modelProb, baseline, expectRunDirection) &&
+  matchesDirection(gameScriptPassNudge.modelProb, baseline, expectPassDirection) &&
   Math.abs(gameScriptNoFireOnCloseSpread.modelProb - baseline) < 0.0001 &&
-  gameScriptRunNudge.contributors.some(c => /favors the run/.test(c)) &&
-  gameScriptPassNudge.contributors.some(c => /garbage-time passing/.test(c));
-console.log("Game-script nudge favors the run for a big favorite's rushing prop and the pass for a big underdog's receiving prop, and stays silent on a close spread (should be true):", gameScriptNudgesWork,
+  gameScriptRunNudge.contributors.some(c => /game script read/.test(c)) &&
+  gameScriptPassNudge.contributors.some(c => /game script read/.test(c));
+console.log(`Game-script nudge moves each estimate in whatever direction MODEL_COEFFS' real backtested values currently say (run: ${expectRunDirection}, pass: ${expectPassDirection}), fires with a neutral non-directional label either way, and stays silent on a close spread (should be true):`, gameScriptNudgesWork,
   { baseline, run: gameScriptRunNudge.modelProb, pass: gameScriptPassNudge.modelProb, close: gameScriptNoFireOnCloseSpread.modelProb });
 
 // --- Suspect vs. stale-line value (lib/analyze.js) ---
