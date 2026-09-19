@@ -391,6 +391,14 @@ band, a single leg can never appear in more than one of those three within the s
 missing in Low Risk says nothing about whether Medium/High (drawn from an entirely different, disjoint pool of
 players) hit or missed.
 
+**The odds-equivalent bands above describe OUR MODEL's own probability estimate, not the book's displayed
+price.** A leg can land in Low Risk while its book price sits at -109, if our model independently rates it a
+real 66.7%+ favorite regardless of what the book charges — that gap between our number and the book's own number
+IS the value this app exists to find, not an inconsistency between the tier and the leg shown under it. To make
+that unmistakable rather than confusing, every leg on every parlay card shows both numbers side by side (a
+`model X% real · book ~Y%` chip, plus the same comparison spelled out in that leg's full write-up sentence) —
+see `parlayCardHTML`/`parlayWriteupHTML` in `public/index.html`.
+
 Mega and Nuke sit on top of that ladder as two "best of" categories, not additional probability slices — a leg
 qualifying for Mega or Nuke *and* one of Low/Medium/High is expected, not a bug:
 

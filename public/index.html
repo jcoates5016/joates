@@ -923,7 +923,11 @@ function applyPropFilters(){
 function parlayWriteupHTML(v){
   const lead = `<p class="ec-parlay-leg">This ${esc(v.tier.label.toLowerCase())} combines ${v.legs.length} legs at ${esc(BOOKS[v.book].label)} for combined odds of ${fmtOdds(v.combinedAmerican)} (~${fmtPct(v.combinedProb)} naive combined probability, assuming independence).</p>`;
   const legParas = v.legs.map((l, i) => {
-    return `<p class="ec-parlay-leg"><b>Leg ${i + 1}: ${esc(l.label)}</b> (${fmtOdds(l.price)}) — ${propReasoning(l.row)}</p>`;
+    const gap = l.hitProbability - l.prob;
+    const modelNote = gap >= 0.03
+      ? ` Our model rates this a real ${fmtPct(l.hitProbability)} shot, well above the ~${fmtPct(l.prob)} this book's own price implies — that gap is the value this leg was picked for, not a mismatch.`
+      : ` Our model's own estimate (${fmtPct(l.hitProbability)}) is close to what this book's price already implies (~${fmtPct(l.prob)}) — this one's picked more for its safety than for a pricing gap.`;
+    return `<p class="ec-parlay-leg"><b>Leg ${i + 1}: ${esc(l.label)}</b> (${fmtOdds(l.price)}) — ${propReasoning(l.row)}${modelNote}</p>`;
   }).join("");
   const correlationNote = v.correlated
     ? `<p class="ec-parlay-leg" style="color:var(--amber);">Two or more legs share the same game here, so their outcomes aren't fully independent — treat the combined probability above as optimistic, not literal.</p>`
@@ -959,7 +963,7 @@ function parlayCardHTML(p){
   return `<div class="edge-card">
     <div class="ec-top"><div class="ec-player">${esc(p.tier.label)} <span class="pill ${v.book}">${BOOKS[v.book].short}</span></div><div class="ec-edge pos odds">${fmtOdds(v.combinedAmerican)}</div></div>
     <div class="ec-market">${esc(p.tier.desc)}</div>
-    <div style="margin:12px 0;display:flex;flex-direction:column;gap:5px;">${v.legs.map(l => `<div style="font-size:13px;">${esc(l.label)} <span class="odds" style="color:var(--dim);">${fmtOdds(l.price)}</span></div>`).join("")}</div>
+    <div style="margin:12px 0;display:flex;flex-direction:column;gap:5px;">${v.legs.map(l => `<div style="font-size:13px;">${esc(l.label)} <span class="odds" style="color:var(--dim);">${fmtOdds(l.price)}</span> <span class="chip ${(l.hitProbability - l.prob) >= 0.08 ? 'hit' : 'info'}" style="margin-left:6px;" title="Our model's own real-probability estimate for this leg vs. what this book's own price implies — the gap between the two is the value this leg is picked for, not a mismatch.">model ${fmtPct(l.hitProbability)} real${(l.hitProbability - l.prob) >= 0.03 ? ` · book ~${fmtPct(l.prob)}` : ''}</span></div>`).join("")}</div>
     <div style="font-size:13px;">$100 stake → <b style="color:var(--mint);">$${v.payout}</b> profit if it hits · naive combined probability ${fmtPct(v.combinedProb)}</div>
     ${v.correlated ? '<span class="tag tag-warn" style="margin-top:8px;display:inline-block;">Shares a game across legs</span>' : ''}
     ${parlayWriteupHTML(v)}
