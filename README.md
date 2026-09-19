@@ -160,8 +160,22 @@ to backtest against real historical market lines. Instead it walks forward throu
 his *own trailing average* for that stat, a reasonable stand-in for "the market already prices in a player's
 normal level" but a genuinely easier question than "beat the real closing line." Coefficients with no historical
 feed at all (opponent secondary injuries, opponent front-seven injuries, O-line injuries, a teammate-out usage
-bump, market steam, personal weather history — none of which nflverse, ESPN's injury feed, or this odds tier
-publishes historically) are left at hand-set defaults and reported as untested, not disproven.
+bump, market steam, real cross-book stale-line value, personal weather history — none of which nflverse, ESPN's
+injury feed, or this odds tier publishes historically) are left at hand-set defaults and reported as untested,
+not disproven.
+
+**Real stale-line value now actually moves the model, not just a badge.** `lib/analyze.js`'s
+`computeBestAcrossBooks` has long told a genuinely mispriced, corroborated outlier book (`staleValue`) apart
+from a likely data error (`suspect`) — see its own comment for exactly how (a majority of the tracked panel
+agreeing with the consensus is what makes it real, not a shared glitch). Until now that distinction only
+decided whether a prop got excluded from Mispriced Bets, AI notes, and parlays (`suspect` did, `staleValue`
+didn't) — a real, corroborated signal that never actually influenced `modelProb`, the number every ranking and
+parlay-tier decision is made on. `lib/probability.js` now applies a `stale_line_value` nudge scaled by how far
+past the threshold the corroborated edge runs (same magnitude-scaling-with-a-cap discipline `steam_move`
+already uses), so a genuinely stale-priced leg is now correctly rated a real, higher probability instead of
+just wearing a badge that never affected its ranking. Hand-set, not backtested, for the same reason
+`steam_move` is: there's no historical multi-book odds archive to replay "was this book's outlier price
+actually corroborated by the rest of the panel" against.
 
 **Statistical pruning, not just shrinkage.** Every factor's coefficient used to be shrunk only by *sample size*
 (more supporting games = less shrinkage toward 0) — which meant a factor with a tiny, meaningless real-world lift
@@ -175,18 +189,43 @@ scored prop until a future, larger sample gives it a fair chance to prove itself
 the z-test still goes through the existing sample-size shrinkage on top, so a real-but-thin-sampled effect still
 gets pulled partway toward 0.
 
-**What a real run against 2023-2025 actually found** (see `lib/modelCoeffs.js`'s own per-line comments for the
-exact numbers and p-values from whichever run last generated it): of 13 factors with enough data to test, only
-5 cleared the significance bar — `form_hot`, `usage_high_snap`, and `redzone_share` (each a real, positive lift),
-plus `travel_penalty` and `game_script_pass_favor` (both real, but *negative* — see below). The other 8 —
-`weak_defense`, `matchup_edge`, `high_scoring_env`, `starter_change`, `short_week_penalty`,
-`game_script_run_favor`, `referee_over_lean`, and `referee_under_lean` — were pruned to exactly 0 as
-statistically indistinguishable from noise at this sample size. Pruning these actually *helped*: the full
-model's real Brier score improved (0.2530 → 0.2523), the nudges' measured lift over a zero-nudge baseline grew
-(0.0013 → 0.0020), and — notably — the confidence-tier ordering flipped to the direction it's supposed to be in
-(high-confidence picks now out-calibrate medium, where they previously didn't). None of this gets this app close
-to a real, durable edge on its own — see "How accurate is the model, really?" below for the honest full picture —
-but it's a genuine, measured step in the right direction from removing noise rather than adding more signals.
+**Joint estimation, not just per-factor testing.** The two-proportion z-test above has a real blind spot: it
+tests each factor completely on its own, so two correlated factors (a hot-streak player is often also a
+high-snap-share player) can each look independently significant even when only one of them is doing the actual
+work — the model then double-counts one real signal as two. `scripts/backtest.js` now decides its actual written
+coefficients from a single joint logistic fit across every backtested factor at once, with a Wald significance
+test per coefficient at this same p<0.05 bar (`lib/regularizedFit.js`'s `fitJointLogisticWithWaldTest`) — every
+factor competes for credit against every other simultaneously, so a redundant factor's estimated effect (and its
+statistical uncertainty) already reflect that overlap. The independent z-test is still computed and printed
+alongside it purely as diagnostic context (useful for spotting exactly this kind of shared-credit situation when
+the two disagree), but no longer decides what gets written. An earlier version of this used a cross-validated
+lasso instead of a Wald test; that was tried against real backtest data and discarded — see
+`lib/regularizedFit.js`'s own header comment for why it miscalibrated in both directions (either pruning
+everything or nothing, depending which of the two standard lasso lambda-selection rules was used) and wasn't
+trustworthy for a tool real money rides on.
+
+**What a real run against 2023-2025 found, under the ORIGINAL (independent z-test) methodology** (see
+`lib/modelCoeffs.js`'s own per-line comments for the exact numbers and p-values from whichever run last generated
+it — re-running `npm run backtest` now will refresh these under the NEW joint-fit methodology above, and the
+numbers below will change accordingly): of 13 factors with enough data to test, only 5 cleared the significance
+bar — `form_hot`, `usage_high_snap`, and `redzone_share` (each a real, positive lift), plus `travel_penalty` and
+`game_script_pass_favor` (both real, but *negative* — see below). The other 8 — `weak_defense`, `matchup_edge`,
+`high_scoring_env`, `starter_change`, `short_week_penalty`, `game_script_run_favor`, `referee_over_lean`, and
+`referee_under_lean` — were pruned to exactly 0 as statistically indistinguishable from noise at this sample
+size. Pruning these actually *helped*: the full model's real Brier score improved (0.2530 → 0.2523), the nudges'
+measured lift over a zero-nudge baseline grew (0.0013 → 0.0020), and — notably — the confidence-tier ordering
+flipped to the direction it's supposed to be in (high-confidence picks now out-calibrate medium, where they
+previously didn't). None of this gets this app close to a real, durable edge on its own — see "How accurate is
+the model, really?" below for the honest full picture — but it's a genuine, measured step in the right direction
+from removing noise rather than adding more signals. A sandbox smoke test of the new joint-fit methodology
+against a single real season (2024 only — not the full 3-season history this app actually ships with) produced
+directionally consistent results: the same four strong factors (`form_hot`, `usage_high_snap`, `redzone_share`,
+`travel_penalty`) came back significant, the same core noise factors (`weak_defense`, `matchup_edge`,
+`high_scoring_env`, `starter_change`, `referee_under_lean`) came back pruned, and `game_script_run_favor`
+crossed into significance jointly (p=0.045) despite not clearing the bar independently (p=0.136) — a plausible
+example of the exact shared-credit effect this change was built to catch, though one real season isn't enough
+data to call that conclusively. **Re-run `npm run backtest` against your own real 3-season history to get the
+actual current numbers** rather than trusting either of the historical runs summarized here.
 
 **A genuinely counter-intuitive real finding:** `game_script_pass_favor` (the "a big underdog throws more in
 catch-up mode, so his pass-catchers see a volume bump" intuition) came back with a real, statistically
@@ -274,6 +313,40 @@ before there's anything to grade — and is the only honest answer to "is any of
 "high confidence" picks don't hit more than "medium" or "low" ones do after a few real weeks, the tiers aren't
 earning their name, and that will show up here rather than staying a permanent unknown.
 
+### Platt-scaling recalibration — closing the loop a second time
+
+The results ledger above answers "is any of this actually working." `lib/calibration.js` is what actually DOES
+something with that answer, beyond just displaying it. `lib/probability.js`'s blend can be systematically over-
+or under-confident in a consistent direction — every "60% modelProb" pick actually hitting 52% of the time, say —
+even when every individual factor coefficient feeding it is itself real and correctly signed (see
+`scripts/backtest.js`'s joint fit above): that's a calibration problem, not a signal problem, and no amount of
+re-tuning individual nudges fixes it. Standard Platt scaling (Platt, 1999) fits a small 2-parameter logistic
+transform, `calibratedProb = sigmoid(A * logit(rawProb) + B)`, from real `(rawProb, actually hit or missed)` pairs
+pulled from the live ledger, and `lib/pipeline.js` applies it to every prop's `modelProb`/`trueEdge` — before
+anything downstream reads them (AI note selection, Mispriced Bets ranking, parlay tiers, Top Picks, the frontend)
+— so every consumer sees the same corrected number rather than some seeing raw and others calibrated depending on
+where in the pipeline they happen to read it.
+
+This needs real per-pick `(modelProb, hit)` pairs to fit, which the ledger's existing aggregate buckets
+(`totals`/`byConfidence`/`byEdgeBucket`, all just running sums) structurally can't provide — you can't
+reconstruct a scatter plot from its own mean and count. `ledger.recentForCalibration` is the one deliberate
+exception to "raw counters only, never grows with the number of weeks" (see `lib/store.js`'s own comment on that
+design): a rolling window of the most recent `MAX_CALIBRATION_SAMPLE` (500) graded picks' raw `(modelProb, hit)`
+pairs, FIFO-trimmed so it stays a fixed, small size forever rather than accumulating an entire season's worth.
+Below `MIN_CALIBRATION_PICKS` (50) real graded picks on record, there's no real fit yet and every prop's
+`modelProb` passes through completely unchanged — a 2-parameter fit off a handful of picks is itself unstable
+enough to do more harm than good, so raw is the honest answer until there's a real sample to correct against.
+
+Two details keep this from becoming its own source of drift. First, the ledger always fits and folds against the
+RAW, pre-calibration `modelProb` (`rawModelProb`, threaded through from `lib/pipeline.js`'s `buildGradablePicks`),
+never the already-calibrated display value — fitting a correction on top of an already-corrected number would
+compound it refresh over refresh instead of measuring the raw model's actual calibration. Second, each refresh
+applies whatever fit already existed BEFORE folding in that same refresh's newly-graded results, so a pick's own
+just-graded outcome never leaks into the very fit used to score it. The aggregate `totals`/`byConfidence`/
+`byEdgeBucket` aggregate buckets described above still track the CALIBRATED number, deliberately — those exist to
+answer "how did what Jon actually saw and could act on perform," a different question from "is the raw model
+itself calibrated."
+
 ### Closing-line value (CLV)
 
 A pick's `pickPrice`/`pickBook` are captured once, the moment the pick is first saved, and never overwritten by
@@ -348,6 +421,16 @@ its own honest empty state rather than being hidden or padded out with a weaker 
   the same short-name form nflverse's play-by-play actually uses ("P.Mahomes", never "Patrick Mahomes") — an
   earlier version compared full names directly against that field and silently never matched anyone, which
   `scripts/backtest.js` caught by reporting zero real red-zone-share detections across a full season of data.
+  **Cohort-pooled, not a raw ratio.** A share computed off only a handful of team red-zone plays (the floor is
+  just 4) is genuinely noisy — a player who touched 2 of a team's first 4 red-zone snaps this season reads as an
+  extreme 50% "share" a bigger sample would likely walk back, and `scripts/backtest.js`'s own walk-forward
+  measurement of this factor is early-season, in-season-only (it can't pool across years the live app's
+  multi-season history can), so this noise shows up in real backtest runs, not just in theory. The raw ratio is
+  pooled toward an "equal split" baseline — what this player's share would be if the team's red-zone work were
+  divided evenly among however many teammates actually recorded a touch in this same sample, a real same-team
+  cohort computed from data already on hand — weighted by 6 "plays" of trust behind that baseline
+  (`REDZONE_POOL_K` in `lib/factors/playerPbp.js`). `scripts/backtest.js`'s own walk-forward version of this
+  factor calls the exact same pooling helper the live nudge does, so the two can never silently drift apart.
 - **Two-minute-drill share** — how much of a player's usage comes in two-minute situations.
 - **Form, usage, venue, weather-historical, birthday** — season/last-3/last-10/vs-opponent hit rate (with a
   literal per-game breakdown, not just the summarized rate), snap%/target share/aDOT, dome-vs-outdoor +
@@ -408,7 +491,17 @@ its own honest empty state rather than being hidden or padded out with a weaker 
   history are loaded). An over-friendly crew reads as a modest tailwind for scoring generally (more plays for
   BOTH offenses), not a run- or pass-specific tilt the way weather/game-script are. Assignment for an upcoming
   game usually isn't known until close to kickoff — this reports itself unavailable rather than guessing until a
-  real assignment shows up in a later-week refresh.
+  real assignment shows up in a later-week refresh. **Cohort-pooled, not just a hard sample-size floor.** The
+  8-game minimum before a referee's tendency counts at all is itself a thin bar — a genuinely coin-flip-neutral
+  official can show a 65%+ over-rate across just 8-12 games by pure chance. Rather than trust that raw rate
+  outright once it clears the floor, it's pooled toward the league-wide over-rate across every OTHER referee on
+  record, weighted by 20 "games" of trust behind that league baseline (the same shrinkage idea `REG_K` and
+  `marketPriorWeight` already use elsewhere) — a referee with a real, large, well-supported tendency still shows
+  it once his own sample outweighs that constant; one right at the floor gets pulled back hard toward
+  league-normal. This measurably changed backtest behavior in a sandbox smoke test: `referee_under_lean` fired on
+  roughly 10% of scored rows before pooling and under 1% after, because far fewer individual referee/game
+  combinations still cross the ±0.4/0.6 read thresholds once thin samples are pulled toward the middle instead of
+  read at face value.
 - **Player-team accuracy + depth-chart role** — every player is resolved against nflverse's real, continuously
   updated depth-chart scrape (`depth_charts_<season>.csv`), not just the weekly roster file. This closes two
   real accuracy gaps found during this pass: (1) `roster_weekly_<season>.csv` is one row per player *per week*,
@@ -767,37 +860,32 @@ row just silently disappearing.
 Real gaps this build knows about and hasn't closed yet — logged here on purpose rather than fixed silently or
 forgotten, so the reasoning behind "leave it for now" travels with the code.
 
-### Trailing-history factors don't filter by which team the player was actually on
+### Trailing-history factors now filter by which team the player was actually on (fixed)
 
 `computeFormFactor`, `computeUsageFactor`, and `computeTeammateOutTendency` (all in
-`lib/factors/playerSplits.js`) pull a player's trailing game log from `gameLogIndex` keyed only by his name —
-there's no filter for which team he was actually on for each of those games. For a player who's been on the
-same roster his whole career this is a non-issue. For a player who was traded mid-history, it silently mixes
+`lib/factors/playerSplits.js`) used to pull a player's trailing game log from `gameLogIndex` keyed only by his
+name — no filter for which team he was actually on for each of those games. For a player who's been on the
+same roster his whole career this was a non-issue. For a player who was traded mid-history, it silently mixed
 pre-trade and post-trade context into one trailing average: DJ Moore's "last 10 games" the week after a trade
 would blend Panthers/Bears-era usage with whatever the new team is actually doing with him, even though the
-scheme, target competition, and QB play behind those two sets of games can be completely different. Him
-clearing a receiving-yards line this year on a new team doesn't mean the same thing his trailing average says
-it means if half that average is pre-trade games.
-
-`computeTeammateOutTendency` is the worst case of the three: a traded player's OLD team's games would all get
+scheme, target competition, and QB play behind those two sets of games can be completely different.
+`computeTeammateOutTendency` was the worst case of the three: a traded player's OLD team's games would all get
 bucketed as "games without [new teammate]," since that teammate was never on the old roster at all — not a
-noisy signal, a structurally wrong one, since the comparison being drawn (usage with vs. without a specific
-teammate) never actually happened on the field in those old-team games.
+noisy signal, a structurally wrong one.
 
-`computeVenueSplit`, `computeWeatherSplitHistorical`, and `computeBirthdaySplit` are lower priority to fix the
-same way: they're measuring the player's own physical tendencies (does he perform differently in a dome, in
-wet weather, near his birthday) more than his team's scheme or volume, so mixing eras matters less for those —
-a player's dome/outdoor split is still mostly about him, not which offense he's in.
+Fixed via `currentTeamRows` in `lib/factors/playerSplits.js`: the trailing window is now filtered to games
+where the row's own `recent_team`/`team` field matches the player's CURRENT `player.team` first, falling back
+to the full cross-team history only when the current-team-only sample is too thin (under
+`MIN_CURRENT_TEAM_GAMES`, set to 3) to say anything on its own — a player who's been on one roster his whole
+career is unaffected either way, since every row already matches. Covered by a dedicated `scripts/dry-run.js`
+test (a synthetic traded WR with 2 low-volume old-team games and 3 high-volume new-team games, confirming the
+old-team games no longer drag the trailing average down once there are enough new-team games to trust alone,
+plus a companion test confirming a too-thin new-team sample correctly falls back to the full history instead).
 
-Proposed fix direction (not yet built, per Jon's call to log this rather than build it now, since it's only
-Week 2 and there's limited traded-player history to mix in yet): filter the trailing window to games where the
-player's row's own `recent_team`/`team` field matches his CURRENT `player.team` first, falling back to the full
-cross-team history only when the current-team-only sample is too thin (under `MIN_TRAILING_GAMES`) to say
-anything. The existing confidence-tier/`effectiveN` honesty mechanism already down-weights thin samples, so
-this wouldn't need new machinery — just a filter applied before the trailing-average math runs, plus deciding
-what "too thin" means for each of the three affected factors. Current status (active/inactive, snap share,
-depth-chart slot) should carry more weight than a mixed-era trailing average in the meantime — which is already
-true today for `selfInjury`/`oLineInjury`/`tendency`, just not yet for `form`/`usage`.
+`computeVenueSplit`, `computeWeatherSplitHistorical`, and `computeBirthdaySplit` were deliberately left as-is:
+they measure the player's own physical tendencies (does he perform differently in a dome, in wet weather, near
+his birthday) more than his team's scheme or volume, so mixing eras matters less for those — a player's
+dome/outdoor split is still mostly about him, not which offense he's in.
 
 ### How accurate is the model, really? (`scripts/validate-model.js`)
 
@@ -821,10 +909,16 @@ question than "does the model beat a real sportsbook line."
 tied with — technically still a hair worse than — the 0.25 a flat 50% guess would score, but a real, measured
 improvement over both the pre-pruning run (0.2530) and a zero-nudges baseline (0.2543). Confidence tiers now
 order correctly (high out-calibrates medium), which they did not before pruning. Read that as "a genuine step in
-the right direction from removing noise," not as "this now beats the market" — it doesn't yet, and the honest
-next steps toward a real edge (real historical odds to measure actual closing-line value, a properly regularized
-refit instead of hand-correlated coefficients, per-outcome recalibration, and pooling across players instead of
-leaning on thin single-player samples) are still ahead, not behind.
+the right direction from removing noise," not as "this now beats the market" — it doesn't yet. Since that run, all
+three next steps named here have shipped: `scripts/backtest.js` now fits every factor jointly with a Wald
+significance test instead of testing each one alone (see "Joint estimation, not just per-factor testing" above);
+`redzone_share`/referee tendency now pool a thin individual sample toward a same-cohort baseline instead of
+trusting it at face value (see their own entries above and in "Known limitations" below); and a Platt-scaling
+recalibration layer (see "Platt-scaling recalibration" below) now corrects the live modelProb against the real
+graded-picks ledger once it has enough real results on record, falling back to the raw, uncorrected estimate until
+then. What's still genuinely out of reach at this odds tier: real historical odds to measure actual
+closing-line value against a real market, rather than the "beat your own trailing average" proxy every backtest
+number above is built on.
 
 ### Receptions props missing from a live refresh's type filter — diagnosed, not yet fixed
 
@@ -851,6 +945,10 @@ lib/
                    classification
   probability.js   market-anchored probability model — modelProb/marketProb/edge/confidence per row
   modelCoeffs.js   the model's logit-nudge coefficients — GENERATED by scripts/backtest.js
+  regularizedFit.js  joint L1-capable logistic regression (coordinate descent) + Wald significance test —
+                   scripts/backtest.js's own coefficient-selection engine (see "Joint estimation" above)
+  calibration.js   Platt-scaling recalibration — fits/applies a logistic correction to modelProb from the live
+                   graded-picks ledger (see "Platt-scaling recalibration" above)
   grading.js       results ledger: grades completed picks, computes closing-line value (CLV), folds both into
                    the all-time calibration ledger
   parlays.js       fixed-probability-band (Low/Medium/High) plus Mega (combined-payout target) and Nuke

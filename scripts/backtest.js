@@ -1,7 +1,10 @@
 // Answers a question the app never asked itself before: does each contextual factor in the probability model
 // (lib/probability.js) actually predict anything, checked against real multi-season nflverse history — rather
 // than being trusted just because it sounds plausible, the way the old point-scoring system's +6/+7 bonuses
-// were. Overwrites lib/modelCoeffs.js with measured, sample-size-shrunk coefficients when it's done.
+// were. Overwrites lib/modelCoeffs.js with measured coefficients when it's done — as of this version, from a
+// single joint logistic fit + Wald significance test across every backtested factor at once
+// (lib/regularizedFit.js), not from testing each factor in isolation; see the comment above twoProportionZTest
+// below for why that changed.
 //
 // WHAT THIS CAN AND CAN'T PROVE: SportsGameOdds' Rookie tier has no historical odds archive, so there is no way
 // to backtest against real historical market lines. Instead, this walks forward through each season week by
@@ -28,7 +31,7 @@ import { fetchMultiSeasonStats, fetchSchedule, fetchSnapCounts, fetchPlayByPlay 
 import { buildGameLogIndex, shortForm, pbpShortKey } from "../lib/identity.js";
 import { buildTeamSeasonIndex } from "../lib/factors/teamStats.js";
 import { computeDefenseVsPosition, computeVenueSplit, statValueFn, PROP_TYPES } from "../lib/factors/playerSplits.js";
-import { computeMatchupEdge, computeScoringEnvironment } from "../lib/factors/playerPbp.js";
+import { computeMatchupEdge, computeScoringEnvironment, equalSplitCohortShare, pooledShare } from "../lib/factors/playerPbp.js";
 import { computeScheduleFactor, computeStarterChangeFactor } from "../lib/factors/schedule.js";
 import { BIG_SPREAD_THRESHOLD } from "../lib/factors/index.js";
 import { RUN_PROPS, PASS_PROPS } from "../lib/probability.js";
@@ -38,6 +41,7 @@ import { normTeam } from "../lib/teamCodes.js";
 import { logit } from "../lib/oddsMath.js";
 import { MODEL_COEFFS as PREV_COEFFS } from "../lib/modelCoeffs.js";
 import { computeRefereeFactor } from "../lib/factors/referee.js";
+import { fitJointLogisticWithWaldTest } from "../lib/regularizedFit.js";
 
 const log = (msg) => console.log(msg);
 
@@ -74,6 +78,7 @@ const HAND_SET_NOTES = {
   secondary_injury: "not backtestable — no historical injury-report feed",
   oline_injury_penalty: "not backtestable — no historical injury-report feed",
   steam_move: "not backtestable — no historical odds-movement archive",
+  stale_line_value: "not backtestable — no historical multi-book odds archive to replay cross-book corroboration against",
   weather_personal_boost: "not backtestable — no historical weather-forecast archive",
   weather_personal_penalty: "not backtestable — no historical weather-forecast archive",
   practice_trend_down: "not backtestable — no day-by-day historical practice-report archive",
@@ -86,11 +91,20 @@ const HAND_SET_NOTES = {
 // could sit in the combined logit stack right alongside real signal, diluting it. That's a real, measured
 // contributor to why the full model's real walk-forward Brier score came out statistically tied with a flat 50%
 // baseline (see scripts/validate-model.js and README's "How accurate is the model, really?" section) — several
-// factors were very likely adding noise, not signal. Fixed here with a real two-proportion z-test: a factor only
-// keeps a nonzero coefficient when its with/without hit-rate gap is large enough, relative to its own sample
-// size, to be statistically distinguishable from chance at the conventional p<0.05 bar. A factor that fails that
-// bar is pruned to exactly 0 (not softly shrunk) — it stops contributing to every scored prop until a future,
-// larger backtest sample gives it a fair chance to prove itself again.
+// factors were very likely adding noise, not signal. First fixed with a real two-proportion z-test: a factor only
+// kept a nonzero coefficient when its with/without hit-rate gap was large enough, relative to its own sample
+// size, to be statistically distinguishable from chance at the conventional p<0.05 bar.
+//
+// That z-test is still computed and printed below (genuinely useful as an independent, easy-to-audit sanity
+// check — "does this factor move the needle at all, tested completely on its own") but it no longer decides what
+// gets written to lib/modelCoeffs.js. It has a real blind spot: two correlated factors (e.g. a hot-streak player
+// is often also a high-snap-share player) can each look independently significant even when only one of them is
+// doing the actual work, meaning both keep full-strength coefficients and the model effectively double-counts one
+// real signal as two. The actual coefficients now come from a single joint logistic fit across every
+// BACKTESTED_KEYS factor at once, with a Wald significance test per coefficient at this same p<0.05 bar (see
+// lib/regularizedFit.js's fitJointLogisticWithWaldTest, and the call below) — every factor competes for credit
+// against every other simultaneously, so a redundant factor's estimated effect (and its standard error) already
+// reflect that overlap, instead of a separate independent test double-counting it.
 function erf(x) {
   // Abramowitz & Stegun 7.1.26 approximation — accurate to ~1.5e-7, plenty for a p-value used as a keep/prune
   // gate rather than a published statistic.
@@ -151,11 +165,14 @@ function backtestThreshold(propType, trailingAvg) {
   return TD_PROP_TYPES.includes(propType) ? 0 : trailingAvg;
 }
 
+// Uses the exact same equal-split-cohort pooling formula lib/factors/playerPbp.js's computePlayerRedZoneShare
+// uses live (see that file's own comment on why) — imported, not reimplemented, so this walk-forward measurement
+// can't silently drift from what the live nudge actually does.
 function trailingRedZoneShare(rzPlaysByTeam, team, playerKey) {
   const teamPlays = rzPlaysByTeam.get(team);
   if (!teamPlays || teamPlays.length < 4) return null;
   const touches = teamPlays.filter(r => pbpShortKey(r.receiver_player_name) === playerKey || pbpShortKey(r.rusher_player_name) === playerKey);
-  return touches.length / teamPlays.length;
+  return pooledShare(touches.length, teamPlays.length, equalSplitCohortShare(teamPlays));
 }
 
 // One historical-weather lookup per game (not per player), reusing the exact same Open-Meteo archive API and
@@ -237,6 +254,14 @@ async function main() {
 
   const buckets = Object.fromEntries(BACKTESTED_KEYS.map(k => [k, newBucket()]));
   let overallHit = 0, overallN = 0;
+  // Collected in parallel with `buckets` above, one row per (player, week, propType) instance actually scored —
+  // feeds the joint regularized fit after the walk-forward loop finishes (see crossValidatedL1Logistic call
+  // below). Each row's feature values are set from the EXACT SAME boolean conditions the record() calls below
+  // use for the per-factor z-test, via the `mark` helper, so the two approaches are never at risk of silently
+  // measuring different things. A gated factor (e.g. weather_run_favor, only ever wired to fire on RUN_PROPS
+  // live) simply stays 0 on rows where its gate doesn't apply — which is exactly correct, not a simplification:
+  // that mirrors what lib/probability.js's real nudge does on those same rows in production.
+  const designRows = [];
 
   // Everything below fetches ONE season's stats/play-by-play/snap-counts at a time, right before that season is
   // walked, instead of pre-loading every season's raw rows into a statRowsAll/pbpBySeason/snapsBySeason object up
@@ -344,20 +369,23 @@ async function main() {
           const last3 = priorPlayerRows.slice(-3).map(statFor);
           const formHot = last3.length === 3 && last3.filter(v => v > threshold).length / 3 >= 0.66;
 
-          record(buckets.form_hot, formHot, hit);
-          record(buckets.weak_defense, weakDefense, hit);
-          record(buckets.matchup_edge, matchupEdgeHigh, hit);
-          record(buckets.high_scoring_env, highScoringEnv, hit);
-          record(buckets.usage_high_snap, highSnap, hit);
-          record(buckets.redzone_share, heavyRedZone, hit);
-          record(buckets.starter_change, starterChanged, hit);
-          record(buckets.short_week_penalty, shortWeek, hit);
-          record(buckets.travel_penalty, longTravel, hit);
+          const designRow = Object.fromEntries(BACKTESTED_KEYS.map(k => [k, 0]));
+          const mark = (key, present) => { if (present) designRow[key] = 1; };
+
+          record(buckets.form_hot, formHot, hit); mark("form_hot", formHot);
+          record(buckets.weak_defense, weakDefense, hit); mark("weak_defense", weakDefense);
+          record(buckets.matchup_edge, matchupEdgeHigh, hit); mark("matchup_edge", matchupEdgeHigh);
+          record(buckets.high_scoring_env, highScoringEnv, hit); mark("high_scoring_env", highScoringEnv);
+          record(buckets.usage_high_snap, highSnap, hit); mark("usage_high_snap", highSnap);
+          record(buckets.redzone_share, heavyRedZone, hit); mark("redzone_share", heavyRedZone);
+          record(buckets.starter_change, starterChanged, hit); mark("starter_change", starterChanged);
+          record(buckets.short_week_penalty, shortWeek, hit); mark("short_week_penalty", shortWeek);
+          record(buckets.travel_penalty, longTravel, hit); mark("travel_penalty", longTravel);
           // Ungated, same as the nine factors above — referee tendency is read as a general scoring-environment
           // tailwind/headwind, not a run- or pass-specific one (see lib/probability.js's own comment on why).
           if (refFactor.available) {
-            record(buckets.referee_over_lean, refFactor.overRate >= 0.6, hit);
-            record(buckets.referee_under_lean, refFactor.overRate <= 0.4, hit);
+            record(buckets.referee_over_lean, refFactor.overRate >= 0.6, hit); mark("referee_over_lean", refFactor.overRate >= 0.6);
+            record(buckets.referee_under_lean, refFactor.overRate <= 0.4, hit); mark("referee_under_lean", refFactor.overRate <= 0.4);
           }
 
           // These five are gated to the same prop types the live nudges themselves are scoped to (RUN_PROPS/
@@ -365,11 +393,11 @@ async function main() {
           // nine factors above do, would mean asking "does bad weather predict a QB's own passing yards beating
           // HIS OWN trailing average" using rows where the nudge could never have fired live in the first place.
           if (RUN_PROPS.has(propType)) {
-            if (gameWasWet != null) record(buckets.weather_run_favor, gameWasWet === true, hit);
-            if (gameScript.available) record(buckets.game_script_run_favor, gameScript.isBigFavorite, hit);
+            if (gameWasWet != null) { record(buckets.weather_run_favor, gameWasWet === true, hit); mark("weather_run_favor", gameWasWet === true); }
+            if (gameScript.available) { record(buckets.game_script_run_favor, gameScript.isBigFavorite, hit); mark("game_script_run_favor", gameScript.isBigFavorite); }
           } else if (PASS_PROPS.has(propType)) {
-            if (gameWasWet != null) record(buckets.weather_pass_penalty, gameWasWet === true, hit);
-            if (gameScript.available) record(buckets.game_script_pass_favor, gameScript.isBigUnderdog, hit);
+            if (gameWasWet != null) { record(buckets.weather_pass_penalty, gameWasWet === true, hit); mark("weather_pass_penalty", gameWasWet === true); }
+            if (gameScript.available) { record(buckets.game_script_pass_favor, gameScript.isBigUnderdog, hit); mark("game_script_pass_favor", gameScript.isBigUnderdog); }
 
             // venue_edge: only means something once a real dome-vs-outdoor split (2+ games each way) is
             // cross-referenced against which one THIS week's game actually is — same gating as the live nudge in
@@ -379,9 +407,12 @@ async function main() {
             if (venue.available && roofKnown && venue.domeN >= 2 && venue.outdoorN >= 2) {
               const isDomeGame = roofRaw !== "outdoors";
               const domeBetter = venue.domeAvg > venue.outdoorAvg;
-              record(buckets.venue_edge, (isDomeGame && domeBetter) || (!isDomeGame && !domeBetter), hit);
+              const venueEdgeFires = (isDomeGame && domeBetter) || (!isDomeGame && !domeBetter);
+              record(buckets.venue_edge, venueEdgeFires, hit); mark("venue_edge", venueEdgeFires);
             }
           }
+
+          designRows.push({ x: designRow, y: hit ? 1 : 0 });
         }
       }
     }
@@ -390,6 +421,19 @@ async function main() {
 
   log(`\nBaseline: beat own trailing average ${overallHit}/${overallN} times (${overallN ? (100 * overallHit / overallN).toFixed(1) : "?"}%). ` +
     `Should sit fairly close to 50% by construction — a big departure means the "beat your own trailing average" proxy is skewed (e.g. rookies/breakouts trending up all season) more than it means every factor is broken.`);
+
+  // The actual coefficients written to lib/modelCoeffs.js below come from THIS joint fit, not from the per-factor
+  // z-test above — see lib/regularizedFit.js's header comment for why a single combined logistic model catches a
+  // blind spot the independent z-test can't (two correlated factors each getting full "credit" for the same
+  // underlying signal when tested alone), and for why this uses a joint Wald significance test rather than the
+  // cross-validated-lasso design tried first (which miscalibrated in both directions on real backtest data). The
+  // z-test's per-factor hit-rate/lift/p-value numbers are still computed and printed below — they remain
+  // genuinely useful diagnostic context (which factor moves the needle at all, and how confidently, in
+  // isolation) even though they no longer directly decide what gets written.
+  log(`\nRunning joint logistic fit + Wald significance test across all ${BACKTESTED_KEYS.length} factors at once (${designRows.length} scored rows)...`);
+  const jointFit = designRows.length
+    ? fitJointLogisticWithWaldTest(designRows.map(r => BACKTESTED_KEYS.map(k => r.x[k])), designRows.map(r => r.y), BACKTESTED_KEYS, { significanceP: SIGNIFICANCE_P })
+    : { byKey: Object.fromEntries(BACKTESTED_KEYS.map(k => [k, { rawBeta: 0, p: 1, significant: false }])) };
 
   const results = {};
   let prunedCount = 0, keptCount = 0;
@@ -402,27 +446,35 @@ async function main() {
     const ztest = (hitRateWith != null && hitRateWithout != null)
       ? twoProportionZTest(hitRateWith, b.withN, hitRateWithout, b.withoutN) : { z: 0, p: 1 };
     const significant = b.withN >= 20 && ztest.p < SIGNIFICANCE_P;
-    // A factor that fails the significance test is pruned to exactly 0, not softly shrunk by sample size alone —
-    // see the comment above twoProportionZTest for why the old sample-size-only shrinkage let noisy-but-frequent
-    // factors keep meaningful weight. A significant factor still goes through the existing REG_K sample-size
-    // shrinkage on top, so a factor that's real but thin-sampled still gets pulled partway toward 0.
+    // shrunk is the OLD z-test-derived coefficient (kept purely as diagnostic context — no longer written to
+    // lib/modelCoeffs.js) — see the comment above twoProportionZTest for why sample-size-only shrinkage alone let
+    // noisy-but-frequent factors keep meaningful weight.
     const shrunk = significant ? Math.max(-MAX_COEFF, Math.min(MAX_COEFF, rawLogit * (b.withN / (b.withN + REG_K)))) : 0;
+    // jointResult is the joint fit's Wald test for this factor — what actually decides keep-vs-prune and the
+    // written coefficient below (see newCoeffs). The independent z-test's `significant`/`shrunk`/p-value above
+    // are kept purely as diagnostic context in the printed table and verdict string, not as the deciding vote.
+    // A jointly-significant factor still goes through the existing REG_K sample-size shrinkage on top (see
+    // jointCoeff below), so a factor that's real but thin-sampled still gets pulled partway toward 0.
+    const jointResult = jointFit.byKey[key] || { rawBeta: 0, p: 1, significant: false };
+    const jointCoeff = jointResult.significant
+      ? Math.max(-MAX_COEFF, Math.min(MAX_COEFF, jointResult.rawBeta * (b.withN / (b.withN + REG_K))))
+      : 0;
     const verdict = b.withN < 20 ? "not enough data — kept at prior default"
-      : significant ? `real signal (p=${ztest.p.toFixed(3)}) — kept`
-      : `no significant signal (p=${ztest.p.toFixed(3)}) — PRUNED to 0`;
-    if (b.withN >= 20) { if (significant) keptCount++; else prunedCount++; }
-    results[key] = { ...b, hitRateWith, hitRateWithout, lift, rawLogit, ztest, significant, shrunk, verdict };
+      : !jointResult.significant ? `no significant signal in joint fit (p=${jointResult.p.toFixed(3)}) — PRUNED to 0 (independent z-test: ${significant ? `also real, p=${ztest.p.toFixed(3)}` : `no signal either, p=${ztest.p.toFixed(3)}`})`
+      : `real signal in joint fit (p=${jointResult.p.toFixed(3)}) — kept (independent z-test ${significant ? `agrees, p=${ztest.p.toFixed(3)}` : `disagrees, p=${ztest.p.toFixed(3)} — likely shares credit with a correlated factor`})`;
+    if (b.withN >= 20) { if (jointResult.significant) keptCount++; else prunedCount++; }
+    results[key] = { ...b, hitRateWith, hitRateWithout, lift, rawLogit, ztest, significant, shrunk, jointResult, jointCoeff, verdict };
   }
 
-  log("\nFactor                 withN  withoutN  hitRate(with)  hitRate(without)   lift    p-value  coeff(old -> new)   verdict");
+  log("\nFactor                 withN  withoutN  hitRate(with)  hitRate(without)   lift    z-test p  joint p  coeff(old -> new)   verdict");
   for (const key of BACKTESTED_KEYS) {
     const r = results[key];
     const pct = (v) => v == null ? "  n/a" : (v * 100).toFixed(1).padStart(5);
-    const newCoeff = r.withN < 20 ? PREV_COEFFS[key] : +r.shrunk.toFixed(3);
+    const newCoeff = r.withN < 20 ? PREV_COEFFS[key] : +r.jointCoeff.toFixed(3);
     log(`${key.padEnd(22)} ${String(r.withN).padStart(5)}  ${String(r.withoutN).padStart(8)}     ${pct(r.hitRateWith)}%        ${pct(r.hitRateWithout)}%      ` +
-      `${r.lift == null ? " n/a" : (r.lift * 100).toFixed(1).padStart(5) + "%"}   ${r.ztest.p.toFixed(3).padStart(6)}   ${PREV_COEFFS[key].toFixed(2)} -> ${newCoeff.toFixed(3)}      ${r.verdict}`);
+      `${r.lift == null ? " n/a" : (r.lift * 100).toFixed(1).padStart(5) + "%"}   ${r.ztest.p.toFixed(3).padStart(6)}   ${r.jointResult.p.toFixed(3).padStart(6)}   ${PREV_COEFFS[key].toFixed(2)} -> ${newCoeff.toFixed(3)}      ${r.verdict}`);
   }
-  log(`\nOf ${keptCount + prunedCount} factors with enough data to test (p<${SIGNIFICANCE_P} bar): ${keptCount} kept a real, statistically distinguishable signal; ${prunedCount} were pruned to exactly 0 as statistically indistinguishable from noise at this sample size. A pruned factor isn't necessarily fake — it may just need more games than are available yet — but it stops contributing to every scored prop until a future, larger backtest gives it another chance.`);
+  log(`\nOf ${keptCount + prunedCount} factors with enough data to test (joint Wald test, p<${SIGNIFICANCE_P} bar): ${keptCount} kept a real, jointly-significant signal; ${prunedCount} were pruned to exactly 0. A pruned factor isn't necessarily fake — it may just need more games than are available yet, or (thanks to real correlation with another kept factor) its share of the credit may already be reflected in that other factor's coefficient — but it stops contributing to every scored prop until a future, larger backtest gives it another chance.`);
 
   const untested = Object.keys(PREV_COEFFS).filter(k => !BACKTESTED_KEYS.includes(k) && typeof PREV_COEFFS[k] === "number");
   log(`\nNot backtestable with data on hand (left at hand-set defaults): ${untested.join(", ")}.`);
@@ -430,7 +482,7 @@ async function main() {
   const newCoeffs = { ...PREV_COEFFS };
   for (const key of BACKTESTED_KEYS) {
     const r = results[key];
-    newCoeffs[key] = r.withN < 20 ? PREV_COEFFS[key] : +r.shrunk.toFixed(3);
+    newCoeffs[key] = r.withN < 20 ? PREV_COEFFS[key] : +r.jointCoeff.toFixed(3);
   }
   newCoeffs.generatedAt = new Date().toISOString();
   newCoeffs.source = "backtest";
@@ -454,7 +506,7 @@ async function main() {
 // them on the very next regeneration. Now every key in the merged coefficient object gets written somewhere.
 const CORE_KEYS = ["form_hot", "tendency_usage_bump", "usage_high_snap", "redzone_share", "weak_defense",
   "matchup_edge", "high_scoring_env", "starter_change", "secondary_injury", "oline_injury_penalty",
-  "short_week_penalty", "travel_penalty", "steam_move"];
+  "short_week_penalty", "travel_penalty", "steam_move", "stale_line_value"];
 const WEATHER_VENUE_KEYS = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor",
   "weather_pass_penalty", "venue_edge", "practice_trend_down", "practice_trend_up"];
 const GAME_SCRIPT_KEYS = ["front_seven_injury", "game_script_run_favor", "game_script_pass_favor"];

@@ -8,11 +8,14 @@ import { gradeCompletedPicks, foldIntoLedger, summarizeLedger } from "../lib/gra
 import { buildRosterIndex, buildDepthChartIndex, resolvePlayer } from "../lib/identity.js";
 import { findKeyTeammate, computeGameScript } from "../lib/factors/index.js";
 import { computeOpposingFrontSevenInjury, computeInjuryEscalations } from "../lib/factors/injury.js";
-import { computeTeammateOutTendency } from "../lib/factors/playerSplits.js";
-import { computeRefereeFactor } from "../lib/factors/referee.js";
+import { computeTeammateOutTendency, computeFormFactor, computeUsageFactor } from "../lib/factors/playerSplits.js";
+import { computeRefereeFactor, REFEREE_POOL_K } from "../lib/factors/referee.js";
+import { computePlayerRedZoneShare, REDZONE_POOL_K } from "../lib/factors/playerPbp.js";
+import { fitPlattScaling, applyPlattScaling, MIN_CALIBRATION_PICKS, MAX_CALIBRATION_SAMPLE } from "../lib/calibration.js";
 import { computeNgsPassing, computeNgsRushing, computeNgsReceiving, buildNgsIndex } from "../lib/factors/nextgenstats.js";
 import { computePressureFactor } from "../lib/factors/pressure.js";
 import { computeQbrTrend, buildQbrIndex, QBR_ELITE_THRESHOLD, QBR_POOR_THRESHOLD } from "../lib/factors/qbr.js";
+import { fitJointLogisticWithWaldTest } from "../lib/regularizedFit.js";
 import { computeBestAcrossBooks, extractGameContext } from "../lib/analyze.js";
 import { buildDemoData } from "../lib/demoData.js";
 import { fetchNFLEvents } from "../lib/fetchers/odds.js";
@@ -44,7 +47,7 @@ snapshot.logs.forEach(l => console.log(l.msg));
 const factorKeys = Object.keys(snapshot.propRows[0].factors || {});
 const expected = ["form", "tendency", "venue", "weatherHistorical", "weatherForecast", "birthday",
   "usage", "redZone", "twoMinute", "defense", "matchupEdge", "scoringEnvironment", "secondaryInjury", "schedule",
-  "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "situationalNote",
+  "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "staleLineValue", "situationalNote",
   "referee", "ngsPassing", "ngsRushing", "ngsReceiving", "pressure", "qbr"];
 const missing = expected.filter(k => !factorKeys.includes(k));
 
@@ -179,6 +182,88 @@ const wrRedZone = wrRecYdsRow?.factors?.redZone;
 const redZoneShareIsReal = wrRedZone?.available === true && (wrRedZone.redZoneShare ?? 0) > 0.5;
 console.log("Red-zone share resolves a real, nonzero share via short-form PBP name matching (should be true):", redZoneShareIsReal, wrRedZone);
 
+// Cohort pooling for red-zone share (lib/factors/playerPbp.js, task: thin-sample factors shouldn't rely solely
+// on one player's own trailing history). Demo Receiver's own fixture above is the ONLY weapon touching KC's
+// red-zone plays there, so cohortShare works out to 1.0 and never actually exercises the pooling math — this
+// fixture deliberately has TWO weapons splitting a small (4-play) sample so pooling has something real to pull
+// against. "Demo One" gets a thin 4-play sample at a 75% raw share; "Demo Three" gets the exact same 75% raw
+// share off a much bigger 40-play sample — pooling should pull the thin sample noticeably harder toward the
+// equal-split (2 weapons -> 50%) cohort baseline than it pulls the deep one, the same relationship the referee
+// cohort-pooling test above checks.
+function rzPlay(team, touchName, otherName) {
+  return { posteam: team, yardline_100: 10, pass_attempt: 0, rush_attempt: 1, receiver_player_name: null, rusher_player_name: touchName || otherName };
+}
+const thinRzPlays = [
+  rzPlay("KC", "D.One"), rzPlay("KC", "D.One"), rzPlay("KC", "D.One"), rzPlay("KC", "D.Two")
+]; // 4 plays, D.One touches 3 (raw 0.75), 2 distinct weapons -> cohort 0.5
+const deepRzPlays = [
+  ...Array.from({ length: 30 }, () => rzPlay("BUF", "D.Three")),
+  ...Array.from({ length: 10 }, () => rzPlay("BUF", "D.Four"))
+]; // 40 plays, D.Three touches 30 (raw 0.75, same ratio as the thin case), 2 distinct weapons -> cohort 0.5
+const thinRzResult = computePlayerRedZoneShare({ name: "Demo One", team: "KC" }, thinRzPlays);
+const deepRzResult = computePlayerRedZoneShare({ name: "Demo Three", team: "BUF" }, deepRzPlays);
+const expectedThinPooled = (3 + REDZONE_POOL_K * 0.5) / (4 + REDZONE_POOL_K);
+const expectedDeepPooled = (30 + REDZONE_POOL_K * 0.5) / (40 + REDZONE_POOL_K);
+const redZoneCohortPoolingWorks = thinRzResult.available === true && Math.abs(thinRzResult.rawRedZoneShare - 0.75) < 0.001 &&
+  Math.abs(thinRzResult.cohortShare - 0.5) < 0.001 && Math.abs(thinRzResult.redZoneShare - expectedThinPooled) < 0.001 &&
+  deepRzResult.available === true && Math.abs(deepRzResult.rawRedZoneShare - 0.75) < 0.001 &&
+  Math.abs(deepRzResult.redZoneShare - expectedDeepPooled) < 0.001 &&
+  // Same raw ratio (0.75) both times, but the thin 4-play sample should get pulled noticeably harder toward the
+  // 0.5 cohort baseline than the deep 40-play sample does.
+  Math.abs(thinRzResult.redZoneShare - 0.75) > Math.abs(deepRzResult.redZoneShare - 0.75);
+console.log("Red-zone share pools a thin sample toward its equal-split cohort baseline harder than a deep sample at the same raw ratio (should be true):",
+  redZoneCohortPoolingWorks, { thinRzResult, deepRzResult });
+
+// --- Platt-scaling recalibration (lib/calibration.js, lib/grading.js's recentForCalibration) ---
+// Below MIN_CALIBRATION_PICKS, there's no real fit yet — applyPlattScaling must fall back to the raw
+// probability completely unchanged, not some default transform.
+const tooFewPicks = Array.from({ length: MIN_CALIBRATION_PICKS - 1 }, (_, i) => ({ modelProb: 0.6, hit: i % 2 === 0 }));
+const notEnoughDataFit = fitPlattScaling(tooFewPicks);
+const fallbackToRawWorks = notEnoughDataFit.available === false && applyPlattScaling(0.63, notEnoughDataFit) === 0.63;
+console.log("Below MIN_CALIBRATION_PICKS, Platt scaling reports unavailable and falls back to the raw probability unchanged (should be true):", fallbackToRawWorks, notEnoughDataFit);
+
+// Synthetic systematically OVERCONFIDENT picks: modelProb runs 15 points hotter than the real hit rate behind
+// it at every level (a model that says 90% actually hits 75% of the time, and so on) — a real, checkable
+// calibration problem no individual factor coefficient would show. Recalibrating should pull a high raw
+// probability meaningfully back down, not leave it untouched or push it the wrong way.
+const calibRng = mulberry32(7);
+const overconfidentSample = [];
+for (let i = 0; i < 300; i++) {
+  const modelProb = [0.5, 0.6, 0.7, 0.8, 0.9][i % 5];
+  const trueProb = Math.max(0.05, modelProb - 0.15);
+  overconfidentSample.push({ modelProb, hit: calibRng() < trueProb });
+}
+const overconfidentFit = fitPlattScaling(overconfidentSample);
+const calibratedHigh = applyPlattScaling(0.9, overconfidentFit);
+const calibratedLow = applyPlattScaling(0.5, overconfidentFit);
+const overconfidenceCorrectionWorks = overconfidentFit.available === true && overconfidentFit.n === 300 &&
+  calibratedHigh < 0.85 && calibratedHigh > 0.5 && // pulled down from 0.9, but not collapsed to nothing
+  calibratedHigh > calibratedLow; // still monotonic — a higher raw probability stays a higher calibrated one
+console.log("Platt scaling pulls a systematically overconfident raw probability back down toward its real hit rate while staying monotonic (should be true):",
+  overconfidenceCorrectionWorks, { overconfidentFit, calibratedHigh, calibratedLow });
+
+// Synthetic WELL-calibrated picks (modelProb already matches the real hit rate, no systematic bias) — fitting
+// Platt scaling on this should leave probabilities roughly where they already were, not introduce a correction
+// that isn't there.
+const wellCalibratedSample = [];
+for (let i = 0; i < 300; i++) {
+  const modelProb = [0.5, 0.6, 0.7, 0.8, 0.9][i % 5];
+  wellCalibratedSample.push({ modelProb, hit: calibRng() < modelProb });
+}
+const wellCalibratedFit = fitPlattScaling(wellCalibratedSample);
+const noSpuriousCorrectionWorks = wellCalibratedFit.available === true && Math.abs(applyPlattScaling(0.7, wellCalibratedFit) - 0.7) < 0.08;
+console.log("Platt scaling leaves an already-well-calibrated probability roughly unchanged rather than inventing a correction (should be true):",
+  noSpuriousCorrectionWorks, { wellCalibratedFit, calibrated: applyPlattScaling(0.7, wellCalibratedFit) });
+
+// foldIntoLedger's recentForCalibration must stay capped at MAX_CALIBRATION_SAMPLE via a rolling FIFO window —
+// this is the one deliberate exception to the ledger's "raw counters only, never grows with time" design (see
+// lib/grading.js's own comment), so the cap actually holding is worth checking directly, not just assuming.
+const cappingLedger = {};
+foldIntoLedger(cappingLedger, Array.from({ length: MAX_CALIBRATION_SAMPLE + 50 }, (_, i) => ({ modelProb: 0.55, hit: true, confidence: "medium", edge: 0.05 })));
+const cappingWorks = cappingLedger.recentForCalibration.length === MAX_CALIBRATION_SAMPLE;
+console.log("Ledger's recentForCalibration sample stays capped at MAX_CALIBRATION_SAMPLE via a rolling window, not growing unbounded (should be true):",
+  cappingWorks, cappingLedger.recentForCalibration.length);
+
 // --- Probability model (lib/probability.js) ---
 // Regression guard for the point-score -> real-probability rework: every prop with a usable market number gets
 // a modelProb in [0,1], and trueEdge is exactly modelProb - marketProb, not some other derived quantity.
@@ -294,6 +379,21 @@ const steamMagnitudeScalingWorks = steamSmall.modelProb > baseline && steamBig.m
   Math.abs(steamExtreme.modelProb - steamCapMatch.modelProb) < 0.0001; // both past the 2x cap -> identical result
 console.log("Market steam is scaled by magnitude and caps out rather than blowing up on an extreme move (should be true):", steamMagnitudeScalingWorks,
   { baseline, small: steamSmall.modelProb, big: steamBig.modelProb, extreme: steamExtreme.modelProb, capMatch: steamCapMatch.modelProb });
+
+// Real cross-book stale-line value (lib/analyze.js's computeBestAcrossBooks -> f.staleLineValue) now actually
+// moves modelProb instead of just decorating a badge on the Mispriced Bets tab — same magnitude-scaling and
+// capping discipline as market steam above, just keyed off edge size instead of price movement.
+const staleSmall = estimatePropProbability({ staleLineValue: { available: true, edge: 0.09 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const staleBig = estimatePropProbability({ staleLineValue: { available: true, edge: 0.16 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const staleExtreme = estimatePropProbability({ staleLineValue: { available: true, edge: 2 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const staleCapMatch = estimatePropProbability({ staleLineValue: { available: true, edge: 0.16 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const staleNoNudgeWhenUnavailable = estimatePropProbability({ staleLineValue: { available: false }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const staleLineValueWorks = staleSmall.modelProb > baseline && staleBig.modelProb > staleSmall.modelProb &&
+  Math.abs(staleExtreme.modelProb - staleCapMatch.modelProb) < 0.0001 && // both past the 2x cap -> identical result
+  Math.abs(staleNoNudgeWhenUnavailable.modelProb - baseline) < 0.0001 &&
+  staleSmall.contributors.some(c => /stale-line value/.test(c));
+console.log("Real cross-book stale-line value now moves modelProb (scaled by edge size, capped, silent when unavailable), not just a cosmetic badge (should be true):", staleLineValueWorks,
+  { baseline, small: staleSmall.modelProb, big: staleBig.modelProb, extreme: staleExtreme.modelProb, capMatch: staleCapMatch.modelProb, noNudge: staleNoNudgeWhenUnavailable.modelProb });
 
 // --- Opposing front-seven injury (lib/factors/injury.js, run-game mirror of secondary_injury) ---
 // The raw factor function must count only real DL/LB-family positions that are actually out/doubtful — a CB/S
@@ -622,6 +722,48 @@ const teammateTendencyGatesOnCurrentStatus = activeTendency.available === false 
 console.log("computeTeammateOutTendency only fires when the teammate is CURRENTLY Out/Doubtful/Questionable, never on stale historical absence alone (should be true):",
   teammateTendencyGatesOnCurrentStatus, { activeTendency, noEntryTendency, questionableAvailable: questionableTendency.available, outTendency });
 
+// --- Trade-mixing fix (lib/factors/playerSplits.js's currentTeamRows) ---
+// The bug logged in README's "Known limitations": computeFormFactor/computeUsageFactor/computeTeammateOutTendency
+// used to pull a player's WHOLE cross-team game log with no filter for which team he was actually on each game —
+// so a midseason trade silently blended old-team and new-team context into one trailing average. A traded WR with
+// 2 low-volume games on his old team followed by 4 high-volume games on his new team should now read as a hot,
+// high-volume new-team player once he has enough new-team games on record — not diluted by the old-team rows.
+const tradedPlayerLog = new Map([
+  ["traded wr", [
+    { week: 1, season: 2025, recent_team: "CAR", team: "CAR", rec_yds: 20, receiving_yards: 20 },
+    { week: 2, season: 2025, recent_team: "CAR", team: "CAR", rec_yds: 15, receiving_yards: 15 },
+    { week: 3, season: 2025, recent_team: "CHI", team: "CHI", rec_yds: 90, receiving_yards: 90 },
+    { week: 4, season: 2025, recent_team: "CHI", team: "CHI", rec_yds: 85, receiving_yards: 85 },
+    { week: 5, season: 2025, recent_team: "CHI", team: "CHI", rec_yds: 95, receiving_yards: 95 }
+  ]]
+]);
+const tradedPlayer = { _logKey: "traded wr", team: "CHI", name: "Traded WR" };
+// Line of 50 rec yards: old-team games never cleared it, new-team games always did — mixing eras would drag
+// rate_season down toward 40% (2 misses out of 5); filtering to current-team-only should read closer to 100%
+// (3 hits out of 3 real Bears games) since there are enough of them (>= MIN_CURRENT_TEAM_GAMES) to trust alone.
+const tradedForm = computeFormFactor(tradedPlayer, "GB", tradedPlayerLog, "rec_yds", 50);
+const tradedUsage = computeUsageFactor(tradedPlayer, tradedPlayerLog, new Map());
+const tradeFilterWorks = tradedForm.available && tradedForm.n_season === 3 && tradedForm.rate_season === 1 &&
+  tradedForm.gameLog.every(g => g.week >= 3);
+// A player with only 1-2 games on his new team (below MIN_CURRENT_TEAM_GAMES) should fall back to the full
+// cross-team history instead — too thin a current-team sample to say anything on its own, per the README's own
+// logged fallback rule.
+const barelyTradedLog = new Map([
+  ["barely traded wr", [
+    { week: 1, season: 2025, recent_team: "CAR", team: "CAR", rec_yds: 20, receiving_yards: 20 },
+    { week: 2, season: 2025, recent_team: "CAR", team: "CAR", rec_yds: 15, receiving_yards: 15 },
+    { week: 3, season: 2025, recent_team: "CAR", team: "CAR", rec_yds: 25, receiving_yards: 25 },
+    { week: 4, season: 2025, recent_team: "CHI", team: "CHI", rec_yds: 90, receiving_yards: 90 }
+  ]]
+]);
+const barelyTradedPlayer = { _logKey: "barely traded wr", team: "CHI" };
+const barelyTradedForm = computeFormFactor(barelyTradedPlayer, "GB", barelyTradedLog, "rec_yds", 50);
+const thinSampleFallsBackToFullHistory = barelyTradedForm.available && barelyTradedForm.n_season === 4;
+console.log("A traded player's old-team games no longer dilute his new-team trailing average once he has enough new-team games on record (should be true):",
+  tradeFilterWorks, { rate_season: tradedForm.rate_season, n_season: tradedForm.n_season, weeksInLog: tradedForm.gameLog.map(g => g.week), usageSampleGames: tradedUsage.sampleGames });
+console.log("...but falls back to the full cross-team history when the new-team sample alone is too thin to trust (should be true):",
+  thinSampleFallsBackToFullHistory, { n_season: barelyTradedForm.n_season });
+
 // --- Injury status-escalation watch (lib/factors/injury.js) ---
 // Jon's explicit ask: a separate tracker for players who were Questionable on an earlier refresh this week but
 // have since worsened to Doubtful or Out. Four players across two snapshots exercise every case that must be
@@ -652,21 +794,51 @@ const emptyEscalationsOnNoHistory = computeInjuryEscalations([]).length === 0 &&
 console.log("computeInjuryEscalations returns a clean empty list with no/empty history rather than throwing (should be true):", emptyEscalationsOnNoHistory);
 
 // --- Referee tendency, revived as a non-bettable context factor (lib/factors/referee.js) ---
-// 10 synthetic games for "Test Ref": 7 overs, 3 unders, clears the gamesCalled>=8 floor. A second referee with
-// only 3 games on record proves the sample-size gate actually excludes a too-thin history instead of reporting
-// a number anyway.
+// 10 synthetic games for "Test Ref": 7 overs, 3 unders (raw 70%), clears the gamesCalled>=8 floor. "Big Sample
+// Ref" gets a similarly extreme 80% raw rate but over 5x the games (50). A third referee with only 3 games on
+// record proves the sample-size gate actually excludes a too-thin history instead of reporting a number anyway.
+// Cohort pooling (task: thin-sample factors shouldn't rely solely on one referee's own history) should pull
+// BOTH real referees' raw rates toward the league baseline (every OTHER referee's combined rate), but pull the
+// small-sample one harder — expected values are computed here from the exact same formula referee.js uses
+// (rather than hand-derived decimals) so this stays correct if the fixture or REFEREE_POOL_K ever changes.
+// A large, exactly-50%-over "rest of the league" pool (500 games across several filler referees) makes the
+// league baseline stay close to neutral regardless of which single referee is excluded from it — without this,
+// excluding a 50-game referee vs. a 10-game one from a pool of only 2-3 real referees swings the computed
+// baseline wildly (a fixture-size artifact of a compact synthetic test, not something that happens leaguewide
+// with ~17 real officiating crews), which made an earlier version of this fixture non-comparable between the two
+// referees being tested below.
 const refereeSchedule = [
-  ...Array.from({ length: 7 }, (_, i) => ({ referee: "Test Ref", total: 50 + i, total_line: 44 })), // all clear the line -> overs
-  ...Array.from({ length: 3 }, (_, i) => ({ referee: "Test Ref", total: 30 + i, total_line: 44 })), // all under the line
-  { referee: "Thin Sample Ref", total: 40, total_line: 40 }, { referee: "Thin Sample Ref", total: 41, total_line: 40 }, { referee: "Thin Sample Ref", total: 39, total_line: 40 }
+  ...Array.from({ length: 7 }, (_, i) => ({ referee: "Test Ref", total: 50 + i, total_line: 44 })), // 7 overs
+  ...Array.from({ length: 3 }, (_, i) => ({ referee: "Test Ref", total: 30 + i, total_line: 44 })), // 3 unders
+  ...Array.from({ length: 40 }, (_, i) => ({ referee: "Big Sample Ref", total: 50 + i, total_line: 44 })), // 40 overs
+  ...Array.from({ length: 10 }, (_, i) => ({ referee: "Big Sample Ref", total: 30 + i, total_line: 44 })), // 10 unders
+  { referee: "Thin Sample Ref", total: 40, total_line: 40 }, { referee: "Thin Sample Ref", total: 41, total_line: 40 }, { referee: "Thin Sample Ref", total: 39, total_line: 40 },
+  ...Array.from({ length: 250 }, (_, i) => ({ referee: `Filler Ref ${i % 5}`, total: 45, total_line: 44 })), // 250 overs
+  ...Array.from({ length: 250 }, (_, i) => ({ referee: `Filler Ref ${i % 5}`, total: 43, total_line: 44 })) // 250 unders
 ];
+function leagueOverRateExcluding(name) {
+  const others = refereeSchedule.filter(s => s.referee !== name);
+  return others.filter(g => Number(g.total) > Number(g.total_line)).length / others.length;
+}
+function expectedPooledOverRate(name, ownOvers, ownN) {
+  return (ownOvers + REFEREE_POOL_K * leagueOverRateExcluding(name)) / (ownN + REFEREE_POOL_K);
+}
 const testRefFactor = computeRefereeFactor("Test Ref", refereeSchedule);
+const bigSampleRefFactor = computeRefereeFactor("Big Sample Ref", refereeSchedule);
 const thinRefFactor = computeRefereeFactor("Thin Sample Ref", refereeSchedule);
 const noRefFactor = computeRefereeFactor(null, refereeSchedule);
+const expectedTestRefPooled = expectedPooledOverRate("Test Ref", 7, 10);
+const expectedBigSamplePooled = expectedPooledOverRate("Big Sample Ref", 40, 50);
 const refereeFactorWorks = testRefFactor.available === true && testRefFactor.gamesCalled === 10 &&
-  Math.abs(testRefFactor.overRate - 0.7) < 0.001 && thinRefFactor.available === false && noRefFactor.available === false;
-console.log("computeRefereeFactor computes a real over-rate once the sample clears the floor, and reports unavailable below it or with no assignment (should be true):",
-  refereeFactorWorks, { testRefFactor, thinRefFactor });
+  Math.abs(testRefFactor.rawOverRate - 0.7) < 0.001 && Math.abs(testRefFactor.overRate - expectedTestRefPooled) < 0.001 &&
+  bigSampleRefFactor.available === true && Math.abs(bigSampleRefFactor.rawOverRate - 0.8) < 0.001 &&
+  Math.abs(bigSampleRefFactor.overRate - expectedBigSamplePooled) < 0.001 &&
+  // The whole point of cohort pooling: more of a referee's OWN data means less pull away from his raw rate — the
+  // 50-game referee's pooled rate should land closer to his own raw rate than the 10-game referee's does to his.
+  Math.abs(bigSampleRefFactor.overRate - bigSampleRefFactor.rawOverRate) < Math.abs(testRefFactor.overRate - testRefFactor.rawOverRate) &&
+  thinRefFactor.available === false && noRefFactor.available === false;
+console.log("computeRefereeFactor pools each referee's raw over-rate toward the league baseline (pulling a thin sample harder than a large one), and still reports unavailable below the games floor or with no assignment (should be true):",
+  refereeFactorWorks, { testRefFactor, bigSampleRefFactor, thinRefFactor });
 
 // --- Next Gen Stats player efficiency (lib/factors/nextgenstats.js) ---
 // Real NGS-shaped rows for a hot-CPOE QB, a below-expected rusher, and a receiver who consistently gets open —
@@ -1091,19 +1263,73 @@ console.log("Scoring-environment factor computed at least once (should be true):
 const newCoeffsPresent = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor", "weather_pass_penalty",
   "venue_edge", "practice_trend_down", "practice_trend_up", "front_seven_injury", "game_script_run_favor", "game_script_pass_favor",
   "referee_over_lean", "referee_under_lean", "ngs_cpoe_hot", "ngs_cpoe_cold", "ngs_ryoe_hot", "ngs_ryoe_cold",
-  "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost", "qbr_trend_elite", "qbr_trend_poor"].every(k => typeof MODEL_COEFFS[k] === "number");
+  "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost", "qbr_trend_elite", "qbr_trend_poor",
+  "stale_line_value"].every(k => typeof MODEL_COEFFS[k] === "number");
 console.log("Every new hand-set coefficient is present in MODEL_COEFFS (should be true):", newCoeffsPresent);
 
+// --- Regularized joint fit sanity check (lib/regularizedFit.js) — task #40's from-scratch joint logistic fit +
+// Wald significance test, verified here against synthetic data with KNOWN ground truth before ever being
+// trusted against real multi-season backtest rows (scripts/backtest.js). This replaced an earlier
+// cross-validated-lasso design that miscalibrated in both directions on real data (see regularizedFit.js's own
+// header comment) — this test's job is specifically to catch that failure mode again if it ever recurs. A seeded
+// PRNG keeps this reproducible run to run instead of depending on Math.random.
+function mulberry32(seed) {
+  let a = seed;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const synthRng = mulberry32(42);
+function sigmoidSynth(z) { return 1 / (1 + Math.exp(-z)); }
+const N_SYNTH = 20000; // large enough that a genuinely real 0.35-log-odds effect has the statistical power to
+// clear a proper Wald test — this app's real backtests run against tens of thousands of rows, so a synthetic
+// test using only a few thousand risks looking like a false failure of a perfectly sound significance test.
+// Feature layout: strongSignal genuinely drives y; weakSignal has a real but smaller effect; pureNoise has none;
+// redundantCopy is a near-duplicate of strongSignal (agrees with it 90% of the time) — deliberately included so
+// the fit's shared-credit behavior under real multicollinearity can be checked directly. That's the entire
+// reason this joint fit exists in place of independent per-factor z-tests (see regularizedFit.js's header
+// comment): two correlated columns splitting the SAME real signal should show up as real COMBINED weight between
+// them, even if inflated standard errors mean neither one alone clears significance.
+const SYNTH_KEYS = ["strongSignal", "weakSignal", "pureNoise", "redundantCopy"];
+const synthX = [], synthY = [];
+for (let i = 0; i < N_SYNTH; i++) {
+  const strongSignal = synthRng() < 0.4 ? 1 : 0;
+  const weakSignal = synthRng() < 0.4 ? 1 : 0;
+  const pureNoise = synthRng() < 0.4 ? 1 : 0;
+  const redundantCopy = synthRng() < 0.9 ? strongSignal : (synthRng() < 0.4 ? 1 : 0);
+  const logOdds = -0.2 + 1.6 * strongSignal + 0.35 * weakSignal + 0 * pureNoise;
+  const y = synthRng() < sigmoidSynth(logOdds) ? 1 : 0;
+  synthX.push([strongSignal, weakSignal, pureNoise, redundantCopy]);
+  synthY.push(y);
+}
+const synthFit = fitJointLogisticWithWaldTest(synthX, synthY, SYNTH_KEYS);
+const noiseIsNotSignificant = synthFit.byKey.pureNoise.significant === false;
+const weakSignalIsSignificantAndPositive = synthFit.byKey.weakSignal.significant === true && synthFit.byKey.weakSignal.rawBeta > 0;
+// strongSignal and redundantCopy share 90% of their variance, so under a per-coefficient Wald test either one
+// (or both) may legitimately miss significance on its own — the real assertion is that their COMBINED coefficient
+// weight still recovers the true injected effect, proving the joint fit isn't silently losing a real correlated
+// signal, only declining to over-confidently assign it to one specific column.
+const combinedStrongWeight = synthFit.byKey.strongSignal.rawBeta + synthFit.byKey.redundantCopy.rawBeta;
+const atLeastOneStrongColumnSignificant = synthFit.byKey.strongSignal.significant || synthFit.byKey.redundantCopy.significant;
+const sharedCreditWorks = combinedStrongWeight > 0.5 && atLeastOneStrongColumnSignificant;
+const regularizedFitSaneOnSyntheticData = noiseIsNotSignificant && weakSignalIsSignificantAndPositive && sharedCreditWorks;
+console.log("Joint logistic fit + Wald test rejects pure noise, keeps a smaller real effect significant, and still recovers a strong signal's combined weight when it's shared across a correlated redundant column (should be true):",
+  regularizedFitSaneOnSyntheticData, { byKey: synthFit.byKey, combinedStrongWeight });
+
 if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
-  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !frontSevenInjuryFactorWorks || !frontSevenNudgeFires || !gameContextIsCorrect || !noOddsContextWorks || !stringPayloadNudgeWorks || !gameScriptWorks || !gameScriptNudgesWork || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks || !edgeBoardHistoryWorks || !edgeBoardLimitWorks ||
+  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !staleLineValueWorks || !frontSevenInjuryFactorWorks || !frontSevenNudgeFires || !gameContextIsCorrect || !noOddsContextWorks || !stringPayloadNudgeWorks || !gameScriptWorks || !gameScriptNudgesWork || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks || !edgeBoardHistoryWorks || !edgeBoardLimitWorks ||
   !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks || !aiConcurrencyWorks ||
   !aiSelectionWorks || !cacheLoosening || !costEstimatesAreCorrect || !spendGuardCapWorks || !rolloverWorks || !scoutingThrottleWorks || !newCoeffsPresent ||
   !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
   !crossGameMegaNuke.ok || !allSgpMegaNukeValid || !allSlateMegaNukeValid || !demo5MegaCanPoolAcrossBands ||
   !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous ||
   !topPicksBasicsWork || !emptyCategoryHandledCleanly || !negativeContributorExcludedAndRankedByWeight || !fallbackFillsToMinimum || !blurbIsWellFormed ||
-  !teammateTendencyGatesOnCurrentStatus || !escalationWatchWorksCorrectly || !emptyEscalationsOnNoHistory ||
-  !refereeFactorWorks || !ngsFactorsWork || !pressureFactorWorks || !qbrFactorWorks) {
+  !teammateTendencyGatesOnCurrentStatus || !tradeFilterWorks || !thinSampleFallsBackToFullHistory || !escalationWatchWorksCorrectly || !emptyEscalationsOnNoHistory ||
+  !refereeFactorWorks || !ngsFactorsWork || !pressureFactorWorks || !qbrFactorWorks || !regularizedFitSaneOnSyntheticData || !redZoneCohortPoolingWorks ||
+  !fallbackToRawWorks || !overconfidenceCorrectionWorks || !noSpuriousCorrectionWorks || !cappingWorks) {
   console.log("\nFAILED — see above.");
   process.exit(1);
 } else {
