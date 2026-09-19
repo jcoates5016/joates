@@ -404,6 +404,7 @@ const WEATHER_VENUE_KEYS = ["weather_personal_boost", "weather_personal_penalty"
 const GAME_SCRIPT_KEYS = ["front_seven_injury", "game_script_run_favor", "game_script_pass_favor"];
 const REFEREE_KEYS = ["referee_over_lean", "referee_under_lean"];
 const NGS_PRESSURE_KEYS = ["ngs_cpoe_hot", "ngs_cpoe_cold", "ngs_ryoe_hot", "ngs_ryoe_cold", "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost"];
+const QBR_TREND_KEYS = ["qbr_trend_elite", "qbr_trend_poor"];
 const METADATA_KEYS = ["marketPriorWeight", "generatedAt", "source", "_backtestSeasons", "_backtestSampleSizes"];
 
 function writeCoeffsFile(c) {
@@ -415,7 +416,7 @@ function writeCoeffsFile(c) {
     const note = !BACKTESTED_KEYS.includes(key) && HAND_SET_NOTES[key] ? ` // ${HAND_SET_NOTES[key]}` : "";
     return `  ${key}: ${c[key]},${note}`;
   };
-  const categorized = new Set([...CORE_KEYS, ...WEATHER_VENUE_KEYS, ...GAME_SCRIPT_KEYS, ...REFEREE_KEYS, ...NGS_PRESSURE_KEYS, ...METADATA_KEYS]);
+  const categorized = new Set([...CORE_KEYS, ...WEATHER_VENUE_KEYS, ...GAME_SCRIPT_KEYS, ...REFEREE_KEYS, ...NGS_PRESSURE_KEYS, ...QBR_TREND_KEYS, ...METADATA_KEYS]);
   const uncategorized = Object.keys(c).filter(k => !categorized.has(k));
   const uncategorizedBlock = uncategorized.length
     ? `\n  // Added to lib/modelCoeffs.js without a matching entry in scripts/backtest.js's CORE_KEYS/
@@ -463,6 +464,11 @@ ${REFEREE_KEYS.map(line).join("\n")}
   // real full-history nflverse/play-by-play archives exist for both, making them genuine future backtest
   // candidates, but neither is wired into this script's walk-forward loop yet — hand-set for now.
 ${NGS_PRESSURE_KEYS.map(line).join("\n")}
+
+  // Real ESPN Total QBR trend (lib/factors/qbr.js) — nflverse's own espn_data release covers 2006-present, a
+  // genuine full-history archive, so this is a real future backtest candidate the same way ngs_*/pressure_*
+  // above are — not wired into this script's walk-forward loop yet, hand-set for now.
+${QBR_TREND_KEYS.map(line).join("\n")}
 ${uncategorizedBlock}
   generatedAt: ${JSON.stringify(c.generatedAt)},
   source: "backtest",

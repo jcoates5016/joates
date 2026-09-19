@@ -12,11 +12,13 @@ import { computeTeammateOutTendency } from "../lib/factors/playerSplits.js";
 import { computeRefereeFactor } from "../lib/factors/referee.js";
 import { computeNgsPassing, computeNgsRushing, computeNgsReceiving, buildNgsIndex } from "../lib/factors/nextgenstats.js";
 import { computePressureFactor } from "../lib/factors/pressure.js";
+import { computeQbrTrend, buildQbrIndex, QBR_ELITE_THRESHOLD, QBR_POOR_THRESHOLD } from "../lib/factors/qbr.js";
 import { computeBestAcrossBooks, extractGameContext } from "../lib/analyze.js";
 import { buildDemoData } from "../lib/demoData.js";
 import { fetchNFLEvents } from "../lib/fetchers/odds.js";
 import { annotatePropsWithAI, annotateScoutingTakes, selectAiEligible, roundForHash, createSpendGuard, estimateCostUsd } from "../lib/ai.js";
-import { classifyKickoffWindow, summarizeEvents, buildAllParlays, buildSameGameParlays, buildSlateParlays, RISK_TIERS, MIN_LEG_PROBABILITY } from "../lib/parlays.js";
+import { classifyKickoffWindow, summarizeEvents, buildAllParlays, buildSameGameParlays, buildSlateParlays, RISK_TIERS, MIN_LEG_PROBABILITY, MEGA_TARGET_DECIMAL, MEGA_MIN_LEGS, NUKE_LEGS } from "../lib/parlays.js";
+import { americanToDecimal } from "../lib/oddsMath.js";
 import { buildTopPicks, pickTopReasons, pickBlurb, PICK_CATEGORIES } from "../lib/topPicks.js";
 
 const SEASON = 2026;
@@ -43,7 +45,7 @@ const factorKeys = Object.keys(snapshot.propRows[0].factors || {});
 const expected = ["form", "tendency", "venue", "weatherHistorical", "weatherForecast", "birthday",
   "usage", "redZone", "twoMinute", "defense", "matchupEdge", "scoringEnvironment", "secondaryInjury", "schedule",
   "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "situationalNote",
-  "referee", "ngsPassing", "ngsRushing", "ngsReceiving", "pressure"];
+  "referee", "ngsPassing", "ngsRushing", "ngsReceiving", "pressure", "qbr"];
 const missing = expected.filter(k => !factorKeys.includes(k));
 
 console.log("\n=== SELF-CHECK ===");
@@ -691,6 +693,27 @@ const pressureFactorWorks = pressureResult.available === true && Math.abs(pressu
 console.log("computePressureFactor combines the offense's own pass-block rate with the opposing defense's pass-rush rate, real numbers only (should be true):",
   pressureFactorWorks, pressureResult);
 
+// --- Real ESPN Total QBR trend (lib/factors/qbr.js) ---
+// An elite-trending QB (avg well above QBR_ELITE_THRESHOLD), a poor-trending one (avg below QBR_POOR_THRESHOLD),
+// a non-QB who should never get a QBR read regardless of how the data is shaped, and a too-thin single-game
+// sample that should stay unavailable rather than trusting one QBR reading.
+const qbrIdx = buildQbrIndex([
+  { name_display: "Test Qb", week_num: 1, qbr_total: 82.5 },
+  { name_display: "Test Qb", week_num: 2, qbr_total: 79.1 },
+  { name_display: "Poor Qb", week_num: 1, qbr_total: 22.0 },
+  { name_display: "Poor Qb", week_num: 2, qbr_total: 28.4 },
+  { name_display: "Thin Qb", week_num: 1, qbr_total: 95.0 }
+]);
+const eliteQbrResult = computeQbrTrend({ position: "QB", _logKey: "test qb" }, qbrIdx);
+const poorQbrResult = computeQbrTrend({ position: "QB", _logKey: "poor qb" }, qbrIdx);
+const thinQbrStaysUnavailable = computeQbrTrend({ position: "QB", _logKey: "thin qb" }, qbrIdx).available === false;
+const nonQbStaysUnavailable = computeQbrTrend({ position: "WR", _logKey: "test qb" }, qbrIdx).available === false;
+const qbrFactorWorks = eliteQbrResult.available === true && eliteQbrResult.avgQbr >= QBR_ELITE_THRESHOLD &&
+  poorQbrResult.available === true && poorQbrResult.avgQbr <= QBR_POOR_THRESHOLD &&
+  thinQbrStaysUnavailable && nonQbStaysUnavailable;
+console.log("computeQbrTrend reads real ESPN QBR trailing averages, gated on QB position and a real 2-game floor (should be true):",
+  qbrFactorWorks, { eliteQbrResult, poorQbrResult });
+
 // --- Roster/depth-chart accuracy pass (lib/identity.js, lib/factors/index.js) ---
 // Unit-tested directly against the same fixtures buildDemoData feeds the pipeline, the same pattern already
 // used above for lib/probability.js and lib/grading.js — these fixtures don't have their own odds/props in
@@ -912,16 +935,19 @@ const demoEventWindowsAreCorrect = eventWindows["demo-1"] === "sun_early" && eve
   eventWindows["demo-3"] === "sun_late" && eventWindows["demo-4"] === "sun_late" && eventWindows["demo-5"] === null;
 console.log("Every demo event lands in the right kickoff window (should be true):", demoEventWindowsAreCorrect, eventWindows);
 
-// Core invariant of the whole rewrite, checked generically (not by hand-deriving every leg's exact modelProb):
-// within ANY one parlay grouping (a cross-game tier set, one game's SGP tier set, or one slate's tier set),
-// every tier that built successfully must draw its legs ONLY from its own declared probability band, and no
-// single leg (by oddID) can appear in more than one of that group's tiers — the actual bug this rewrite fixes
-// (the old design let the same top legs get reused across every risk tier).
+// Core invariant of the Low/Medium/High rewrite, checked generically (not by hand-deriving every leg's exact
+// modelProb): within ANY one parlay grouping (a cross-game tier set, one game's SGP tier set, or one slate's
+// tier set), every ONE OF THOSE THREE tiers that built successfully must draw its legs ONLY from its own
+// declared probability band, and no single leg (by oddID) can appear in more than one of them — the actual bug
+// the original rewrite fixed (the old design let the same top legs get reused across every risk tier). Mega and
+// Nuke are checked separately below (checkMegaNukeInvariants) since they're deliberately allowed to reuse a
+// Low/Medium/High leg — see parlays.js's own comment on buildTierSet for why that's by design, not a bug.
 function checkTierSetInvariants(tiers, label) {
   const seenAcrossTiers = new Set();
   let bandsRespected = true, noOverlap = true;
   const details = [];
-  for (const t of tiers) {
+  const banded = tiers.filter(t => ["low", "medium", "high"].includes(t.tier.key));
+  for (const t of banded) {
     if (!t.ok) { details.push(`${label} ${t.tier.key}: not ok (${t.reason})`); continue; }
     for (const leg of t.legs) {
       if (leg.hitProbability < t.tier.minProb || leg.hitProbability >= t.tier.maxProb) {
@@ -935,19 +961,50 @@ function checkTierSetInvariants(tiers, label) {
   return { bandsRespected, noOverlap, details };
 }
 
+// Mega's and Nuke's own real invariants, checked on whatever's actually in `tiers` (cross-game/SGP/slate all
+// share this shape): a successful Mega must have every leg still clear the real 55% floor and its combined
+// payout must genuinely reach the +2500 target (never faked/rounded past it); a successful Nuke must have every
+// leg genuinely priced at plus money by the book AND still clear that same 55% floor, with at least NUKE_LEGS.
+function checkMegaNukeInvariants(tiers, label) {
+  const mega = tiers.find(t => t.tier.key === "mega");
+  const nuke = tiers.find(t => t.tier.key === "nuke");
+  const details = [];
+  let ok = true;
+  if (mega?.ok) {
+    const decimal = mega.legs.reduce((d, l) => d * americanToDecimal(l.price), 1);
+    if (decimal < MEGA_TARGET_DECIMAL - 1e-9) { ok = false; details.push(`${label} mega: combined decimal ${decimal.toFixed(2)} is under the +2500 target`); }
+    if (mega.legs.length < MEGA_MIN_LEGS) { ok = false; details.push(`${label} mega: only ${mega.legs.length} legs, under MEGA_MIN_LEGS`); }
+    if (mega.legs.some(l => l.hitProbability < MIN_LEG_PROBABILITY)) { ok = false; details.push(`${label} mega: a leg is under the 55% floor`); }
+  }
+  if (nuke?.ok) {
+    if (nuke.legs.length < NUKE_LEGS) { ok = false; details.push(`${label} nuke: only ${nuke.legs.length} legs, expected ${NUKE_LEGS}+`); }
+    if (nuke.legs.some(l => l.price <= 0 || l.hitProbability < MIN_LEG_PROBABILITY)) { ok = false; details.push(`${label} nuke: a leg isn't genuinely plus-money-and-55%+`); }
+  }
+  return { ok, details };
+}
+
 const crossGameCheck = checkTierSetInvariants(snapshot.parlays, "cross-game");
-console.log("Cross-game parlay tiers each stay inside their own probability band, with zero legs reused across tiers (should be true):",
+console.log("Cross-game Low/Medium/High tiers each stay inside their own probability band, with zero legs reused across those three (should be true):",
   crossGameCheck.bandsRespected && crossGameCheck.noOverlap, crossGameCheck.details);
+const crossGameMegaNuke = checkMegaNukeInvariants(snapshot.parlays, "cross-game");
+console.log("Cross-game Mega (when built) genuinely clears +2500 and Nuke (when built) is genuinely all plus-money-and-55%+ (should be true):",
+  crossGameMegaNuke.ok, crossGameMegaNuke.details);
 
 const sameGameParlays = buildSameGameParlays(snapshot.propRows);
 const sgpChecks = sameGameParlays.map(g => ({ eventId: g.eventId, ...checkTierSetInvariants(g.tiers, `SGP:${g.eventId}`) }));
 const allSgpRespectBandsAndDisjoint = sgpChecks.every(c => c.bandsRespected && c.noOverlap);
-console.log("Every Same Game Parlay's tiers stay inside their own band with zero cross-tier leg reuse (should be true):", allSgpRespectBandsAndDisjoint, sgpChecks.flatMap(c => c.details));
+console.log("Every Same Game Parlay's Low/Medium/High tiers stay inside their own band with zero reuse among those three (should be true):", allSgpRespectBandsAndDisjoint, sgpChecks.flatMap(c => c.details));
+const sgpMegaNukeChecks = sameGameParlays.map(g => checkMegaNukeInvariants(g.tiers, `SGP:${g.eventId}`));
+const allSgpMegaNukeValid = sgpMegaNukeChecks.every(c => c.ok);
+console.log("Every Same Game Parlay's Mega/Nuke (when built) are genuinely real (should be true):", allSgpMegaNukeValid, sgpMegaNukeChecks.flatMap(c => c.details));
 
 const slateParlays = buildSlateParlays(snapshot.propRows);
 const slateChecks = slateParlays.map(s => ({ window: s.window, ...checkTierSetInvariants(s.tiers, `slate:${s.window}`) }));
 const allSlatesRespectBandsAndDisjoint = slateChecks.every(c => c.bandsRespected && c.noOverlap);
-console.log("Every slate parlay's tiers stay inside their own band with zero cross-tier leg reuse (should be true):", allSlatesRespectBandsAndDisjoint, slateChecks.flatMap(c => c.details));
+console.log("Every slate parlay's Low/Medium/High tiers stay inside their own band with zero reuse among those three (should be true):", allSlatesRespectBandsAndDisjoint, slateChecks.flatMap(c => c.details));
+const slateMegaNukeChecks = slateParlays.map(s => checkMegaNukeInvariants(s.tiers, `slate:${s.window}`));
+const allSlateMegaNukeValid = slateMegaNukeChecks.every(c => c.ok);
+console.log("Every slate parlay's Mega/Nuke (when built) are genuinely real (should be true):", allSlateMegaNukeValid, slateMegaNukeChecks.flatMap(c => c.details));
 
 // The cross-game pool draws from every demo event, each contributing real legs deliberately placed in every one
 // of the four bands (see demoData.js's fillerGame) — so unlike a single game's own SGP, it should be able to
@@ -957,11 +1014,19 @@ console.log("The cross-game pool fills every tier at its real leg count, drawing
   snapshot.parlays.map(p => p.ok ? `${p.tier.key}:${p.legs.length}` : `${p.tier.key}:fail(${p.reason})`));
 
 // A single filler game only ever contributes 2 real legs per band (see demoData.js) — never enough on its own
-// to fill a 3-4-leg tier — so every filler game's own SGP should honestly fail every tier, exactly the point
-// the design note on RISK_TIERS in parlays.js makes about single-game pools being unrealistic for full coverage.
+// to fill a 3-4-leg Low/Medium/High tier — so every filler game's own SGP should honestly fail all three of
+// those, exactly the point the design note on RISK_TIERS in parlays.js makes about single-game pools being
+// unrealistic for full coverage. Mega is EXPECTED to behave differently now: it draws from the whole real pool
+// across every band at once, so a game with enough total real legs (even split thin across bands) can still
+// stack its way to a real Mega parlay — that's the new design working as intended, not a regression.
 const demo5Sgp = sameGameParlays.find(g => g.eventId === "demo-5");
-const sgpReportsShortfallHonestly = demo5Sgp && demo5Sgp.tiers.every(t => t.ok === false && /fall in the .*% range|per game keeps this/.test(t.reason));
-console.log("A single filler game's SGP honestly fails every tier rather than borrowing legs from another band (should be true):", sgpReportsShortfallHonestly, demo5Sgp?.tiers.map(t => t.ok ? t.legs.length : t.reason));
+const demo5BandedTiers = demo5Sgp?.tiers.filter(t => ["low", "medium", "high"].includes(t.tier.key)) || [];
+const sgpReportsShortfallHonestly = demo5BandedTiers.length === 3 &&
+  demo5BandedTiers.every(t => t.ok === false && /are in the .*% range|per game keeps this/.test(t.reason));
+console.log("A single filler game's SGP honestly fails Low/Medium/High rather than borrowing legs from another band (should be true):",
+  sgpReportsShortfallHonestly, demo5BandedTiers.map(t => t.reason));
+const demo5MegaCanPoolAcrossBands = demo5Sgp?.tiers.find(t => t.tier.key === "mega")?.ok === true;
+console.log("That same filler game's Mega CAN still build by pooling real legs across every band at once (should be true, confirming the new design intent):", demo5MegaCanPoolAcrossBands);
 
 // The Sunday slate windows pool TWO games each (demo-1b+demo-2 for 1:00pm, demo-3+demo-4 for 4:00pm), each
 // contributing 2 real legs per band — 4 per band per window, exactly enough to fill every tier by drawing from
@@ -985,11 +1050,12 @@ console.log("The 4:00pm slate fills every tier, drawing legs from more than one 
   lateSlate?.tiers.map(t => t.ok ? `${t.tier.key}:${t.legs.length}(${new Set(t.legs.map(l => l.gameKey)).size} games)` : `${t.tier.key}:fail`));
 console.log("The Thursday-night game never gets pooled into a Sunday slate (should be true):", thursdayGameNeverJoinsASlate);
 
-// MIN_LEG_PROBABILITY must equal the Mega band's own floor by construction — the whole tier ladder is built as
-// one continuous, non-overlapping range from that floor up to "almost guaranteed."
-const tierLadderIsContinuous = MIN_LEG_PROBABILITY === RISK_TIERS.find(t => t.key === "mega").minProb &&
+// MIN_LEG_PROBABILITY must equal High's own floor by construction — Low/Medium/High still form one continuous,
+// non-overlapping range from that real floor up to "almost guaranteed." Mega/Nuke are no longer part of this
+// ladder (see parlays.js's own comment on why) — checked on their own terms above instead.
+const tierLadderIsContinuous = MIN_LEG_PROBABILITY === RISK_TIERS.find(t => t.key === "high").minProb &&
   RISK_TIERS.every((t, i) => i === 0 || t.maxProb === RISK_TIERS[i - 1].minProb);
-console.log("The four risk tiers form one continuous, non-overlapping probability ladder (should be true):", tierLadderIsContinuous, RISK_TIERS.map(t => `${t.key}:[${t.minProb},${t.maxProb})`));
+console.log("Low/Medium/High form one continuous, non-overlapping probability ladder (should be true):", tierLadderIsContinuous, RISK_TIERS.map(t => `${t.key}:[${t.minProb},${t.maxProb})`));
 
 console.log("Any team mismatch in demo data (should be false):", anyMismatch);
 console.log("At least one prop resolved a real factor (should be true):", anyRealFactor);
@@ -1004,7 +1070,7 @@ console.log("Scoring-environment factor computed at least once (should be true):
 const newCoeffsPresent = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor", "weather_pass_penalty",
   "venue_edge", "practice_trend_down", "practice_trend_up", "front_seven_injury", "game_script_run_favor", "game_script_pass_favor",
   "referee_over_lean", "referee_under_lean", "ngs_cpoe_hot", "ngs_cpoe_cold", "ngs_ryoe_hot", "ngs_ryoe_cold",
-  "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost"].every(k => typeof MODEL_COEFFS[k] === "number");
+  "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost", "qbr_trend_elite", "qbr_trend_poor"].every(k => typeof MODEL_COEFFS[k] === "number");
 console.log("Every new hand-set coefficient is present in MODEL_COEFFS (should be true):", newCoeffsPresent);
 
 if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
@@ -1012,10 +1078,11 @@ if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefens
   !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks || !aiConcurrencyWorks ||
   !aiSelectionWorks || !cacheLoosening || !costEstimatesAreCorrect || !spendGuardCapWorks || !rolloverWorks || !scoutingThrottleWorks || !newCoeffsPresent ||
   !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
+  !crossGameMegaNuke.ok || !allSgpMegaNukeValid || !allSlateMegaNukeValid || !demo5MegaCanPoolAcrossBands ||
   !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous ||
   !topPicksBasicsWork || !emptyCategoryHandledCleanly || !negativeContributorExcludedAndRankedByWeight || !fallbackFillsToMinimum || !blurbIsWellFormed ||
   !teammateTendencyGatesOnCurrentStatus || !escalationWatchWorksCorrectly || !emptyEscalationsOnNoHistory ||
-  !refereeFactorWorks || !ngsFactorsWork || !pressureFactorWorks) {
+  !refereeFactorWorks || !ngsFactorsWork || !pressureFactorWorks || !qbrFactorWorks) {
   console.log("\nFAILED — see above.");
   process.exit(1);
 } else {

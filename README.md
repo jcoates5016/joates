@@ -328,6 +328,12 @@ its own honest empty state rather than being hidden or padded out with a weaker 
   expected per attempt for runners, and average separation at the catch point plus yards-after-catch over
   expectation for pass-catchers. Trailing last-3-games average, gated on a minimum sample (2+ games, with a
   per-game attempt/target floor so a garbage-time single-drop-back row can't skew it).
+- **QBR trend** — real ESPN Total QBR, pulled straight from nflverse's own free, historical-and-current
+  `espn_data` release (`qbr_week_level.csv.gz` — no ESPN scraping, no proprietary feed), trailing-average across
+  a QB's recent games. QBR already accounts for game situation, opponent, and how a QB's own team performed
+  around him, so it's a genuinely different signal from CPOE/EPA above rather than a restatement of them —
+  scored as a small nudge in either direction only once it clears a real-vs-thin sample gate (`QBR_ELITE_THRESHOLD`
+  / `QBR_POOR_THRESHOLD` in `lib/factors/qbr.js`), and only ever applied to QB props.
 - **Pass-protection/pressure matchup** — real data this app was already fetching and computing but never actually
   wired into anything that could move a grade: `lib/factors/teamStats.js`'s `pressureRateAllowed`/
   `pressureRateCreated` (straight off play-by-play's `sack`/`qb_hit` columns) are combined in
@@ -367,37 +373,53 @@ football knowledge only," separate from every other factor.
 
 ## Parlays
 
-`lib/parlays.js` builds three kinds of parlay, all sharing the same tier structure: **Low Risk, Medium, High, and
-Mega**, each tier drawing its legs from a **fixed, non-overlapping absolute probability band** on `modelProb`
-rather than a shared top-N pool:
+`lib/parlays.js` builds three kinds of parlay group (cross-game, Same Game, and slate), each made up of five
+tiers: **Low Risk, Medium, High, Mega, and Nuke**. Low/Medium/High are the base ladder — each drawing its legs
+from a **fixed, non-overlapping absolute probability band** on `modelProb`, expressed in the odds terms Jon
+actually thinks in rather than round percentage cutoffs:
 
-| Tier | Probability band | Legs | Sorted by |
-|---|---|---|---|
-| Low | 75%+ | 3 | highest `modelProb` first (safest) |
-| Medium | 65–75% | 4 | highest `modelProb` first |
-| High | 60–65% | 4 | highest `modelProb` first |
-| Mega | 55–60% | 4 | highest payout (decimal odds) first |
+| Tier | Probability band | Odds equivalent | Legs | Sorted by |
+|---|---|---|---|---|
+| Low | 66.7%+ | -200 or safer | 3 | highest `modelProb` first (safest) |
+| Medium | 60–66.7% | -150 to -200 | 4 | highest `modelProb` first |
+| High | 55–60% | -125-ish down to the 55% floor | 4 | highest `modelProb` first |
 
-Every leg everywhere is gated at a 55% floor (`MIN_LEG_PROBABILITY`, equal to Mega's own band floor) — a
-coin-flip or worse doesn't belong in a build whose whole premise is "graded, real plays," even in the riskiest
-tier. Because each tier draws *only* from its own probability band, a single leg can never appear in more than
-one tier of the same parlay group — this was a deliberate rebuild specifically so that one leg missing in Low
-Risk says nothing about whether the Medium/High/Mega legs (drawn from an entirely different, disjoint pool of
-players) hit or missed. Mega no longer means "the board's biggest longshots" — every leg in every tier is still
-a real, model-backed play above the 55% floor; Mega just accepts a lower floor within that requirement in
-exchange for a better payout, sorted by actual decimal odds rather than by safety.
+Every leg everywhere — Mega and Nuke included — is gated at a 55% floor (`MIN_LEG_PROBABILITY`, equal to High's
+own band floor): a coin-flip or worse doesn't belong in a build whose whole premise is "graded, real plays," no
+matter how big a payout a tier is chasing. Because Low/Medium/High each draw *only* from their own probability
+band, a single leg can never appear in more than one of those three within the same parlay group — one leg
+missing in Low Risk says nothing about whether Medium/High (drawn from an entirely different, disjoint pool of
+players) hit or missed.
+
+Mega and Nuke sit on top of that ladder as two "best of" categories, not additional probability slices — a leg
+qualifying for Mega or Nuke *and* one of Low/Medium/High is expected, not a bug:
+
+- **Mega** — a real combined payout of **+2500 or better**. A true single leg at +2500 odds would be roughly a
+  4% shot, which the 55% floor already rules out everywhere, so Mega reaches that number the only way the floor
+  allows: by stacking as many genuine 55%+ legs (drawn from the *whole* real pool, no probability ceiling) as it
+  takes to cross a +2500 combined payout (`MEGA_TARGET_DECIMAL`), with at least `MEGA_MIN_LEGS` (4) so a thin
+  1-2-leg parlay can't technically qualify just because two juicy-but-real legs happened to multiply past the
+  target. The leg count does the work a single longshot leg used to.
+- **Nuke** — "the highest +money bets that are most likely to hit": the market's own plus-money legs (the
+  *book's* posted price is positive — the market is pricing it as an underdog) that our model still rates a real
+  55%+ shot. A book's displayed price and the model's own probability estimate are two independent numbers
+  already tracked per leg, so a leg can genuinely be priced like a longshot at the book while still being a real
+  favorite by our numbers — that combination is exactly this app's whole premise, just paying out better than it
+  should. Nuke pulls `NUKE_LEGS` (6+) of those, safest-first, from that plus-money-and-55%+ intersection.
 
 - **Risk Tiers** (cross-game) — the original parlay type: pools legs from every game on the board, capped at 2
   legs from any single game so a "board-wide" parlay can't quietly turn into one team's SGP, then splits that
-  pool into the four bands above.
-- **Same Game Parlays** — one Low/Medium/High/Mega set per game, built only from that game's own legs, split
-  into the same four bands. A single game frequently won't have enough legs in every band to fill every tier —
-  that's reported honestly (a tier simply doesn't appear) rather than backfilled with a leg that doesn't belong
-  in that band. No contradiction guard is needed: this app only ever surfaces the "over"/"yes" side of every
-  prop market, so there's no opposite-side pairing possible within one game to guard against.
-- **Slate parlays** — one Low/Medium/High/Mega set per Sunday kickoff window (the "1:00 PM ET Slate" and "4:00
-  PM ET Slate"), pooling legs across every game in that window, capped at 3 legs per game — looser than the
-  cross-game cap since a slate is already scoped to a handful of games. A game's window is classified by its
+  pool into Low/Medium/High/Mega/Nuke as described above.
+- **Same Game Parlays** — one Low/Medium/High/Mega/Nuke set per game, built only from that game's own legs. A
+  single game frequently won't have enough legs in every band to fill every tier — that's reported honestly (a
+  tier simply doesn't appear) rather than backfilled with a leg that doesn't belong in that band. Mega is the
+  one tier that can still build even when Low/Medium/High individually come up short, since it pools across
+  every band inside that same game rather than needing enough legs within just one of them. No contradiction
+  guard is needed: this app only ever surfaces the "over"/"yes" side of every prop market, so there's no
+  opposite-side pairing possible within one game to guard against.
+- **Slate parlays** — one Low/Medium/High/Mega/Nuke set per Sunday kickoff window (the "1:00 PM ET Slate" and
+  "4:00 PM ET Slate"), pooling legs across every game in that window, capped at 3 legs per game — looser than
+  the cross-game cap since a slate is already scoped to a handful of games. A game's window is classified by its
   real kickoff hour converted to Eastern time (`classifyKickoffWindow`), not a hardcoded UTC offset — a fixed
   offset would silently drift by an hour after the November daylight-saving change, right in the middle of a
   season. Thursday, Sunday night, Monday, and early international Sunday kickoffs sit outside both windows and
@@ -671,6 +693,73 @@ the feed — and excluded from Mispriced Bets, AI commentary, and parlay legs. I
 with a struck-through red "⚠ unverified" badge so you can review the raw fields (also logged) rather than the
 row just silently disappearing.
 
+## Known limitations & tracked items
+
+Real gaps this build knows about and hasn't closed yet — logged here on purpose rather than fixed silently or
+forgotten, so the reasoning behind "leave it for now" travels with the code.
+
+### Trailing-history factors don't filter by which team the player was actually on
+
+`computeFormFactor`, `computeUsageFactor`, and `computeTeammateOutTendency` (all in
+`lib/factors/playerSplits.js`) pull a player's trailing game log from `gameLogIndex` keyed only by his name —
+there's no filter for which team he was actually on for each of those games. For a player who's been on the
+same roster his whole career this is a non-issue. For a player who was traded mid-history, it silently mixes
+pre-trade and post-trade context into one trailing average: DJ Moore's "last 10 games" the week after a trade
+would blend Panthers/Bears-era usage with whatever the new team is actually doing with him, even though the
+scheme, target competition, and QB play behind those two sets of games can be completely different. Him
+clearing a receiving-yards line this year on a new team doesn't mean the same thing his trailing average says
+it means if half that average is pre-trade games.
+
+`computeTeammateOutTendency` is the worst case of the three: a traded player's OLD team's games would all get
+bucketed as "games without [new teammate]," since that teammate was never on the old roster at all — not a
+noisy signal, a structurally wrong one, since the comparison being drawn (usage with vs. without a specific
+teammate) never actually happened on the field in those old-team games.
+
+`computeVenueSplit`, `computeWeatherSplitHistorical`, and `computeBirthdaySplit` are lower priority to fix the
+same way: they're measuring the player's own physical tendencies (does he perform differently in a dome, in
+wet weather, near his birthday) more than his team's scheme or volume, so mixing eras matters less for those —
+a player's dome/outdoor split is still mostly about him, not which offense he's in.
+
+Proposed fix direction (not yet built, per Jon's call to log this rather than build it now, since it's only
+Week 2 and there's limited traded-player history to mix in yet): filter the trailing window to games where the
+player's row's own `recent_team`/`team` field matches his CURRENT `player.team` first, falling back to the full
+cross-team history only when the current-team-only sample is too thin (under `MIN_TRAILING_GAMES`) to say
+anything. The existing confidence-tier/`effectiveN` honesty mechanism already down-weights thin samples, so
+this wouldn't need new machinery — just a filter applied before the trailing-average math runs, plus deciding
+what "too thin" means for each of the three affected factors. Current status (active/inactive, snap share,
+depth-chart slot) should carry more weight than a mixed-era trailing average in the meantime — which is already
+true today for `selfInjury`/`oLineInjury`/`tendency`, just not yet for `form`/`usage`.
+
+### How accurate is the model, really? (`scripts/validate-model.js`)
+
+`npm run backtest` (see above) measures individual factors one at a time against "did the player beat his own
+trailing average." `scripts/validate-model.js` is a separate, complementary check that runs the ACTUAL
+`estimatePropProbability()` end to end — the same function the live app calls every refresh — against two
+seasons of real walk-forward history, then reports Brier score, log-loss, a calibration table, and a
+confidence-tier breakdown, alongside a "zero contextual nudges" baseline for comparison. It also runs a
+separate synthetic Monte Carlo stress test of the nudge-combination math itself (known ground-truth
+probabilities, simulated noisy evidence) to check whether stacking several nudges together stays calibrated.
+
+Run it with `node scripts/validate-model.js` (or `node scripts/validate-model.js 2024 2023` for specific
+seasons). It fetches multiple seasons of real nflverse data, so expect a couple of minutes, not seconds. Read
+the file's own header comment before trusting a single number out of it in isolation — same "here's exactly
+what this can and can't prove" treatment `scripts/backtest.js` already gets, for the same reason: the market
+proxy this uses (`marketProb = 0.5`, since there's no historical odds archive) makes this a genuinely easier
+question than "does the model beat a real sportsbook line."
+
+### Receptions props missing from a live refresh's type filter — diagnosed, not yet fixed
+
+The live app's prop-type filter has been observed without a "Receptions" option (also missing: Rushing TDs,
+Receiving TDs), even though `classifyProp` in `lib/analyze.js` already recognizes `receptions` as a real prop
+type. Rather than guess why (SportsGameOdds simply not sending that market this refresh, vs. it being sent under
+a statID this build doesn't recognize, vs. rows surviving classification but getting filtered out later), this
+build now logs the real answer instead: `analyzePlayerProps` tracks every distinct `statID` it sees on any
+player-level odds entry this refresh (classified or not) in a `statIdSeen` map, and logs two lines — every
+unclassified statID with its count, and the final row count per recognized prop type — to the Netlify function
+logs on the very next live refresh. That turns "where are receptions?" into a one-refresh-away answered
+question instead of a guess. Once that log confirms which case it is, the actual fix is either trivial (add a
+missing statID pattern to `PROP_PATTERNS`) or "SportsGameOdds isn't sending it this week" (nothing to fix here).
+
 ## Project structure
 
 ```
@@ -685,8 +774,9 @@ lib/
   modelCoeffs.js   the model's logit-nudge coefficients — GENERATED by scripts/backtest.js
   grading.js       results ledger: grades completed picks, computes closing-line value (CLV), folds both into
                    the all-time calibration ledger
-  parlays.js       fixed-probability-band (Low/Medium/High/Mega), leg-disjoint parlay builder — cross-game,
-                   Same Game Parlays, and the two Sunday slate windows (see "Parlays" above)
+  parlays.js       fixed-probability-band (Low/Medium/High) plus Mega (combined-payout target) and Nuke
+                   (plus-money-and-55%+ value) parlay builder — cross-game, Same Game Parlays, and the two
+                   Sunday slate windows (see "Parlays" above)
   ai.js            two AI buckets: real-number analytical notes, and speculative scouting takes (plus cached
                    parlay rationale, shared across all three parlay types above)
   topPicks.js      Top Picks tab: top-5-per-category ranking, reason selection, and write-up (see "Top Picks" above)

@@ -443,6 +443,12 @@ function propReasoning(r){
     if (f.referee.overRate >= 0.6) pos.push({ w:4, t:`Referee ${esc(f.referee.refereeName)} has called the over in ${fmtPct(f.referee.overRate)} of ${f.referee.gamesCalled} games — a modest tailwind for scoring in general.` });
     else if (f.referee.overRate <= 0.4) caution.push({ w:4, t:`Referee ${esc(f.referee.refereeName)} has actually trended under (${fmtPct(f.referee.overRate)} overs across ${f.referee.gamesCalled} games) — a modest headwind for scoring in general.` });
   }
+  // Real ESPN Total QBR trend — QB-only, see lib/factors/qbr.js. Distinct from the NGS CPOE read below (ball-
+  // placement specifically): QBR folds in scrambles, sacks, turnovers, and game situation into one number.
+  if (f.qbr?.available){
+    if (f.qbr.avgQbr >= 75) pos.push({ w:6, t:`Playing elite football by ESPN's own QBR: ${fmtNum(f.qbr.avgQbr,1)} over his last ${f.qbr.sampleGames} games.` });
+    else if (f.qbr.avgQbr <= 35) caution.push({ w:5, t:`Trending poorly by ESPN's own QBR: ${fmtNum(f.qbr.avgQbr,1)} over his last ${f.qbr.sampleGames} games.` });
+  }
   // Next Gen Stats player efficiency — real tracking-data numbers, see lib/factors/nextgenstats.js.
   if (f.ngsPassing?.available){
     if (f.ngsPassing.cpoe >= 3) pos.push({ w:6, t:`Throwing well above expected accuracy lately: +${fmtNum(f.ngsPassing.cpoe,1)} CPOE over his last ${f.ngsPassing.sampleGames} games (Next Gen Stats).` });
@@ -724,6 +730,7 @@ function factorChipsHTML(f){
   if (f.usage?.available && f.usage.targetShare!=null) chips.push(`<span class="chip ${f.usage.targetShare>=0.22?'hit':''}">${fmtPct(f.usage.targetShare)} tgt share</span>`);
   if (f.tendency?.available) chips.push(`<span class="chip hit" title="${esc(f.tendency.teammateName)} — ${esc(f.tendency.teammateStatus||'')} — ${esc(f.tendency.statLabel||'')}">${esc(f.tendency.teammateName)} (${esc(f.tendency.teammateStatus||'')}): ${fmtNum(f.tendency.withoutAvg,1)} vs ${fmtNum(f.tendency.withAvg,1)} avg</span>`);
   if (f.referee?.available) chips.push(`<span class="chip" title="n=${f.referee.gamesCalled} games">Ref ${esc(f.referee.refereeName)}: ${fmtPct(f.referee.overRate)} overs</span>`);
+  if (f.qbr?.available) chips.push(`<span class="chip ${f.qbr.avgQbr>=75?'hit':f.qbr.avgQbr<=35?'warn':''}" title="Real ESPN Total QBR, trailing ${f.qbr.sampleGames} games">QBR: ${fmtNum(f.qbr.avgQbr,1)}</span>`);
   if (f.ngsPassing?.available) chips.push(`<span class="chip ${f.ngsPassing.cpoe>=3?'hit':f.ngsPassing.cpoe<=-3?'warn':''}" title="Completion % over expectation, Next Gen Stats">CPOE: ${f.ngsPassing.cpoe>=0?'+':''}${fmtNum(f.ngsPassing.cpoe,1)}</span>`);
   if (f.ngsRushing?.available) chips.push(`<span class="chip ${f.ngsRushing.ryoePerAtt>=0.5?'hit':f.ngsRushing.ryoePerAtt<=-0.5?'warn':''}" title="Rush yards over expected per attempt, Next Gen Stats">RYOE/att: ${f.ngsRushing.ryoePerAtt>=0?'+':''}${fmtNum(f.ngsRushing.ryoePerAtt,2)}</span>`);
   if (f.ngsReceiving?.available && f.ngsReceiving.avgSeparation!=null) chips.push(`<span class="chip ${f.ngsReceiving.avgSeparation>=3?'hit':''}" title="Average separation at the catch point, Next Gen Stats">Separation: ${fmtNum(f.ngsReceiving.avgSeparation,1)}yd</span>`);
@@ -983,7 +990,7 @@ function renderParlays(){
   if (!snapshot.parlays?.length){ riskWrap.innerHTML = `<div class="empty">No parlays built this refresh.</div>`; }
   else { riskWrap.innerHTML = snapshot.parlays.map(parlayCardHTML).join(""); bindParlayShuffles(riskWrap); }
 
-  // Same Game Parlays: one mini-section per game, each holding its own Low/Medium/High/Mega set built ONLY
+  // Same Game Parlays: one mini-section per game, each holding its own Low/Medium/High/Mega/Nuke set built ONLY
   // from that game's legs — see buildSameGameParlays in lib/parlays.js.
   const sgpWrap = document.getElementById("sgpList");
   if (!snapshot.sameGameParlays?.length){ sgpWrap.innerHTML = `<div class="empty">No games this week.</div>`; }
