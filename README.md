@@ -24,6 +24,17 @@ Fanatics specifically turned out to be unavailable at this tier, so it's been dr
 longer takes the whole refresh down. Parlays still only ever combine legs from one shared book, so every parlay
 stays placeable as one slip — from 4 candidate books (DraftKings, FanDuel, BetMGM, theScore Bet).
 
+## Interface
+
+`public/index.html`'s visual design was redone from scratch around an Apple Stocks-app-style language: system
+fonts (`-apple-system`, no external font fetch — one less network dependency for the page to load), a true-black
+surface with Apple's own dark-mode system accent colors (systemGreen/systemRed/systemBlue/systemOrange), hairline
+separators and soft shadows instead of heavy borders, larger rounded corners, pill-shaped buttons and a
+segmented-control nav bar, and tabular-numeral monospace for anything that reads like a live figure (a grade %, a
+price, an edge). Every existing element id/class name was kept as-is — this was a styling pass, not a rebuild —
+so no JS wiring changed. **Top Picks** (above) is the new default landing tab, ahead of the Edge Board, since it's
+meant to be the fastest "what should I actually look at this week" read.
+
 ### Odds-fetch resilience
 
 `fetchNFLEvents` (`lib/fetchers/odds.js`) requests all tracked bookmakerIDs in a single SportsGameOdds call.
@@ -91,6 +102,15 @@ only moves away from it when there's real, sized evidence to justify the move:
      sportsbook-display convention (negative = home favored). Every live refresh logs a one-time sanity-check
      line ("Game-script check: ... reading X as favored") — check it against a real sportsbook board once, and
      flip the sign in `extractGameContext` if it's backwards.
+
+     **A real bug this shipped with and then fixed within a day**: SportsGameOdds' actual payload returns
+     `bookSpread`/`bookOverUnder` as strings (e.g. `"+8.5"`), not JS numbers — the dry-run fixture used numeric
+     literals, so this passed every test and only broke on a live refresh (`TypeError: teamSpread.toFixed is not
+     a function`, thrown from the home team's own row specifically — the away side's `-homeSpread` negation
+     happens to coerce a string to a number as an accidental side effect, masking the bug there). `extractGameContext`
+     now coerces both fields with `Number(...)` at the source, and `scripts/dry-run.js` has a dedicated regression
+     test (`stringPayloadNudgeWorks`) that reproduces the exact crash with a string-typed fixture and fails loudly
+     if this regresses.
 3. **Hard-override to near-zero** when the player himself is out or doubtful — no amount of favorable context
    makes a bet on someone who might not play a good one.
 
@@ -187,6 +207,32 @@ first, and reports a simple hits/total tally. This answers "of what this board a
 last week, what hit" — not "of whatever still looks like an edge today," which is a different and much easier
 question to get a good-looking answer to. Shown on the Edge Board tab, right under the existing calibration
 track-record panel; empty on a fresh deploy for the same honest reason that panel is.
+
+### Top Picks
+
+A quick-glance dashboard (`lib/topPicks.js`, the app's new default landing tab) — the sharpest, most mispriced
+pick in each of five categories (Anytime TD, receiving/rushing/passing yards, passing TDs), instead of one pooled
+Edge Board list. Same eligibility bar as the Edge Board itself (`trueEdge` above the noise floor, medium/high
+confidence, no team-mismatch or suspect flag) — `buildTopPicks` just slices it per `propType` and caps each
+category at 5, sharpest edge first.
+
+The reasons shown under each pick are not a second, looser writeup — they're `lib/probability.js`'s own fired
+nudges, re-surfaced. `estimatePropProbability` now returns `contributorDetails` (`{key, weight, label}`) alongside
+the plain-string `contributors` it already returned (kept as-is for backward compatibility with the existing
+prop-card reasoning and `scripts/dry-run.js`'s string-matching tests). `pickTopReasons` filters that list to
+positive-weight nudges only, ranked by the actual measured coefficient — which matters in a very specific way:
+`matchup_edge`'s backtested coefficient currently sits at **-0.027** (see `lib/modelCoeffs.js`) despite its
+positive-sounding label, so a naive "just list whatever fired" approach would tout a factor whose real, measured
+effect goes the other way. Ranking by signed weight instead of just listing labels catches that automatically.
+When a pick has fewer than 3 real fired nudges, `pickTopReasons` fills the gap with real computed facts pulled
+directly off the row (opponent's defensive rank, last-10 hit rate, red-zone share, the edge itself) rather than
+padding with something invented — every reason on a Top Pick card is either a nudge that actually moved the grade
+%, or a real number already shown elsewhere on the full card.
+
+`pickBlurb` composes the 2-3 sentence write-up: a headline sentence with the real model/market probabilities and
+the edge, then the chosen reasons woven into one sentence, plus an optional third sentence only when the sample
+behind the pick is thin enough to be worth flagging. A category with nothing that clears the bar this week shows
+its own honest empty state rather than being hidden or padded out with a weaker pick just to fill five slots.
 
 ## What this build computes
 
@@ -586,6 +632,7 @@ lib/
                    Same Game Parlays, and the two Sunday slate windows (see "Parlays" above)
   ai.js            two AI buckets: real-number analytical notes, and speculative scouting takes (plus cached
                    parlay rationale, shared across all three parlay types above)
+  topPicks.js      Top Picks tab: top-5-per-category ranking, reason selection, and write-up (see "Top Picks" above)
   pipeline.js      orchestrates one full refresh end to end
   doRefresh.js     wires env vars + notes into runPipeline, saves the resulting snapshot
   store.js         Netlify Blobs wrapper (snapshot, notes, injury/price history, AI note cache — now including

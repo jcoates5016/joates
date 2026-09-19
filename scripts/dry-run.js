@@ -13,6 +13,7 @@ import { buildDemoData } from "../lib/demoData.js";
 import { fetchNFLEvents } from "../lib/fetchers/odds.js";
 import { annotatePropsWithAI, annotateScoutingTakes, selectAiEligible, roundForHash, createSpendGuard, estimateCostUsd } from "../lib/ai.js";
 import { classifyKickoffWindow, summarizeEvents, buildAllParlays, buildSameGameParlays, buildSlateParlays, RISK_TIERS, MIN_LEG_PROBABILITY } from "../lib/parlays.js";
+import { buildTopPicks, pickTopReasons, pickBlurb, PICK_CATEGORIES } from "../lib/topPicks.js";
 
 const SEASON = 2026;
 
@@ -321,6 +322,38 @@ console.log("extractGameContext reads a real spread/total into correct per-team 
 const noOddsContextWorks = extractGameContext({ odds: {} }).available === false;
 console.log("extractGameContext reports unavailable with no spread/total odds present (should be true):", noOddsContextWorks);
 
+// Regression guard for a real live incident: SportsGameOdds' actual payload returns bookSpread/bookOverUnder as
+// STRINGS (e.g. "+8.5"), never JS numbers — the fixture above used numeric literals, which is exactly how this
+// slipped past dry-run and only broke on a live refresh ("f.gameScript.teamSpread.toFixed is not a function").
+// Specifically the HOME team's own row: computeGameScript passes homeSpread straight through with no coercion
+// for isHome (`teamSpread = gameContext.homeSpread`), unlike the away side, where the unary minus
+// (`-gameContext.homeSpread`) happens to coerce a string to a number as a side effect and masks the bug — so
+// this fixture deliberately makes the HOME team (KC) the big underdog, the exact path that actually crashed.
+// Comparisons like <=/>= silently coerce a string fine, so computeGameScript's isBigUnderdog flag looked correct
+// even without the fix; only calling .toFixed() on the still-string value in lib/probability.js's nudge text
+// actually threw. extractGameContext must coerce to a real Number so nothing downstream can hit this again.
+const stringPayloadContext = extractGameContext({
+  odds: {
+    // Home team (KC) is getting +8.5 -> KC (home) is the big underdog, the uncoerced-string code path.
+    homeSpread: { periodID: "game", statID: "points", statEntityID: "home", betTypeID: "sp", sideID: "home", bookSpread: "+8.5" },
+    gameTotal: { periodID: "game", statID: "points", statEntityID: "all", betTypeID: "ou", sideID: "over", bookOverUnder: "44.5" }
+  }
+});
+const stringGameScript = computeGameScript({ team: "KC", home: "KC", away: "BUF" }, stringPayloadContext);
+let stringPayloadNudgeWorks = false, stringPayloadNudgeText = null;
+try {
+  const nudgeResult = estimatePropProbability({
+    propType: "rec_yds", gameScript: stringGameScript,
+    form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
+  }, 0.55);
+  stringPayloadNudgeText = nudgeResult.contributors.find(c => /garbage-time passing/.test(c));
+  stringPayloadNudgeWorks = typeof stringPayloadContext.homeSpread === "number" && !isNaN(stringPayloadContext.homeSpread) &&
+    stringGameScript.isBigUnderdog === true && !!stringPayloadNudgeText;
+} catch (e) {
+  stringPayloadNudgeText = `THREW: ${e.message}`;
+}
+console.log("A string-typed spread/total from the real odds payload is coerced to a real number and never crashes the game-script nudge (should be true):", stringPayloadNudgeWorks, stringPayloadContext.homeSpread, typeof stringPayloadContext.homeSpread, stringPayloadNudgeText);
+
 const homeRow = { team: "KC", home: "KC", away: "BUF" }; // home team getting a -7.5 spread -> big favorite
 const awayRow = { team: "BUF", home: "KC", away: "BUF" }; // away team getting a +7.5 spread -> big underdog
 const gameScriptHome = computeGameScript(homeRow, gameContext);
@@ -448,6 +481,90 @@ const manyEdgeBoardPicks = Array.from({ length: 10 }, (_, i) => ({
 const limitedHistory = buildEdgeBoardHistory(manyEdgeBoardPicks, 3);
 const edgeBoardLimitWorks = limitedHistory.picks.length === 3 && limitedHistory.total === 3 && limitedHistory.picks[0].oddID === "eb-9";
 console.log("buildEdgeBoardHistory's limit caps the returned list to the most recent N picks (should be true):", edgeBoardLimitWorks, limitedHistory.picks.map(p => p.oddID));
+
+// --- Top Picks (lib/topPicks.js) ---
+// Category grouping, the quality bar (same as Edge Board's), sort-by-edge, and the limit cap — all in one
+// synthetic "rush_yds" slate with deliberate disqualifiers mixed in (low confidence, suspect, team mismatch,
+// below the noise-floor edge) so a bug in any single exclusion doesn't slip through unnoticed.
+function fakeTopPickRow(over) {
+  return {
+    oddID: "tp-x", propType: "rush_yds", propLabel: "Rushing Yards", side: "over", line: 55.5,
+    player: "Test Back", team: "KC", opponent: "BUF", opponentDisp: "BUF", position: "RB", kickoff: "2026-10-05T17:00:00Z",
+    model: { available: true }, modelProb: 0.6, marketProb: 0.5, trueEdge: 0.1, confidence: "high",
+    teamMismatch: false, suspect: false, bestBook: "draftkings", bestPrice: -110,
+    modelContributorDetails: [], factors: {}, ...over
+  };
+}
+const topPickCandidates = [
+  fakeTopPickRow({ oddID: "tp-1", trueEdge: 0.15 }),
+  fakeTopPickRow({ oddID: "tp-2", trueEdge: 0.12 }),
+  fakeTopPickRow({ oddID: "tp-3", trueEdge: 0.09 }),
+  fakeTopPickRow({ oddID: "tp-4", trueEdge: 0.08 }),
+  fakeTopPickRow({ oddID: "tp-5", trueEdge: 0.07 }),
+  fakeTopPickRow({ oddID: "tp-6", trueEdge: 0.06 }), // 6th real candidate -> should be cut by the limit=5 default
+  fakeTopPickRow({ oddID: "tp-low-edge", trueEdge: 0.01 }), // below MIN_TRUE_EDGE -> excluded
+  fakeTopPickRow({ oddID: "tp-low-conf", trueEdge: 0.2, confidence: "low" }), // real edge, but too thin a sample -> excluded
+  fakeTopPickRow({ oddID: "tp-suspect", trueEdge: 0.2, suspect: true }), // implausible/unverified -> excluded
+  fakeTopPickRow({ oddID: "tp-mismatch", trueEdge: 0.2, teamMismatch: true }) // unresolved team -> excluded
+];
+const topPicksResult = buildTopPicks(topPickCandidates);
+const rushCategory = topPicksResult.categories.find(c => c.key === "rush_yds");
+const topPicksBasicsWork = topPicksResult.categories.length === PICK_CATEGORIES.length &&
+  rushCategory.picks.length === 5 &&
+  rushCategory.picks.map(p => p.oddID).join(",") === "tp-1,tp-2,tp-3,tp-4,tp-5" && // sharpest edge first, capped at 5
+  !rushCategory.picks.some(p => ["tp-6", "tp-low-edge", "tp-low-conf", "tp-suspect", "tp-mismatch"].includes(p.oddID));
+console.log("buildTopPicks groups by every category, ranks by real edge, and holds the same quality bar as the Edge Board (should be true):",
+  topPicksBasicsWork, rushCategory.picks.map(p => p.oddID));
+
+// An empty slate for a category (nothing qualifies) must return an empty picks array, never throw or drop the
+// category entirely — a bye week for every player in a bucket is a real state, not an error.
+const emptyTopPicks = buildTopPicks([fakeTopPickRow({ oddID: "only-one", propType: "td_pass", trueEdge: 0.01 })]);
+const emptyCategoryHandledCleanly = emptyTopPicks.categories.every(c => Array.isArray(c.picks)) &&
+  emptyTopPicks.categories.find(c => c.key === "rush_yds").picks.length === 0 &&
+  emptyTopPicks.categories.find(c => c.key === "td_pass").picks.length === 0; // the one candidate's edge was below the bar
+console.log("Every category is always present, even empty, and never throws on a slate with nothing that qualifies (should be true):", emptyCategoryHandledCleanly);
+
+// --- Top Picks reasons + write-up (pickTopReasons/pickBlurb) ---
+// A nudge whose real, currently-backtested coefficient is negative (matchup_edge sits at -0.027 in the live
+// lib/modelCoeffs.js despite its positive-sounding label) must never be touted as a reason to like the pick —
+// this is the whole point of carrying signed weight through contributorDetails instead of just label strings.
+const mixedContributorRow = fakeTopPickRow({
+  modelContributorDetails: [
+    { key: "form_hot", weight: 0.283, label: "hot last 3 games" },
+    { key: "matchup_edge", weight: -0.027, label: "team matchup edge" }, // real backtested effect is negative -> must be excluded
+    { key: "usage_high_snap", weight: 0.293, label: "high snap share" },
+    { key: "redzone_share", weight: 0.233, label: "heavy red-zone share" }
+  ]
+});
+const mixedReasons = pickTopReasons(mixedContributorRow);
+// Positive weights only, ranked highest-first: usage_high_snap (0.293) > form_hot (0.283) > redzone_share (0.233);
+// matchup_edge (-0.027) is excluded outright despite its positive-sounding label.
+const negativeContributorExcludedAndRankedByWeight = !mixedReasons.includes("team matchup edge") &&
+  mixedReasons[0] === "high snap share" && mixedReasons[1] === "hot last 3 games" && mixedReasons[2] === "heavy red-zone share";
+console.log("pickTopReasons excludes a nudge with a real negative measured effect and ranks the rest by actual weight (should be true):", negativeContributorExcludedAndRankedByWeight, mixedReasons);
+
+// With fewer than 3 real fired nudges, real computed facts (matchup rank, form rate, edge itself, ...) fill the
+// gap rather than leaving a card with only 1-2 reasons — every filler is grounded in a real number on the row,
+// never invented, and duplicate-tagged fillers (e.g. two usage-flavored facts) are skipped in favor of variety.
+const thinContributorRow = fakeTopPickRow({
+  modelContributorDetails: [{ key: "form_hot", weight: 0.283, label: "hot last 3 games" }],
+  factors: {
+    defense: { available: true, rank: 4, ofTeams: 32 },
+    form: { available: true, n_last10: 8, rate_last10: 0.75 },
+    redZone: { available: true, redZoneShare: 0.4 }
+  }
+});
+const thinReasons = pickTopReasons(thinContributorRow);
+const fallbackFillsToMinimum = thinReasons.length >= 3 && thinReasons[0] === "hot last 3 games" &&
+  thinReasons.some(r => /ranks 4 of 32/.test(r));
+console.log("pickTopReasons fills in with real computed facts when fired nudges alone don't reach 3 (should be true):", fallbackFillsToMinimum, thinReasons);
+
+// The write-up itself: 2-3 sentences, names the player, states the real model/market numbers and edge, and
+// weaves in the chosen reasons — never a wall of bullet fragments.
+const blurb = pickBlurb(mixedContributorRow, mixedReasons);
+const blurbSentenceCount = blurb.split(/(?<=[.!?])\s+/).filter(Boolean).length;
+const blurbIsWellFormed = blurb.includes("Test Back") && /\d+-point edge/.test(blurb) && blurbSentenceCount >= 2 && blurbSentenceCount <= 3;
+console.log("pickBlurb reads as a real 2-3 sentence write-up naming the player and the actual edge (should be true):", blurbIsWellFormed, blurb);
 
 // --- Roster/depth-chart accuracy pass (lib/identity.js, lib/factors/index.js) ---
 // Unit-tested directly against the same fixtures buildDemoData feeds the pipeline, the same pattern already
@@ -764,11 +881,12 @@ const newCoeffsPresent = ["weather_personal_boost", "weather_personal_penalty", 
 console.log("Every new hand-set coefficient is present in MODEL_COEFFS (should be true):", newCoeffsPresent);
 
 if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
-  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !frontSevenInjuryFactorWorks || !frontSevenNudgeFires || !gameContextIsCorrect || !noOddsContextWorks || !gameScriptWorks || !gameScriptNudgesWork || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks || !edgeBoardHistoryWorks || !edgeBoardLimitWorks ||
+  !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !frontSevenInjuryFactorWorks || !frontSevenNudgeFires || !gameContextIsCorrect || !noOddsContextWorks || !stringPayloadNudgeWorks || !gameScriptWorks || !gameScriptNudgesWork || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks || !edgeBoardHistoryWorks || !edgeBoardLimitWorks ||
   !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks || !aiConcurrencyWorks ||
   !aiSelectionWorks || !cacheLoosening || !costEstimatesAreCorrect || !spendGuardCapWorks || !rolloverWorks || !scoutingThrottleWorks || !newCoeffsPresent ||
   !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
-  !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous) {
+  !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous ||
+  !topPicksBasicsWork || !emptyCategoryHandledCleanly || !negativeContributorExcludedAndRankedByWeight || !fallbackFillsToMinimum || !blurbIsWellFormed) {
   console.log("\nFAILED — see above.");
   process.exit(1);
 } else {
