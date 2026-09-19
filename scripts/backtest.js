@@ -37,6 +37,7 @@ import { STADIUMS } from "../lib/stadiums.js";
 import { normTeam } from "../lib/teamCodes.js";
 import { logit } from "../lib/oddsMath.js";
 import { MODEL_COEFFS as PREV_COEFFS } from "../lib/modelCoeffs.js";
+import { computeRefereeFactor } from "../lib/factors/referee.js";
 
 const log = (msg) => console.log(msg);
 
@@ -58,7 +59,12 @@ const BACKTESTED_KEYS = [
   // measures against the schedule's own roof column, already being fetched; game_script_run_favor/
   // game_script_pass_favor measure against nflverse's own historical spread_line/total_line columns. Personal
   // weather history (weather_personal_boost/penalty) and front_seven_injury stay hand-set — see HAND_SET_NOTES.
-  "weather_run_favor", "weather_pass_penalty", "venue_edge", "game_script_run_favor", "game_script_pass_favor"
+  "weather_run_favor", "weather_pass_penalty", "venue_edge", "game_script_run_favor", "game_script_pass_favor",
+  // Referee tendency, revived as a non-bettable context factor (lib/factors/referee.js) — measured walk-forward
+  // against nflverse's own historical referee/total/total_line schedule columns, using only games that referee
+  // had already called strictly before the one being tested (see refereeFactorAsOf below). ngs_*/pressure_*
+  // coefficients stay hand-set for now (see lib/modelCoeffs.js's own comment on those).
+  "referee_over_lean", "referee_under_lean"
 ];
 
 // Why each coefficient NOT in BACKTESTED_KEYS is still hand-set — used by writeCoeffsFile to annotate the
@@ -160,6 +166,21 @@ async function buildWeatherCache(schedule, seasons, log) {
 // here is what makes this backtest's "big favorite/big underdog" reads mean the same thing computeGameScript
 // means live — get this wrong and the whole game_script_* backtest would be silently measuring the opposite of
 // what the live nudge does.
+// Walk-forward-safe wrapper around lib/factors/referee.js's computeRefereeFactor: the live function happily
+// reads the WHOLE schedule file (safe live, since a future/unplayed game always has a blank referee/total
+// anyway), but a backtest replaying a past season needs the same discipline every other factor in this loop
+// follows — only games that referee had ACTUALLY called strictly before `cutoffDate` count, or a 2024 test row
+// could silently learn from that same referee's games later in that same season.
+function refereeFactorAsOf(refereeName, cutoffDate, fullSchedule) {
+  if (!refereeName || !cutoffDate) return { available: false };
+  const cutoff = new Date(cutoffDate);
+  const priorGames = fullSchedule.filter(s => {
+    const d = s.gameday || s.game_date;
+    return d && new Date(d) < cutoff;
+  });
+  return computeRefereeFactor(refereeName, priorGames);
+}
+
 function scheduleGameScript(gameRow, team, homeTeam) {
   const spreadLineRaw = Number(gameRow.spread_line);
   const totalLineRaw = Number(gameRow.total_line);
@@ -249,6 +270,7 @@ async function main() {
         // historical spread_line/total_line (see scheduleGameScript's sign-convention note above).
         let gameWasWet = null, roofRaw = null, roofKnown = false;
         let gameScript = { available: false };
+        let refFactor = { available: false };
         const gameRow = seasonSchedule.find(s => Number(s.week) === week &&
           (normTeam(s.home_team || s.home) === team || normTeam(s.away_team || s.away) === team));
         if (gameRow) {
@@ -266,6 +288,7 @@ async function main() {
           const cached = weatherCache.get(`${homeTeam}|${season}|${week}`);
           gameWasWet = cached === undefined ? null : cached;
           gameScript = scheduleGameScript(gameRow, team, homeTeam);
+          refFactor = refereeFactorAsOf(gameRow.referee, gameRow.gameday || gameRow.game_date, schedule);
         }
 
         for (const propType of PROP_TYPES) {
@@ -290,6 +313,12 @@ async function main() {
           record(buckets.starter_change, starterChanged, hit);
           record(buckets.short_week_penalty, shortWeek, hit);
           record(buckets.travel_penalty, longTravel, hit);
+          // Ungated, same as the nine factors above — referee tendency is read as a general scoring-environment
+          // tailwind/headwind, not a run- or pass-specific one (see lib/probability.js's own comment on why).
+          if (refFactor.available) {
+            record(buckets.referee_over_lean, refFactor.overRate >= 0.6, hit);
+            record(buckets.referee_under_lean, refFactor.overRate <= 0.4, hit);
+          }
 
           // These five are gated to the same prop types the live nudges themselves are scoped to (RUN_PROPS/
           // PASS_PROPS from lib/probability.js) — recording them against every prop type regardless, the way the
@@ -373,6 +402,8 @@ const CORE_KEYS = ["form_hot", "tendency_usage_bump", "usage_high_snap", "redzon
 const WEATHER_VENUE_KEYS = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor",
   "weather_pass_penalty", "venue_edge", "practice_trend_down", "practice_trend_up"];
 const GAME_SCRIPT_KEYS = ["front_seven_injury", "game_script_run_favor", "game_script_pass_favor"];
+const REFEREE_KEYS = ["referee_over_lean", "referee_under_lean"];
+const NGS_PRESSURE_KEYS = ["ngs_cpoe_hot", "ngs_cpoe_cold", "ngs_ryoe_hot", "ngs_ryoe_cold", "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost"];
 const METADATA_KEYS = ["marketPriorWeight", "generatedAt", "source", "_backtestSeasons", "_backtestSampleSizes"];
 
 function writeCoeffsFile(c) {
@@ -384,7 +415,7 @@ function writeCoeffsFile(c) {
     const note = !BACKTESTED_KEYS.includes(key) && HAND_SET_NOTES[key] ? ` // ${HAND_SET_NOTES[key]}` : "";
     return `  ${key}: ${c[key]},${note}`;
   };
-  const categorized = new Set([...CORE_KEYS, ...WEATHER_VENUE_KEYS, ...GAME_SCRIPT_KEYS, ...METADATA_KEYS]);
+  const categorized = new Set([...CORE_KEYS, ...WEATHER_VENUE_KEYS, ...GAME_SCRIPT_KEYS, ...REFEREE_KEYS, ...NGS_PRESSURE_KEYS, ...METADATA_KEYS]);
   const uncategorized = Object.keys(c).filter(k => !categorized.has(k));
   const uncategorizedBlock = uncategorized.length
     ? `\n  // Added to lib/modelCoeffs.js without a matching entry in scripts/backtest.js's CORE_KEYS/
@@ -422,6 +453,16 @@ ${WEATHER_VENUE_KEYS.map(line).join("\n")}
   // spread_line/total_line columns; front_seven_injury stays hand-set for the same reason secondary_injury does
   // — no historical injury-report archive exists to replay it against.
 ${GAME_SCRIPT_KEYS.map(line).join("\n")}
+
+  // Referee tendency, revived as a non-bettable context factor after this build dropped its Totals market (see
+  // lib/factors/referee.js) — backtested walk-forward against nflverse's own historical referee/total/total_line
+  // schedule columns, using only each referee's games strictly before the one being tested.
+${REFEREE_KEYS.map(line).join("\n")}
+
+  // Next Gen Stats player efficiency (CPOE, rush yards over expected, separation) and pass-protection/pressure —
+  // real full-history nflverse/play-by-play archives exist for both, making them genuine future backtest
+  // candidates, but neither is wired into this script's walk-forward loop yet — hand-set for now.
+${NGS_PRESSURE_KEYS.map(line).join("\n")}
 ${uncategorizedBlock}
   generatedAt: ${JSON.stringify(c.generatedAt)},
   source: "backtest",

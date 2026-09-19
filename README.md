@@ -35,6 +35,30 @@ price, an edge). Every existing element id/class name was kept as-is — this wa
 so no JS wiring changed. **Top Picks** (above) is the new default landing tab, ahead of the Edge Board, since it's
 meant to be the fastest "what should I actually look at this week" read.
 
+### Injury Watch
+
+A separate tab (`lib/factors/injury.js`'s `computeInjuryEscalations`, rendered in `#view-watch`) tracking a
+specific, narrow event: a player whose EARLIEST-seen status on a refresh this week was Questionable, but whose
+status as of the latest refresh has worsened to Doubtful or Out. This is deliberately not "who's hurt right
+now" (every player's own card already shows that) — it's "who got *worse* since an earlier look this week,"
+built from the same rolling `injuryHistory` snapshots `computePracticeTrend` already uses, just read across
+every team at once instead of folded into one player's own reasoning. Empty most of the time (a real escalation
+is a genuinely uncommon event, and it's always empty right after a fresh deploy or in demo mode — there's no
+multi-refresh history yet to compare against) — that's the correct, honest state, not a bug.
+
+### Teammate-out usage tendency now gates on CURRENT injury status
+
+`computeTeammateOutTendency` (`lib/factors/playerSplits.js`) took an `injuriesByTeam` parameter from day one but
+never actually read it — "without the teammate" was decided purely from whether the teammate's own game log had
+a row for that week at all (a bye, a benching, a trade, an old injury — any absence counted the same), with zero
+connection to whether he's actually playing *this week*. That produced real, confusing live output: a writeup
+reading "Without Omarion Hampton on the field, his numbers jump to X" for a game where Hampton was active and
+expected to play, just because some unrelated week in the log happened to be missing him. It now checks the
+teammate's live status from this refresh's own ESPN injury pull and only fires when he's currently listed Out,
+Doubtful, or **Questionable** — Questionable counts as "not fully expected to play" here, the same bar
+`computeOLineInjuryFlag` already used. The historical with/without split itself (the actual games-log math) is
+unchanged; only the gate on whether it's even worth showing changed.
+
 ### Odds-fetch resilience
 
 `fetchNFLEvents` (`lib/fetchers/odds.js`) requests all tracked bookmakerIDs in a single SportsGameOdds call.
@@ -156,6 +180,17 @@ match the live pipeline's own convention. Because the weather backfill now hits 
 non-dome historical game across all requested seasons (not just this week's board, the way the live pipeline
 scopes it), a full backtest run takes noticeably longer than it used to — expect several minutes, not "under a
 minute per season."
+
+Two more joined the backtestable list this round: **`referee_over_lean`/`referee_under_lean`** (the revived,
+non-bettable referee-tendency factor) measure walk-forward against nflverse's own historical `referee`/`total`/
+`total_line` schedule columns, using a dedicated `refereeFactorAsOf` helper that only counts games a given
+referee had *actually already called* strictly before the one being tested (the live factor itself can safely
+read the whole schedule file, since a future/unplayed game always has a blank referee — but replaying a past
+season needs that same no-lookahead discipline every other nudge here already follows). The Next Gen Stats
+efficiency nudges (`ngs_cpoe_hot/cold`, `ngs_ryoe_hot/cold`, `ngs_separation_hot`) and the pass-protection/
+pressure nudges (`pressure_risk_penalty`, `clean_pocket_boost`) both draw on real, full-history archives too
+(NGS back to 2016; every sack/`qb_hit` play-by-play column as far back as `pbp` is fetched) — genuine future
+backtest candidates — but neither is wired into this script's walk-forward loop yet, so they stay hand-set.
 
 `writeCoeffsFile` (the function that regenerates `lib/modelCoeffs.js`) used to write from a hardcoded per-key
 template that predated the weather/venue/practice-trend/front-seven/game-script coefficients a later session
@@ -286,6 +321,27 @@ its own honest empty state rather than being hidden or padded out with a weaker 
   scored against each prop's own personal-history-first / positional-fallback weather nudge (see above).
 - **Line movement** — price/point movement across the week, from a rolling history of odds snapshots, scored as
   a magnitude-scaled market-steam nudge rather than a flat "moved or didn't."
+- **Next Gen Stats player efficiency** — real, tracking-data-derived numbers straight from nflverse's own
+  `ngs_passing`/`ngs_rushing`/`ngs_receiving` releases (`lib/factors/nextgenstats.js`), isolating a player's OWN
+  skill from his team's overall offensive numbers (already covered by the matchup/scoring-environment factors
+  above): completion percentage over expectation (CPOE) and average time-to-throw for QBs, rush yards over
+  expected per attempt for runners, and average separation at the catch point plus yards-after-catch over
+  expectation for pass-catchers. Trailing last-3-games average, gated on a minimum sample (2+ games, with a
+  per-game attempt/target floor so a garbage-time single-drop-back row can't skew it).
+- **Pass-protection/pressure matchup** — real data this app was already fetching and computing but never actually
+  wired into anything that could move a grade: `lib/factors/teamStats.js`'s `pressureRateAllowed`/
+  `pressureRateCreated` (straight off play-by-play's `sack`/`qb_hit` columns) are combined in
+  `lib/factors/pressure.js` into one "how much heat will this week's QB actually face" number — the offense's
+  own pass-block rate plus the specific opponent's own pass-rush rate. A true PFF/ESPN-style "pass rush win rate"
+  or "blitz rate" is proprietary and not freely buildable; this sack+hit-rate proxy from already-fetched
+  play-by-play is real and is.
+- **Referee tendency** — revived as a non-bettable context factor (`lib/factors/referee.js`) after this build
+  dropped its Totals market: a real historical over/under bias per assigned referee, computed from nflverse's own
+  schedule file (the actual final combined score vs. the closing total line, across however many seasons of
+  history are loaded). An over-friendly crew reads as a modest tailwind for scoring generally (more plays for
+  BOTH offenses), not a run- or pass-specific tilt the way weather/game-script are. Assignment for an upcoming
+  game usually isn't known until close to kickoff — this reports itself unavailable rather than guessing until a
+  real assignment shows up in a later-week refresh.
 - **Player-team accuracy + depth-chart role** — every player is resolved against nflverse's real, continuously
   updated depth-chart scrape (`depth_charts_<season>.csv`), not just the weekly roster file. This closes two
   real accuracy gaps found during this pass: (1) `roster_weekly_<season>.csv` is one row per player *per week*,
@@ -619,7 +675,8 @@ row just silently disappearing.
 
 ```
 lib/
-  fetchers/        nflverse (stats, roster, snaps, schedule, play-by-play, depth charts), odds, weather, injuries
+  fetchers/        nflverse (stats, roster, snaps, schedule, play-by-play, depth charts, Next Gen Stats), odds,
+                   weather, injuries
   factors/         every computed-factor module, wired together in factors/index.js
   identity.js      player identity resolution — roster index, depth-chart index, resolvePlayer()
   analyze.js       price comparison, best-book selection, suspect-vs-stale-value classification, prop

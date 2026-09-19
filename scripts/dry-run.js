@@ -7,7 +7,11 @@ import { MODEL_COEFFS } from "../lib/modelCoeffs.js";
 import { gradeCompletedPicks, foldIntoLedger, summarizeLedger } from "../lib/grading.js";
 import { buildRosterIndex, buildDepthChartIndex, resolvePlayer } from "../lib/identity.js";
 import { findKeyTeammate, computeGameScript } from "../lib/factors/index.js";
-import { computeOpposingFrontSevenInjury } from "../lib/factors/injury.js";
+import { computeOpposingFrontSevenInjury, computeInjuryEscalations } from "../lib/factors/injury.js";
+import { computeTeammateOutTendency } from "../lib/factors/playerSplits.js";
+import { computeRefereeFactor } from "../lib/factors/referee.js";
+import { computeNgsPassing, computeNgsRushing, computeNgsReceiving, buildNgsIndex } from "../lib/factors/nextgenstats.js";
+import { computePressureFactor } from "../lib/factors/pressure.js";
 import { computeBestAcrossBooks, extractGameContext } from "../lib/analyze.js";
 import { buildDemoData } from "../lib/demoData.js";
 import { fetchNFLEvents } from "../lib/fetchers/odds.js";
@@ -38,7 +42,8 @@ snapshot.logs.forEach(l => console.log(l.msg));
 const factorKeys = Object.keys(snapshot.propRows[0].factors || {});
 const expected = ["form", "tendency", "venue", "weatherHistorical", "weatherForecast", "birthday",
   "usage", "redZone", "twoMinute", "defense", "matchupEdge", "scoringEnvironment", "secondaryInjury", "schedule",
-  "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "situationalNote"];
+  "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "situationalNote",
+  "referee", "ngsPassing", "ngsRushing", "ngsReceiving", "pressure"];
 const missing = expected.filter(k => !factorKeys.includes(k));
 
 console.log("\n=== SELF-CHECK ===");
@@ -566,6 +571,126 @@ const blurbSentenceCount = blurb.split(/(?<=[.!?])\s+/).filter(Boolean).length;
 const blurbIsWellFormed = blurb.includes("Test Back") && /\d+-point edge/.test(blurb) && blurbSentenceCount >= 2 && blurbSentenceCount <= 3;
 console.log("pickBlurb reads as a real 2-3 sentence write-up naming the player and the actual edge (should be true):", blurbIsWellFormed, blurb);
 
+// --- Teammate-out tendency now gates on CURRENT injury status (lib/factors/playerSplits.js) ---
+// The real bug Jon reported live: a writeup reading "Without Omarion Hampton on the field..." for a game where
+// Hampton was actually active — because the old version never looked at `injuriesByTeam` at all, just historical
+// game-log gaps (any absence, any reason). Same synthetic game log (3 games with the teammate, 2 without, a real
+// usage bump in the "without" games) run through three different current-status states for the teammate.
+const teammateGameLogIndex = new Map([
+  ["test rb1", [
+    { week: 1, rushing_yards: 60 }, { week: 2, rushing_yards: 100 }, { week: 3, rushing_yards: 55 },
+    { week: 4, rushing_yards: 95 }, { week: 5, rushing_yards: 58 }
+  ]],
+  ["test rb2", [ // the "teammate" — active weeks 1, 3, 5; absent (any reason) weeks 2 and 4
+    { week: 1, rushing_yards: 40 }, { week: 3, rushing_yards: 35 }, { week: 5, rushing_yards: 45 }
+  ]]
+]);
+const teammatePlayer = { _logKey: "test rb1", team: "KC" };
+const activeTendency = computeTeammateOutTendency(teammatePlayer, "Test RB2",
+  { KC: [{ name: "Test RB2", status: "Active" }] }, teammateGameLogIndex, "rush_yds");
+const noEntryTendency = computeTeammateOutTendency(teammatePlayer, "Test RB2", { KC: [] }, teammateGameLogIndex, "rush_yds");
+const questionableTendency = computeTeammateOutTendency(teammatePlayer, "Test RB2",
+  { KC: [{ name: "Test RB2", status: "Questionable" }] }, teammateGameLogIndex, "rush_yds");
+const outTendency = computeTeammateOutTendency(teammatePlayer, "Test RB2",
+  { KC: [{ name: "Test RB2", status: "Out" }] }, teammateGameLogIndex, "rush_yds");
+const teammateTendencyGatesOnCurrentStatus = activeTendency.available === false && noEntryTendency.available === false &&
+  questionableTendency.available === true && outTendency.available === true &&
+  outTendency.teammateStatus === "Out" && outTendency.withoutAvg === 97.5 && Math.abs(outTendency.withAvg - 57.6667) < 0.01;
+console.log("computeTeammateOutTendency only fires when the teammate is CURRENTLY Out/Doubtful/Questionable, never on stale historical absence alone (should be true):",
+  teammateTendencyGatesOnCurrentStatus, { activeTendency, noEntryTendency, questionableAvailable: questionableTendency.available, outTendency });
+
+// --- Injury status-escalation watch (lib/factors/injury.js) ---
+// Jon's explicit ask: a separate tracker for players who were Questionable on an earlier refresh this week but
+// have since worsened to Doubtful or Out. Four players across two snapshots exercise every case that must be
+// told apart: a real Questionable->Doubtful escalation (include), Out staying Out (already worst, not an
+// "escalation" — exclude), Questionable staying Questionable (no change — exclude), and Doubtful->Out (a real
+// worsening, but doesn't START at Questionable, so it's out of scope for THIS tracker per Jon's exact wording).
+const escalationHistory = [
+  { t: "2026-09-17T12:00:00Z", byTeam: { KC: [
+    { name: "Player Q2D", status: "Questionable", position: "WR", detail: "ankle" },
+    { name: "Player OutStays", status: "Out", position: "RB" },
+    { name: "Player QStays", status: "Questionable", position: "TE" },
+    { name: "Player DtoOut", status: "Doubtful", position: "CB" }
+  ] } },
+  { t: "2026-09-18T12:00:00Z", byTeam: { KC: [
+    { name: "Player Q2D", status: "Doubtful", position: "WR", detail: "ankle" },
+    { name: "Player OutStays", status: "Out", position: "RB" },
+    { name: "Player QStays", status: "Questionable", position: "TE" },
+    { name: "Player DtoOut", status: "Out", position: "CB" }
+  ] } }
+];
+const escalations = computeInjuryEscalations(escalationHistory);
+const escalationWatchWorksCorrectly = escalations.length === 1 && escalations[0].name === "Player Q2D" &&
+  escalations[0].firstStatus === "Questionable" && escalations[0].currentStatus === "Doubtful" &&
+  !escalations.some(e => ["Player OutStays", "Player QStays", "Player DtoOut"].includes(e.name));
+console.log("computeInjuryEscalations flags only a real Questionable -> Doubtful/Out worsening, not an already-Out player or a same-status repeat (should be true):",
+  escalationWatchWorksCorrectly, escalations);
+const emptyEscalationsOnNoHistory = computeInjuryEscalations([]).length === 0 && computeInjuryEscalations(undefined).length === 0;
+console.log("computeInjuryEscalations returns a clean empty list with no/empty history rather than throwing (should be true):", emptyEscalationsOnNoHistory);
+
+// --- Referee tendency, revived as a non-bettable context factor (lib/factors/referee.js) ---
+// 10 synthetic games for "Test Ref": 7 overs, 3 unders, clears the gamesCalled>=8 floor. A second referee with
+// only 3 games on record proves the sample-size gate actually excludes a too-thin history instead of reporting
+// a number anyway.
+const refereeSchedule = [
+  ...Array.from({ length: 7 }, (_, i) => ({ referee: "Test Ref", total: 50 + i, total_line: 44 })), // all clear the line -> overs
+  ...Array.from({ length: 3 }, (_, i) => ({ referee: "Test Ref", total: 30 + i, total_line: 44 })), // all under the line
+  { referee: "Thin Sample Ref", total: 40, total_line: 40 }, { referee: "Thin Sample Ref", total: 41, total_line: 40 }, { referee: "Thin Sample Ref", total: 39, total_line: 40 }
+];
+const testRefFactor = computeRefereeFactor("Test Ref", refereeSchedule);
+const thinRefFactor = computeRefereeFactor("Thin Sample Ref", refereeSchedule);
+const noRefFactor = computeRefereeFactor(null, refereeSchedule);
+const refereeFactorWorks = testRefFactor.available === true && testRefFactor.gamesCalled === 10 &&
+  Math.abs(testRefFactor.overRate - 0.7) < 0.001 && thinRefFactor.available === false && noRefFactor.available === false;
+console.log("computeRefereeFactor computes a real over-rate once the sample clears the floor, and reports unavailable below it or with no assignment (should be true):",
+  refereeFactorWorks, { testRefFactor, thinRefFactor });
+
+// --- Next Gen Stats player efficiency (lib/factors/nextgenstats.js) ---
+// Real NGS-shaped rows for a hot-CPOE QB, a below-expected rusher, and a receiver who consistently gets open —
+// each gated on real position/sample-size checks, never firing for the wrong position or a too-thin sample.
+const ngsPassingIdx = buildNgsIndex([
+  { player_display_name: "Test Qb", week: 1, attempts: 32, completion_percentage_above_expectation: 5.1, avg_time_to_throw: 2.6, aggressiveness: 15, avg_intended_air_yards: 8.1 },
+  { player_display_name: "Test Qb", week: 2, attempts: 35, completion_percentage_above_expectation: 4.4, avg_time_to_throw: 2.5, aggressiveness: 14, avg_intended_air_yards: 7.9 },
+  { player_display_name: "Test Qb", week: 3, attempts: 3, completion_percentage_above_expectation: 40, avg_time_to_throw: 2.0, aggressiveness: 20, avg_intended_air_yards: 10 } // too few attempts -> filtered out
+]);
+const ngsRushingIdx = buildNgsIndex([
+  { player_display_name: "Test Rb", week: 1, rush_attempts: 18, rush_yards_over_expected_per_att: -0.8, efficiency: 3.1 },
+  { player_display_name: "Test Rb", week: 2, rush_attempts: 20, rush_yards_over_expected_per_att: -0.6, efficiency: 3.0 }
+]);
+const ngsReceivingIdx = buildNgsIndex([
+  { player_display_name: "Test Wr", week: 1, targets: 8, avg_separation: 3.4, avg_yac_above_expectation: 0.8 },
+  { player_display_name: "Test Wr", week: 2, targets: 9, avg_separation: 3.2, avg_yac_above_expectation: 1.1 }
+]);
+const testQb = { position: "QB", _logKey: "test qb" };
+const testRb = { position: "RB", _logKey: "test rb" };
+const testWr = { position: "WR", _logKey: "test wr" };
+const ngsPassingResult = computeNgsPassing(testQb, ngsPassingIdx);
+const ngsRushingResult = computeNgsRushing(testRb, ngsRushingIdx);
+const ngsReceivingResult = computeNgsReceiving(testWr, ngsReceivingIdx);
+const ngsWrongPositionStaysUnavailable = computeNgsPassing(testRb, ngsPassingIdx).available === false &&
+  computeNgsRushing(testWr, ngsRushingIdx).available === false;
+const ngsFactorsWork = ngsPassingResult.available === true && ngsPassingResult.sampleGames === 2 && Math.abs(ngsPassingResult.cpoe - 4.75) < 0.01 &&
+  ngsRushingResult.available === true && Math.abs(ngsRushingResult.ryoePerAtt - (-0.7)) < 0.01 &&
+  ngsReceivingResult.available === true && Math.abs(ngsReceivingResult.avgSeparation - 3.3) < 0.01 &&
+  ngsWrongPositionStaysUnavailable;
+console.log("computeNgsPassing/Rushing/Receiving compute real trailing efficiency numbers, gated on position and a real sample-size/attempt floor (should be true):",
+  ngsFactorsWork, { ngsPassingResult, ngsRushingResult, ngsReceivingResult });
+
+// --- Pass-protection/pressure matchup (lib/factors/pressure.js) ---
+// Real team-level numbers already computed by teamStats.js: a team with a leaky O-line (high pressureRateAllowed)
+// facing a defense with an elite pass rush (high pressureRateCreated) should read out a real elevated combined
+// risk number — and stay unavailable when either side has no play-by-play sample to compute from yet.
+const pressureTeamIndex = {
+  KC: { pressureRateAllowed: 0.42 },
+  BUF: { pressureRateCreated: 0.38 },
+  NOSAMPLE: { pressureRateAllowed: null, pressureRateCreated: null }
+};
+const pressureResult = computePressureFactor("KC", "BUF", pressureTeamIndex);
+const pressureUnavailableWithoutSample = computePressureFactor("KC", "NOSAMPLE", pressureTeamIndex).available === false;
+const pressureFactorWorks = pressureResult.available === true && Math.abs(pressureResult.combinedPressureRisk - 0.4) < 0.001 && pressureUnavailableWithoutSample;
+console.log("computePressureFactor combines the offense's own pass-block rate with the opposing defense's pass-rush rate, real numbers only (should be true):",
+  pressureFactorWorks, pressureResult);
+
 // --- Roster/depth-chart accuracy pass (lib/identity.js, lib/factors/index.js) ---
 // Unit-tested directly against the same fixtures buildDemoData feeds the pipeline, the same pattern already
 // used above for lib/probability.js and lib/grading.js — these fixtures don't have their own odds/props in
@@ -877,7 +1002,9 @@ console.log("Scoring-environment factor computed at least once (should be true):
 // New coefficients must actually be present (not just referenced) in MODEL_COEFFS — a nudge silently falling
 // back to `|| 0` because the coefficient was never added would pass every test above for the wrong reason.
 const newCoeffsPresent = ["weather_personal_boost", "weather_personal_penalty", "weather_run_favor", "weather_pass_penalty",
-  "venue_edge", "practice_trend_down", "practice_trend_up", "front_seven_injury", "game_script_run_favor", "game_script_pass_favor"].every(k => typeof MODEL_COEFFS[k] === "number");
+  "venue_edge", "practice_trend_down", "practice_trend_up", "front_seven_injury", "game_script_run_favor", "game_script_pass_favor",
+  "referee_over_lean", "referee_under_lean", "ngs_cpoe_hot", "ngs_cpoe_cold", "ngs_ryoe_hot", "ngs_ryoe_cold",
+  "ngs_separation_hot", "pressure_risk_penalty", "clean_pocket_boost"].every(k => typeof MODEL_COEFFS[k] === "number");
 console.log("Every new hand-set coefficient is present in MODEL_COEFFS (should be true):", newCoeffsPresent);
 
 if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
@@ -886,7 +1013,9 @@ if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefens
   !aiSelectionWorks || !cacheLoosening || !costEstimatesAreCorrect || !spendGuardCapWorks || !rolloverWorks || !scoutingThrottleWorks || !newCoeffsPresent ||
   !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
   !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous ||
-  !topPicksBasicsWork || !emptyCategoryHandledCleanly || !negativeContributorExcludedAndRankedByWeight || !fallbackFillsToMinimum || !blurbIsWellFormed) {
+  !topPicksBasicsWork || !emptyCategoryHandledCleanly || !negativeContributorExcludedAndRankedByWeight || !fallbackFillsToMinimum || !blurbIsWellFormed ||
+  !teammateTendencyGatesOnCurrentStatus || !escalationWatchWorksCorrectly || !emptyEscalationsOnNoHistory ||
+  !refereeFactorWorks || !ngsFactorsWork || !pressureFactorWorks) {
   console.log("\nFAILED — see above.");
   process.exit(1);
 } else {
