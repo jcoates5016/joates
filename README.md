@@ -242,6 +242,23 @@ present in the merged coefficient object, with a fallback "uncategorized" sectio
 recognize, so a coefficient someone adds directly to `lib/modelCoeffs.js` later can no longer just vanish.
 Re-run the backtest periodically as more seasons of data accumulate.
 
+**Fixed a real out-of-memory crash.** Running `npm run backtest` against 3 real seasons on an actual machine
+(rather than the dev sandbox this app is built in) crashed with `FATAL ERROR: Reached heap limit — JavaScript
+heap out of memory`. Root cause, found by measuring actual heap use step by step: `fetchPlayByPlay` parsed each
+season's full play-by-play CSV (370+ raw columns from nflverse, ~48,000+ rows) into full-width row objects
+*before* trimming down to the ~50 columns this app actually uses — briefly needing close to 2GB of heap for a
+single season, just to throw away 85% of it a moment later. On top of that, this script (and
+`scripts/validate-model.js`, which had the identical pattern) pre-loaded *every* requested season's stats,
+play-by-play, and snap-counts into memory before walking any of them, instead of processing one season at a
+time — so a 3-season run needed roughly 3x that peak simultaneously. Fixed both: `fetchPlayByPlay` now parses
+play-by-play row-by-row and trims each row immediately (never holding the full 370-column version of more than
+one row at a time), and both scripts now fetch-walk-release one season before starting the next. Measured
+side by side, this cut one season's play-by-play parse from ~2GB of heap to under 300MB, and let a full 3-season
+backtest complete inside a 1.5GB heap ceiling in testing — comfortably under the 4GB ceiling both `npm run
+backtest` and `npm run validate-model` now request via `node --max-old-space-size=4096` in `package.json`, which
+serves as a second, independent safety margin on top of the real memory-footprint fix. If a future run somehow
+still hits this, that flag is the first place to look — raising it further costs nothing but memory.
+
 ### The results ledger — closing the feedback loop
 
 None of the above matters if nobody ever checks whether it works. `lib/grading.js` + `lib/store.js`

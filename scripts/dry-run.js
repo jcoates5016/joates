@@ -238,13 +238,22 @@ const goodWeatherNoNudge = estimatePropProbability({
   propType: "pass_yds", weatherForecast: { precipProb: 10, windMph: 3 },
   form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
 }, 0.55);
+// weather_run_favor/weather_pass_penalty are backtested (scripts/backtest.js) and can come back pruned to 0 or
+// either sign, same as game_script_run_favor/game_script_pass_favor below — so, like that test, this checks
+// whatever direction MODEL_COEFFS' real current values say rather than hardcoding "always up"/"always down".
+// weather_personal_boost/penalty stay hand-set (no historical per-player forecast archive to backtest against —
+// see HAND_SET_NOTES in scripts/backtest.js), so those two keep their fixed expected direction.
+const expectWeatherRunDirection = MODEL_COEFFS.weather_run_favor > 0 ? "up" : MODEL_COEFFS.weather_run_favor < 0 ? "down" : "flat";
+const expectWeatherPassDirection = MODEL_COEFFS.weather_pass_penalty > 0 ? "up" : MODEL_COEFFS.weather_pass_penalty < 0 ? "down" : "flat";
+const matchesWeatherDirection = (v, base, dir) => dir === "up" ? v > base : dir === "down" ? v < base : Math.abs(v - base) < 0.0001;
 const weatherNudgesWork = weatherPersonalBoost.modelProb > baseline && weatherPersonalPenalty.modelProb < baseline &&
-  weatherRunFavor.modelProb > baseline && weatherPassPenalty.modelProb < baseline &&
+  matchesWeatherDirection(weatherRunFavor.modelProb, baseline, expectWeatherRunDirection) &&
+  matchesWeatherDirection(weatherPassPenalty.modelProb, baseline, expectWeatherPassDirection) &&
   Math.abs(goodWeatherNoNudge.modelProb - baseline) < 0.0001 &&
   weatherPersonalBoost.contributors.some(c => /personal history/.test(c)) &&
-  weatherRunFavor.contributors.some(c => /favors the run/.test(c)) &&
-  weatherPassPenalty.contributors.some(c => /against the passing/.test(c));
-console.log("Weather nudge: personal history wins when available, else falls back to the positional read, and never fires in good weather (should be true):", weatherNudgesWork,
+  weatherRunFavor.contributors.some(c => /weather read/.test(c)) &&
+  weatherPassPenalty.contributors.some(c => /weather read/.test(c));
+console.log(`Weather nudge: personal history wins when available, else falls back to whatever direction MODEL_COEFFS' real backtested values currently say (run: ${expectWeatherRunDirection}, pass: ${expectWeatherPassDirection}), fires with a neutral non-directional label either way, and never fires in good weather (should be true):`, weatherNudgesWork,
   { baseline, boost: weatherPersonalBoost.modelProb, penalty: weatherPersonalPenalty.modelProb, runFavor: weatherRunFavor.modelProb, passPenalty: weatherPassPenalty.modelProb, goodWeather: goodWeatherNoNudge.modelProb });
 
 // Venue: only fires when the split is real (2+ games each way) AND cross-referenced against THIS week's actual

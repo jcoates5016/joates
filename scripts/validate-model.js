@@ -150,25 +150,24 @@ async function runHistoricalValidation() {
   log(`\n=== Part 1: historical walk-forward calibration (seasons ${SEASONS.join(", ")}) ===`);
   log(`Fetching multi-season stats, schedule, play-by-play, and snap counts (no weather/NGS backfill this pass — see file header)...`);
 
-  const [statRowsAll, scheduleRaw] = await Promise.all([fetchMultiSeasonStats(SEASONS, log), fetchSchedule(log)]);
+  const scheduleRaw = await fetchSchedule(log);
   const hasGameType = scheduleRaw.some(r => "game_type" in r);
   const schedule = hasGameType ? scheduleRaw.filter(r => r.game_type === "REG") : scheduleRaw;
-
-  const pbpBySeason = {}, snapsBySeason = {};
-  for (const season of SEASONS) {
-    pbpBySeason[season] = await fetchPlayByPlay(season, log);
-    snapsBySeason[season] = await fetchSnapCounts(season, log);
-  }
 
   const fullRecords = [], baseRecords = [];
   let overallHit = 0, overallN = 0;
 
+  // Fetches one season's stats/play-by-play/snap-counts at a time, right before that season is walked, instead
+  // of pre-loading every season's raw rows into a statRowsAll/pbpBySeason/snapsBySeason object up front (see
+  // scripts/backtest.js's matching comment — this file had the identical pattern and the identical real risk of
+  // a `FATAL ERROR: Reached heap limit` on a real machine, even though it hadn't been hit here yet).
   for (const season of SEASONS) {
-    const seasonStatRows = statRowsAll.filter(r => Number(r.season) === season && (!r.season_type || r.season_type === "REG"));
+    const seasonStatRowsAll = await fetchMultiSeasonStats([season], log);
+    const seasonStatRows = seasonStatRowsAll.filter(r => Number(r.season) === season && (!r.season_type || r.season_type === "REG"));
     const weeks = [...new Set(seasonStatRows.map(r => Number(r.week)))].filter(w => !isNaN(w)).sort((a, b) => a - b);
     const seasonSchedule = schedule.filter(s => Number(s.season) === season);
-    const seasonPbp = pbpBySeason[season] || [];
-    const seasonSnaps = snapsBySeason[season] || [];
+    const seasonPbp = await fetchPlayByPlay(season, log);
+    const seasonSnaps = await fetchSnapCounts(season, log);
     if (!seasonStatRows.length) { log(`${season}: no stat rows returned, skipping.`); continue; }
 
     for (const week of weeks) {

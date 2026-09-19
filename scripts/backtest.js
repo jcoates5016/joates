@@ -230,26 +230,31 @@ async function main() {
   log(`(This fetches multiple seasons of full play-by-play, plus a historical-weather backfill for the new`);
   log(`weather_run_favor/weather_pass_penalty keys — it can take several minutes now, not just a few.)`);
 
-  const [statRowsAll, scheduleRaw] = await Promise.all([fetchMultiSeasonStats(SEASONS, log), fetchSchedule(log)]);
+  const scheduleRaw = await fetchSchedule(log);
   const hasGameType = scheduleRaw.some(r => "game_type" in r);
   const schedule = hasGameType ? scheduleRaw.filter(r => r.game_type === "REG") : scheduleRaw;
   const weatherCache = await buildWeatherCache(schedule, SEASONS, log);
 
-  const pbpBySeason = {}, snapsBySeason = {};
-  for (const season of SEASONS) {
-    pbpBySeason[season] = await fetchPlayByPlay(season, log);
-    snapsBySeason[season] = await fetchSnapCounts(season, log);
-  }
-
   const buckets = Object.fromEntries(BACKTESTED_KEYS.map(k => [k, newBucket()]));
   let overallHit = 0, overallN = 0;
 
+  // Everything below fetches ONE season's stats/play-by-play/snap-counts at a time, right before that season is
+  // walked, instead of pre-loading every season's raw rows into a statRowsAll/pbpBySeason/snapsBySeason object up
+  // front. Full play-by-play in particular is parsed from CSV at 370+ raw columns before being trimmed (see
+  // fetchPlayByPlay) — holding that for every season in SEASONS simultaneously, on top of full-season stat and
+  // snap-count rows, is what pushed a real run past Node's default heap ceiling on a lower-RAM machine (this
+  // sandbox's own run happened not to hit it, but a `FATAL ERROR: Reached heap limit` on a real machine is a real
+  // bug in this script, not a fluke of that machine). Fetching one season, walking it, then letting its raw rows
+  // fall out of scope before the next season's fetch starts keeps peak memory to roughly one season's worth
+  // instead of SEASONS.length seasons' worth. package.json's "backtest" script also now raises Node's heap
+  // ceiling directly (--max-old-space-size) as a second, independent safety margin.
   for (const season of SEASONS) {
-    const seasonStatRows = statRowsAll.filter(r => Number(r.season) === season && (!r.season_type || r.season_type === "REG"));
+    const seasonStatRowsAll = await fetchMultiSeasonStats([season], log);
+    const seasonStatRows = seasonStatRowsAll.filter(r => Number(r.season) === season && (!r.season_type || r.season_type === "REG"));
     const weeks = [...new Set(seasonStatRows.map(r => Number(r.week)))].filter(w => !isNaN(w)).sort((a, b) => a - b);
     const seasonSchedule = schedule.filter(s => Number(s.season) === season);
-    const seasonPbp = pbpBySeason[season] || [];
-    const seasonSnaps = snapsBySeason[season] || [];
+    const seasonPbp = await fetchPlayByPlay(season, log);
+    const seasonSnaps = await fetchSnapCounts(season, log);
     if (!seasonStatRows.length) { log(`${season}: no stat rows returned, skipping.`); continue; }
 
     for (const week of weeks) {
