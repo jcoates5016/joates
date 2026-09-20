@@ -757,6 +757,19 @@ button (same `workflow_dispatch` call, via `netlify/functions/trigger-refresh.js
 anymore. If that tradeoff changes later, re-adding a `schedule:` block to that workflow file is all it takes to
 bring auto-refresh back.
 
+**Trigger endpoint access control.** `netlify/functions/trigger-refresh.js` is a public URL on the open
+internet — Netlify functions don't get any access control by default. Until this was caught during a real cost
+review, that meant anyone who found the URL (a bot scanning for exposed Netlify functions, a scraper, anything)
+could `POST` to it directly and set off a real, paid GitHub Actions run with live Anthropic calls, with zero
+involvement from you — indistinguishable from a phantom auto-refresh from the outside. The daily spend cap
+above limits the damage per day, but a cap is a ceiling, not a lock. The endpoint now requires a `REFRESH_SECRET`
+you set yourself (see the environment variables section below) sent as an `x-refresh-secret` header; a request
+without the right value gets a flat 401 before it ever touches the GitHub API, and if `REFRESH_SECRET` isn't set
+at all, every request is rejected outright rather than silently staying open. The site's own "Refresh Now"
+button asks for this value once per browser (via a plain `prompt()`, since a static site can't hide a secret
+baked into its own JS source) and remembers it in that browser's `localStorage` after that — enter it once and
+you won't be asked again on that machine.
+
 ## Environment variables & secrets
 
 Split across two places now, since two different systems run this.
@@ -784,6 +797,10 @@ Split across two places now, since two different systems run this.
 - `GH_REPO` — this repo's name.
 - `GH_WORKFLOW_FILE` — optional, defaults to `refresh.yml`.
 - `GH_BRANCH` — optional, defaults to `main`.
+- `REFRESH_SECRET` — required. A password you make up (any random string works — a password manager's generator
+  is fine). Gates `trigger-refresh.js` so a random request from the open internet can't fire a paid refresh —
+  see "Trigger endpoint access control" above. The site's "Refresh Now" button will prompt you for this value
+  the first time you click it on a given browser and remember it after that.
 
 ## Deploying
 
@@ -791,8 +808,8 @@ Split across two places now, since two different systems run this.
 2. In Netlify: New site from Git → pick the repo. Build command `npm install`, publish directory `public`,
    functions directory `netlify/functions` (all already set in `netlify.toml`, so the defaults should just
    work).
-3. Add the four `GH_*` environment variables above in Netlify's Site configuration → Environment variables,
-   then redeploy (Deploys → Trigger deploy) so the functions pick them up.
+3. Add the four `GH_*` environment variables plus `REFRESH_SECRET` above in Netlify's Site configuration →
+   Environment variables, then redeploy (Deploys → Trigger deploy) so the functions pick them up.
 4. Add the six secrets above in the GitHub repo's Settings → Secrets and variables → Actions.
 5. Kick off a first run manually: GitHub repo → Actions tab → "Refresh APEX Edge data" workflow → Run workflow.
    Watch it in the Actions tab — a green check means it wrote a snapshot to Blobs; a red X will show you

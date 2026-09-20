@@ -261,7 +261,7 @@
     </div>
     <div class="setup-block">
       <div class="heading">Where the refresh actually runs</div>
-      <div class="body">This site (Netlify) only serves the frontend, reads the latest saved snapshot, and — when you click "Refresh Now" — fires a GitHub Actions workflow. The full pipeline (odds, nflverse + play-by-play, weather, AI) runs on GitHub Actions, every 30 minutes plus on-demand, and saves its result straight to this site's Netlify Blobs store. See the project README for why it's on GitHub Actions rather than a Netlify Background Function (those require a paid Netlify Pro plan; GitHub Actions doesn't).</div>
+      <div class="body">This site (Netlify) only serves the frontend, reads the latest saved snapshot, and — when you click "Refresh Now" — fires a GitHub Actions workflow. The full pipeline (odds, nflverse + play-by-play, weather, AI) runs on GitHub Actions, manually only (no automatic schedule — see the README's "Manual-only refresh" section for why), and saves its result straight to this site's Netlify Blobs store. See the project README for why it's on GitHub Actions rather than a Netlify Background Function (those require a paid Netlify Pro plan; GitHub Actions doesn't).</div>
     </div>
     <div class="setup-block">
       <div class="heading">Environment variables (Netlify site)</div>
@@ -509,10 +509,30 @@ async function loadSnapshot(){
   render();
 }
 
+// The trigger endpoint now requires a shared secret (see netlify/functions/trigger-refresh.js's header
+// comment on the cost incident this closes) — a static site can't keep that secret hidden in its own source,
+// so instead of baking it into this file (which anyone could just read), we ask for it once per browser and
+// keep it in localStorage. A bot or scanner that finds the trigger URL has no way to produce this value.
+function getRefreshSecret(forcePrompt){
+  const KEY = "apexEdgeRefreshSecret";
+  let secret = forcePrompt ? null : (localStorage.getItem(KEY) || null);
+  if (!secret){
+    secret = window.prompt("Refresh secret (set as REFRESH_SECRET in Netlify's environment variables):", "");
+    if (secret) localStorage.setItem(KEY, secret);
+  }
+  return secret;
+}
+
 async function refreshNow(){
   const btn = document.getElementById("refreshBtn");
   const prevGeneratedAt = snapshot?.generatedAt || null;
   const statusEl = document.getElementById("edgeStatus");
+  const secret = getRefreshSecret(false);
+  if (!secret){
+    statusEl.textContent = "Refresh cancelled — a refresh secret is required.";
+    statusEl.classList.add("err");
+    return;
+  }
   btn.disabled = true;
   const started = Date.now();
   const tick = () => { btn.innerHTML = `<span class="spinner"></span>Refreshing… ${Math.round((Date.now()-started)/1000)}s`; };
@@ -521,8 +541,14 @@ async function refreshNow(){
   statusEl.textContent = "Refresh triggered on GitHub Actions — pulling odds, nflverse stats + play-by-play, weather, and running AI analysis. This can take a few minutes, plus a bit of queue time for the runner to start.";
   statusEl.classList.remove("err");
   try{
-    const triggerRes = await fetch("/.netlify/functions/trigger-refresh", { method:"POST" });
+    const triggerRes = await fetch("/.netlify/functions/trigger-refresh", { method:"POST", headers: { "x-refresh-secret": secret } });
     const triggerJson = await triggerRes.json().catch(() => null);
+    if (triggerRes.status === 401){
+      // Stored secret is wrong or stale (e.g. rotated in Netlify) — clear it so the next click re-prompts
+      // instead of failing silently forever.
+      localStorage.removeItem("apexEdgeRefreshSecret");
+      throw new Error("Refresh secret rejected — cleared the saved one, click Refresh Now again to re-enter it.");
+    }
     if (!triggerJson?.ok) throw new Error(triggerJson?.error || `Trigger failed (HTTP ${triggerRes.status})`);
     const deadline = Date.now() + 10*60*1000;
     let done = false;
