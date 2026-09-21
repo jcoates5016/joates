@@ -321,6 +321,23 @@ function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, c => ({"&":"&amp;
 /* are stitched together into the card's paragraph.                      */
 /* ---------------------------------------------------------------------- */
 
+// Looks up the REAL, signed coefficient lib/probability.js's nudge() actually applied for a given factor key on
+// this row (r.modelContributorDetails, set server-side in lib/pipeline.js from the exact same MODEL_COEFFS
+// scripts/backtest.js measures) — never invented, never assumed from a label's wording. Several factors below
+// used to hardcode which direction ("tailwind"/"headwind") they cut based on plausible-sounding intuition, which
+// silently went stale the moment a real backtest measured that same factor in the OPPOSITE direction (confirmed
+// live: game_script_pass_favor and, once nflverse's real historical injury reports made them testable,
+// secondary_injury/front_seven_injury all came back with a real, kept, but negative effect — the opposite of
+// what their original hand-set defaults assumed). Returns null when the factor hasn't fired at all (shouldn't
+// normally happen at a call site already gated on the same factor's `.available` condition, but defensive
+// either way) — callers treat null the same as 0: real, but not currently one way or the other, so it's shown
+// as neither a supporting reason nor a caution, exactly like lib/topPicks.js's own `weight > 0` filter already
+// treats a zero/negative weight server-side.
+function nudgeWeight(r, key){
+  const d = (r.modelContributorDetails || []).find(c => c.key === key);
+  return d ? d.weight : null;
+}
+
 function propReasoning(r){
   const f = r.factors || {};
   const pos = [], caution = [];
@@ -342,21 +359,45 @@ function propReasoning(r){
     if (f.redZone.goalLineShare != null && f.redZone.goalLineShare >= 0.28) t += ` and ${fmtPct(f.redZone.goalLineShare)} of goal-line touches`;
     pos.push({ w:7, t: t + " — real scoring-chance volume." });
   }
+  // secondary_injury/front_seven_injury: real historical nflverse injury reports (added once that archive was
+  // confirmed to exist) let scripts/backtest.js actually test the intuitive "thinner secondary/front seven helps
+  // the opponent" read — and it came back real, kept, but NEGATIVE for both (see lib/modelCoeffs.js's own
+  // comments), plausibly the same garbage-time-against-a-still-good-defense dynamic already found for
+  // game_script_pass_favor below. The count/names are still shown as real facts either way; only which bucket
+  // (support vs. caution vs. neither) they land in is driven by the actual measured weight now, not the
+  // originally-assumed direction.
   if (f.secondaryInjury?.available && f.secondaryInjury.count >= 1){
-    pos.push({ w:6, t:`${opp} is down ${f.secondaryInjury.count} defensive back${f.secondaryInjury.count>1?"s":""} (${f.secondaryInjury.names.join(", ")}) — a thinner secondary is a real tailwind for the passing game, even without knowing exactly who lines up across from him.` });
+    const w = nudgeWeight(r, "secondary_injury");
+    const base = `${opp} is down ${f.secondaryInjury.count} defensive back${f.secondaryInjury.count>1?"s":""} (${f.secondaryInjury.names.join(", ")})`;
+    if (w > 0) pos.push({ w:6, t:`${base} — a thinner secondary is a real tailwind for the passing game, even without knowing exactly who lines up across from him.` });
+    else if (w < 0) caution.push({ w:4, t:`${base} — but measured against real history that hasn't actually boosted the opposing pass-catcher's own numbers (more likely explained by garbage-time volume coming against a defense that's still ahead), so this isn't scored as a tailwind here.` });
   }
   if (f.frontSevenInjury?.available && f.frontSevenInjury.count >= 1){
-    pos.push({ w:6, t:`${opp} is down ${f.frontSevenInjury.count} run-defender${f.frontSevenInjury.count>1?"s":""} (${f.frontSevenInjury.names.join(", ")}) — a thinner front seven is a real tailwind for the run game.` });
+    const w = nudgeWeight(r, "front_seven_injury");
+    const base = `${opp} is down ${f.frontSevenInjury.count} run-defender${f.frontSevenInjury.count>1?"s":""} (${f.frontSevenInjury.names.join(", ")})`;
+    if (w > 0) pos.push({ w:6, t:`${base} — a thinner front seven is a real tailwind for the run game.` });
+    else if (w < 0) caution.push({ w:4, t:`${base} — but measured against real history that hasn't actually translated into a boost for the run game here, so this isn't scored as a tailwind.` });
   }
-  // Vegas's own implied game script (spread/total, read as context — not a bet type here). A big favorite tends
-  // toward a run-heavy, clock-killing plan; a big underdog tends toward more pass volume playing catch-up. Same
-  // direction the game_script_run_favor/game_script_pass_favor nudges in lib/probability.js actually score, so
-  // this never disagrees with what moved the grade %.
+  // Vegas's own implied game script (spread/total, read as context — not a bet type here). The intuitive read —
+  // big favorite means more clock-killing runs, big underdog means more catch-up passing — is what these two
+  // nudges were ORIGINALLY hand-set to assume, but scripts/backtest.js has since measured game_script_pass_favor
+  // against real history and found the opposite: a big underdog's pass-catchers actually beat their own trailing
+  // average LESS often, not more (plausibly garbage-time volume against a defense that's still ahead, not more
+  // efficient volume) — see lib/modelCoeffs.js's own comment. game_script_run_favor never cleared real
+  // significance either way (currently pruned to 0). Checking the real signed weight here, instead of assuming
+  // the original intuition still holds, is what keeps this card's prose from disagreeing with what the model
+  // itself actually did with the same fact.
   if (f.gameScript?.available){
     if (f.gameScript.isBigFavorite && ["rush_yds","td_rush"].includes(r.propType)){
-      pos.push({ w:5, t:`${r.team||"His team"} is favored by ${fmtNum(Math.abs(f.gameScript.teamSpread),1)} points — a lopsided game script that tends to mean more clock-killing runs, especially late.` });
+      const w = nudgeWeight(r, "game_script_run_favor");
+      const base = `${r.team||"His team"} is favored by ${fmtNum(Math.abs(f.gameScript.teamSpread),1)} points`;
+      if (w > 0) pos.push({ w:5, t:`${base} — a lopsided game script that tends to mean more clock-killing runs, especially late.` });
+      else if (w < 0) caution.push({ w:3, t:`${base} — though measured against real history, being a big favorite hasn't actually translated into more rushing production here.` });
     } else if (f.gameScript.isBigUnderdog && ["pass_yds","td_pass","rec_yds","receptions","td_rec"].includes(r.propType)){
-      pos.push({ w:5, t:`${r.team||"His team"} is getting ${fmtNum(f.gameScript.teamSpread,1)} points — playing from behind tends to mean more pass volume as the game goes on, a tailwind for this prop.` });
+      const w = nudgeWeight(r, "game_script_pass_favor");
+      const base = `${r.team||"His team"} is getting ${fmtNum(f.gameScript.teamSpread,1)} points`;
+      if (w > 0) pos.push({ w:5, t:`${base} — playing from behind tends to mean more pass volume as the game goes on, a tailwind for this prop.` });
+      else if (w < 0) caution.push({ w:5, t:`${base} — but measured against real history, playing from behind this big has actually meant WORSE pass-catcher production than his own trailing average, not better (likely garbage-time volume against a defense that's still ahead), so this isn't scored as a tailwind.` });
     }
   }
   // Form gets a sentence either way — favorable OR unfavorable — never silence. A one-line "hit rate" is exactly
@@ -386,9 +427,19 @@ function propReasoning(r){
     if (f.usage.targetShare != null) bits.push(`a ${fmtPct(f.usage.targetShare)} target share`);
     pos.push({ w:5, t:`Volume backs it up: ${bits.join(" and ")}.` });
   }
+  // tendency_usage_bump ("backup gets a bigger workload when the starter's out") is now backtestable against
+  // real nflverse historical injury reports too — and came back with no statistically real signal at this
+  // sample size (currently pruned to 0; see lib/modelCoeffs.js). The with/without split is still shown as a
+  // real, true number in the factor-chip breakdown either way (factorChipsHTML below), but it's only pushed as a
+  // supporting reason HERE when the model itself currently backs it (a real, kept, positive weight) — a pruned
+  // or not-yet-measured factor stays out of pos/caution entirely rather than being touted on an assumption the
+  // real data hasn't (yet) confirmed, matching every other factor on this card.
   if (f.tendency?.available){
-    const tLabel = f.tendency.statLabel || "production";
-    pos.push({ w:6, t:`${f.tendency.teammateName} is listed ${f.tendency.teammateStatus} this week — in games without him on the field, his ${tLabel} jumps to ${fmtNum(f.tendency.withoutAvg,1)}/game (vs ${fmtNum(f.tendency.withAvg,1)} with him active).` });
+    const w = nudgeWeight(r, "tendency_usage_bump");
+    if (w > 0){
+      const tLabel = f.tendency.statLabel || "production";
+      pos.push({ w:6, t:`${f.tendency.teammateName} is listed ${f.tendency.teammateStatus} this week — in games without him on the field, his ${tLabel} jumps to ${fmtNum(f.tendency.withoutAvg,1)}/game (vs ${fmtNum(f.tendency.withAvg,1)} with him active).` });
+    }
   }
   // The literal "this QB throws more yards/TDs indoors vs outdoors" split — informational rather than scored
   // as favorable or unfavorable, since knowing which way it cuts needs this week's actual stadium roof, which
@@ -424,13 +475,26 @@ function propReasoning(r){
   if (f.starterChange?.available && f.starterChange.changed){
     caution.push({ w:8, t:`This week's starter differs from ${r.team||"the team"}'s usual QB (${f.starterChange.usualStarter}, ${f.starterChange.usualStarterGames} starts) — recent form may not carry over.` });
   }
-  // Same bad-weather threshold and run/pass split lib/probability.js's weather nudge actually scores — see
+    // Same bad-weather threshold and run/pass split lib/probability.js's weather nudge actually scores — see
   // isBadWeather/RUN_PROPS/PASS_PROPS there. Personal wet/dry history (the block above) already covers the case
-  // where a specific player's own numbers cut against the generic positional read.
+  // where a specific player's own numbers cut against the generic positional read. weather_run_favor is now
+  // backtested against real nflverse history too (once a real run had network access to Open-Meteo's historical
+  // archive — see lib/modelCoeffs.js's own comment) and came back flipped negative, same "the whole game just
+  // slows down, not a specific run/pass shift" story as secondary_injury/front_seven_injury/game_script_pass_favor
+  // above — so this reads the real signed weight instead of assuming bad weather always favors the run.
+  // weather_pass_penalty came back real and in the originally-assumed direction (still a real headwind for
+  // passing), but is checked the same way for consistency and in case a future run moves it too.
   if (f.weatherForecast && ((f.weatherForecast.windMph||0) >= 15 || (f.weatherForecast.precipProb||0) >= 50)){
     const wx = `${fmtNum(f.weatherForecast.windMph,0)}mph wind${(f.weatherForecast.precipProb||0)>=50?` and a ${fmtNum(f.weatherForecast.precipProb,0)}% chance of precipitation`:''}`;
-    if (["rush_yds","td_rush"].includes(r.propType)) pos.push({ w:5, t:`Forecast calls for ${wx} at kickoff — bad weather tends to push game plans toward the run.` });
-    else if (["pass_yds","td_pass","rec_yds","receptions","td_rec"].includes(r.propType)) caution.push({ w:7, t:`Forecast calls for ${wx} at kickoff — worth discounting a passing-game prop for that.` });
+    if (["rush_yds","td_rush"].includes(r.propType)){
+      const w = nudgeWeight(r, "weather_run_favor");
+      if (w > 0) pos.push({ w:5, t:`Forecast calls for ${wx} at kickoff — bad weather tends to push game plans toward the run.` });
+      else if (w < 0) caution.push({ w:4, t:`Forecast calls for ${wx} at kickoff — but measured against real history, bad weather hasn't actually boosted rushing production here (more likely the whole game slows down, run and pass alike), so this isn't scored as a tailwind.` });
+    } else if (["pass_yds","td_pass","rec_yds","receptions","td_rec"].includes(r.propType)){
+      const w = nudgeWeight(r, "weather_pass_penalty");
+      if (w < 0) caution.push({ w:7, t:`Forecast calls for ${wx} at kickoff — worth discounting a passing-game prop for that.` });
+      else if (w > 0) pos.push({ w:3, t:`Forecast calls for ${wx} at kickoff — though measured against real history, passing production hasn't actually suffered in weather like this.` });
+    }
   }
   if (f.oLineInjury?.available && f.oLineInjury.count >= 2){
     caution.push({ w:6, t:`${r.team||"The"} offensive line is down ${f.oLineInjury.count} players to injury — a real protection/blocking concern.` });
@@ -854,7 +918,11 @@ function bookGridHTML(r){
   return `<span>${r.bestBook?`<span class="pill ${r.bestBook}">${BOOKS[r.bestBook].short}</span> <span class="odds">${fmtOdds(r.bestPrice)}</span>`:'—'}</span>`;
 }
 
-function factorChipsHTML(f){
+// Takes the full row `r` (not just r.factors) so it can look up the real signed weight behind the injury/
+// teammate-tendency/game-script chips below via nudgeWeight — same reasoning as propReasoning's own use of it:
+// the chip color should say what the model actually did with this fact, not assume it always cuts one way.
+function factorChipsHTML(r){
+  const f = r?.factors;
   if (!f) return "";
   const chips = [];
   if (f.matchupEdge?.available) chips.push(`<span class="chip ${f.matchupEdge.edge>0?'hit':'warn'}" title="This offense's EPA/play minus what the opponent's defense allows">Matchup edge: ${f.matchupEdge.edge>=0?'+':''}${fmtNum(f.matchupEdge.edge,3)} EPA</span>`);
@@ -868,7 +936,7 @@ function factorChipsHTML(f){
   if (f.twoMinute?.available) chips.push(`<span class="chip">2-min share: ${fmtPct(f.twoMinute.share)}</span>`);
   if (f.usage?.available && f.usage.snapPct!=null) chips.push(`<span class="chip ${f.usage.snapPct>=0.75?'hit':''}">${fmtPct(f.usage.snapPct)} snap</span>`);
   if (f.usage?.available && f.usage.targetShare!=null) chips.push(`<span class="chip ${f.usage.targetShare>=0.22?'hit':''}">${fmtPct(f.usage.targetShare)} tgt share</span>`);
-  if (f.tendency?.available) chips.push(`<span class="chip hit" title="${esc(f.tendency.teammateName)} — ${esc(f.tendency.teammateStatus||'')} — ${esc(f.tendency.statLabel||'')}">${esc(f.tendency.teammateName)} (${esc(f.tendency.teammateStatus||'')}): ${fmtNum(f.tendency.withoutAvg,1)} vs ${fmtNum(f.tendency.withAvg,1)} avg</span>`);
+  if (f.tendency?.available) { const w = nudgeWeight(r, "tendency_usage_bump"); chips.push(`<span class="chip ${w>0?'hit':''}" title="${esc(f.tendency.teammateName)} — ${esc(f.tendency.teammateStatus||'')} — ${esc(f.tendency.statLabel||'')}${w<=0?' — not currently a statistically significant pattern':''}">${esc(f.tendency.teammateName)} (${esc(f.tendency.teammateStatus||'')}): ${fmtNum(f.tendency.withoutAvg,1)} vs ${fmtNum(f.tendency.withAvg,1)} avg</span>`); }
   if (f.referee?.available) chips.push(`<span class="chip" title="n=${f.referee.gamesCalled} games">Ref ${esc(f.referee.refereeName)}: ${fmtPct(f.referee.overRate)} overs</span>`);
   if (f.qbr?.available) chips.push(`<span class="chip ${f.qbr.avgQbr>=75?'hit':f.qbr.avgQbr<=35?'warn':''}" title="Real ESPN Total QBR, trailing ${f.qbr.sampleGames} games">QBR: ${fmtNum(f.qbr.avgQbr,1)}</span>`);
   if (f.ngsPassing?.available) chips.push(`<span class="chip ${f.ngsPassing.cpoe>=3?'hit':f.ngsPassing.cpoe<=-3?'warn':''}" title="Completion % over expectation, Next Gen Stats">CPOE: ${f.ngsPassing.cpoe>=0?'+':''}${fmtNum(f.ngsPassing.cpoe,1)}</span>`);
@@ -887,9 +955,9 @@ function factorChipsHTML(f){
   if (f.weatherHistorical?.available) chips.push(`<span class="chip" title="${esc(f.weatherHistorical.statLabel||'')} per game">Wet/dry: ${fmtNum(f.weatherHistorical.wetAvg,1)} / ${fmtNum(f.weatherHistorical.dryAvg,1)} (n=${f.weatherHistorical.wetN})</span>`);
   if (f.birthday?.nearBirthday) chips.push(`<span class="chip hit">🎂 near birthday</span>`);
   if (f.oLineInjury?.available && f.oLineInjury.count>0) chips.push(`<span class="chip warn" title="${(f.oLineInjury.names||[]).map(esc).join(', ')}">O-line: ${f.oLineInjury.count} hurt</span>`);
-  if (f.secondaryInjury?.available && f.secondaryInjury.count>0) chips.push(`<span class="chip hit" title="${(f.secondaryInjury.names||[]).map(esc).join(', ')}">Opp. secondary: ${f.secondaryInjury.count} hurt</span>`);
-  if (f.frontSevenInjury?.available && f.frontSevenInjury.count>0) chips.push(`<span class="chip hit" title="${(f.frontSevenInjury.names||[]).map(esc).join(', ')}">Opp. front seven: ${f.frontSevenInjury.count} hurt</span>`);
-  if (f.gameScript?.available && (f.gameScript.isBigFavorite || f.gameScript.isBigUnderdog)) chips.push(`<span class="chip info" title="Vegas's own implied spread/total, read as context — not a bet offered here">Game script: ${f.gameScript.isBigFavorite ? `big favorite (−${fmtNum(Math.abs(f.gameScript.teamSpread),1)})` : `big underdog (+${fmtNum(f.gameScript.teamSpread,1)})`}</span>`);
+  if (f.secondaryInjury?.available && f.secondaryInjury.count>0) { const w = nudgeWeight(r, "secondary_injury"); chips.push(`<span class="chip ${w>0?'hit':(w<0?'warn':'')}" title="${(f.secondaryInjury.names||[]).map(esc).join(', ')}${w<0?' — measured negative against real history, not a tailwind':''}">Opp. secondary: ${f.secondaryInjury.count} hurt</span>`); }
+  if (f.frontSevenInjury?.available && f.frontSevenInjury.count>0) { const w = nudgeWeight(r, "front_seven_injury"); chips.push(`<span class="chip ${w>0?'hit':(w<0?'warn':'')}" title="${(f.frontSevenInjury.names||[]).map(esc).join(', ')}${w<0?' — measured negative against real history, not a tailwind':''}">Opp. front seven: ${f.frontSevenInjury.count} hurt</span>`); }
+  if (f.gameScript?.available && (f.gameScript.isBigFavorite || f.gameScript.isBigUnderdog)) { const w = nudgeWeight(r, f.gameScript.isBigFavorite ? "game_script_run_favor" : "game_script_pass_favor"); chips.push(`<span class="chip ${w<0?'warn':'info'}" title="Vegas's own implied spread/total, read as context — not a bet offered here${w<0?' — measured negative against real history for this side':''}">Game script: ${f.gameScript.isBigFavorite ? `big favorite (−${fmtNum(Math.abs(f.gameScript.teamSpread),1)})` : `big underdog (+${fmtNum(f.gameScript.teamSpread,1)})`}</span>`); }
   if (f.practiceTrend?.available) chips.push(`<span class="chip">Practice: ${esc(f.practiceTrend.trend)}</span>`);
   if (f.selfInjury) chips.push(`<span class="chip warn">${esc(f.selfInjury.status)}${f.selfInjury.detail?`: ${esc(f.selfInjury.detail)}`:''}</span>`);
   if (f.marketMovement?.available) chips.push(`<span class="chip info">Move: ${f.marketMovement.priceMove!=null?fmtOdds(f.marketMovement.priceMove):'—'}${f.marketMovement.pointMove?` / ${f.marketMovement.pointMove>0?'+':''}${f.marketMovement.pointMove}pt`:''} (${f.marketMovement.points} pts)</span>`);
@@ -972,7 +1040,7 @@ function edgeCardHTML(r){
   const market = r.line != null ? `${esc(r.propLabel)} ${esc(r.side||'')} ${r.line}` : esc(r.propLabel);
   const reasoning = propReasoning(r);
   const conf = confidenceScore(r);
-  const detail = gameLogTableHTML(r.factors) + factorChipsHTML(r.factors);
+  const detail = gameLogTableHTML(r.factors) + factorChipsHTML(r);
 
   return `<div class="edge-card ${r.suspect?'is-suspect':''}">
     <div class="ec-top">

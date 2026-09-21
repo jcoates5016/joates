@@ -412,12 +412,23 @@ const frontSevenInjuryFactorWorks = frontSevenResult.available === true && front
   !frontSevenResult.names.some(n => /Corner|Dt/.test(n));
 console.log("Opposing front-seven-injury factor counts only real DL/LB out/doubtful players, not CB/S or questionable ones (should be true):", frontSevenInjuryFactorWorks, frontSevenResult);
 
+// Checked against MODEL_COEFFS's real, currently-backtested value — NOT the original hand-set +0.15 intuition.
+// Once nflverse's real historical injury reports made this backtestable (scripts/backtest.js), it came back with
+// a real, kept, but NEGATIVE effect (mirroring the same counter-intuitive game_script_pass_favor finding below —
+// plausibly the same garbage-time-against-a-still-good-defense dynamic). Same "track whatever MODEL_COEFFS
+// currently says" discipline the game-script test below already established: if a future, larger backtest
+// re-measures this positive again, this test's expected direction should be revisited to match, not
+// hand-reverted back to assuming positive.
 const frontSevenNudge = estimatePropProbability({
   propType: "rush_yds", frontSevenInjury: { available: true, count: 1 },
   form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 }
 }, 0.55);
-const frontSevenNudgeFires = frontSevenNudge.modelProb > baseline && frontSevenNudge.contributors.some(c => /front seven hurt/.test(c));
-console.log("Front-seven-injury nudge fires on a rushing prop when the opponent has a real DL/LB injury on record (should be true):", frontSevenNudgeFires, { baseline, nudge: frontSevenNudge.modelProb });
+const expectFrontSevenDirection = MODEL_COEFFS.front_seven_injury > 0 ? "up" : MODEL_COEFFS.front_seven_injury < 0 ? "down" : "flat";
+const frontSevenMatchesDirection = expectFrontSevenDirection === "up" ? frontSevenNudge.modelProb > baseline
+  : expectFrontSevenDirection === "down" ? frontSevenNudge.modelProb < baseline
+  : Math.abs(frontSevenNudge.modelProb - baseline) < 0.0001;
+const frontSevenNudgeFires = frontSevenMatchesDirection && frontSevenNudge.contributors.some(c => /front seven hurt/.test(c));
+console.log(`Front-seven-injury nudge moves the estimate in whatever direction MODEL_COEFFS' real backtested value currently says (${expectFrontSevenDirection}) when the opponent has a real DL/LB injury on record (should be true):`, frontSevenNudgeFires, { baseline, nudge: frontSevenNudge.modelProb });
 
 // --- Vegas game-script context (lib/analyze.js's extractGameContext, lib/factors/index.js's computeGameScript) ---
 // A game with a real spread/total (read via SportsGameOdds' own oddID shape: points-home-game-sp-home for the

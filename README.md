@@ -185,6 +185,43 @@ The underlying bug is fixed (`lib/pipeline.js`'s merge line now only preserves w
 `true` or `false`, letting it recompute normally otherwise), so this was a one-time backfill, not a recurring
 maintenance task.
 
+### The `wasEdgeBoard` bug — most of history never got a real recommendation decision
+
+`lib/pipeline.js`'s merge step, on every refresh, used to carry a graded pick's `wasEdgeBoard` flag forward with
+`if (existing) p.wasEdgeBoard = existing.wasEdgeBoard;` — which only checks that `existing` (the saved pick
+object) is truthy, not that `existing.wasEdgeBoard` itself ever got set to a real `true`/`false`. The very first
+time a pick was saved before `wasEdgeBoard` had a real value on it, that `undefined` got copied forward on every
+later refresh, forever — and since the Track Record panel and Edge Board history only ever treat a truthy
+`wasEdgeBoard` as a real recommendation, `undefined` behaved identically to a rejection. A full-history audit
+(`scripts/audit-wasedgeboard.js`, read-only) found this had hit **531 of 559 graded picks (95%) all-time** —
+meaning the "recommended-only" track record shown for most of this app's history was built from a tiny, mostly
+meaningless leftover sample (14 true, 14 false) rather than the real one.
+
+Fixed to `if (existing?.wasEdgeBoard != null) p.wasEdgeBoard = existing.wasEdgeBoard;` — only carries the flag
+forward when it was actually ever resolved. `scripts/backfill-wasedgeboard.js` (dry-run/`--apply`, same pattern
+as `clean-live-line-contamination.js`) then recomputed the correct `wasEdgeBoard` for every affected pick — both
+graded and still-live — from its already-stored `edge`/`confidence` against the current `minEdgeFor()`, and
+rebuilt `calibrationLedger.recommended` from scratch via `foldIntoLedger`/`summarizeLedger` so the ledger's totals
+match the corrected per-pick flags exactly rather than accumulating on top of the old wrong ones. Run against the
+real production data, this recovered **215 previously-invisible real historical recommendations**, turning the
+honest all-time recommended-only track record into **229 picks, 83 hits (36.2%), Brier 0.2695** — high confidence
+71/176 (40.3%), medium confidence 12/53 (22.6%). This was the first statistically coherent picture this app has
+ever had of its own real recommendations (high outperforming medium, as it should) — the earlier "medium
+confidence somehow worse than low" anomaly documented elsewhere in this README turned out to be fully explained
+by Anytime TD contamination of the medium tier plus this bug, not a real defect in the confidence tiers
+themselves. `scripts/lookup-players.js` (read-only) was added alongside these to look up exactly what a specific
+player's saved props showed for a given date — useful for "why wasn't I alerted on X" questions, though it can't
+recover `teamMismatch`/`suspect` (never persisted) or show anything for a prop that never entered the ledger at
+all (missing trailing data, an unresolved identity, or the model marking it unavailable).
+
+**`MIN_TRUE_EDGE_MEDIUM = 0.10`** (`lib/pipeline.js`/`lib/topPicks.js`) followed directly from this corrected
+data: medium-confidence picks now need a real 10-point edge to count as a recommendation (vs. the 3-point
+baseline), the same "raise the bar on the specific tier the real data flagged as weak" philosophy Anytime TD's
+5x threshold already established — a gentler ~3.3x multiplier since medium confidence isn't as catastrophically
+bad as Anytime TD was. This is a reasoned starting point, not itself backtested (no historical `wasEdgeBoard`
+ledger existed before this fix created one) — worth revisiting once more real medium-confidence recommendation
+data accumulates under it.
+
 ## Probability model — how picks are actually ranked
 
 Every prior version of this build ranked picks with `computeMispricedScore`: a hand-tuned point total (+7 if
@@ -274,6 +311,36 @@ feed at all (opponent secondary injuries, opponent front-seven injuries, O-line 
 bump, market steam, real cross-book stale-line value, personal weather history — none of which nflverse, ESPN's
 injury feed, or this odds tier publishes historically) are left at hand-set defaults and reported as untested,
 not disproven.
+**Real historical injury reports now backtest four more factors.** `lib/fetchers/nflverse.js`'s
+`fetchInjuryHistory` pulls nflverse's own real weekly injury-report archive
+(`injuries_<season>.csv` — verified live before coding against it, same discipline every fetcher in that file
+follows) — official `report_status` (Out/Doubtful/Questionable/blank) per player per week, back to 2023. The file
+carries one row per practice-report day, not one per player-week, so `scripts/backtest.js`'s `buildInjuryIndex`
+collapses each player's rows down to the one with the latest `date_modified` before counting anything, giving the
+real final weekly designation rather than double-counting a player or reading a stale mid-week status. This
+finally makes `oline_injury_penalty`, `secondary_injury`, `front_seven_injury`, and `tendency_usage_bump`
+testable — all four used to sit at hand-set defaults forever with no historical injury feed to test them against.
+The walk-forward measurement replicates the exact same position sets and status-regex gating the live nudges use
+(`lib/factors/injury.js`'s `OL_POSITIONS`/`SECONDARY_POSITIONS`/`FRONT_SEVEN_POSITIONS`, and
+`lib/factors/index.js`'s `findKeyTeammate` for the teammate-tendency bump, called the same way the live app
+itself falls back — `depthChartIndex=null`, since per-week historical depth charts aren't practically available).
+
+A real run against 2023-2025 found: `oline_injury_penalty` is a real, kept signal in the expected direction (own
+team's O-line hurt is a genuine drag, though a milder one than the -0.2 hand-set default assumed — measured at
+roughly -0.09). `tendency_usage_bump` (the "backup gets a bigger workload when the starter's out" intuition) has
+**no statistically real signal at this sample size** and is now pruned to 0 — a real, honest answer to "does a
+backup's bump actually show up in the numbers," even though it's a null one for now (1,151 real qualifying
+player-weeks isn't nothing, but it's thin next to the ~35,000 rows behind the biggest factors). `secondary_injury`
+and `front_seven_injury` came back real and kept, but — like `game_script_pass_favor` below — in the *opposite*
+direction from their original positive hand-set intuition: an opponent's hurt secondary or front seven measures
+as a real negative for the affected pass-catcher/rusher's own numbers, not a boost, plausibly the same
+garbage-time-against-a-still-good-defense dynamic. Both cards' reasoning text and chip coloring
+(`public/index.html`'s `propReasoning`/`factorChipsHTML`) now read the actual signed weight off
+`row.modelContributorDetails` before deciding whether to call something a tailwind, a caution, or leave it out
+entirely — the same "never claim a favor the real data doesn't support" rule `matchup_edge`'s and
+`game_script_pass_favor`'s labels already followed, extended to the card copy itself rather than just the nudge
+label. Re-run `npm run backtest` to get the current numbers; treat the specific coefficients above as a snapshot
+of one real run, not a permanent verdict.
 
 **Real stale-line value now actually moves the model, not just a badge.** `lib/analyze.js`'s
 `computeBestAcrossBooks` has long told a genuinely mispriced, corroborated outlier book (`staleValue`) apart

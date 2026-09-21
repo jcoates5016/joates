@@ -15,10 +15,12 @@
 // beat the market." The live results ledger (lib/grading.js, README's "Probability model" section) is what
 // eventually answers the harder question, one real graded pick at a time as the app runs live.
 //
-// Factors with no historical feed available at all — opponent secondary injuries, O-line injuries, a
-// teammate-out usage bump, and market steam (all of which need either a historical injury-report archive or a
-// historical odds-movement archive, neither of which exists here) — are left at their hand-set defaults and
-// reported as untested, not disproven.
+// Opponent secondary injuries, O-line injuries, opposing front-seven injuries, and the teammate-out usage bump
+// are now backtested too — against nflverse's own real historical weekly injury reports (see
+// lib/fetchers/nflverse.js's fetchInjuryHistory; verified live before coding against it the same way every
+// other data source in this file was). Market steam and a few others still have no historical feed at all (no
+// historical odds-movement archive exists here) and stay hand-set — see HAND_SET_NOTES below for the current
+// list and why each one is still untested, not disproven.
 //
 // Walk-forward discipline: for a game in week W, every input (trailing stat average, defense-vs-position rank,
 // team EPA, snap share, red-zone share, starter continuity, rest/travel) is built only from weeks strictly
@@ -27,13 +29,13 @@
 //
 // Usage: node scripts/backtest.js [season ...]   (defaults to the last 3 calendar years)
 import fs from "node:fs";
-import { fetchMultiSeasonStats, fetchSchedule, fetchSnapCounts, fetchPlayByPlay } from "../lib/fetchers/nflverse.js";
-import { buildGameLogIndex, shortForm, pbpShortKey } from "../lib/identity.js";
+import { fetchMultiSeasonStats, fetchSchedule, fetchSnapCounts, fetchPlayByPlay, fetchRoster, fetchInjuryHistory } from "../lib/fetchers/nflverse.js";
+import { buildGameLogIndex, buildRosterIndex, shortForm, pbpShortKey } from "../lib/identity.js";
 import { buildTeamSeasonIndex } from "../lib/factors/teamStats.js";
 import { computeDefenseVsPosition, computeVenueSplit, statValueFn, PROP_TYPES } from "../lib/factors/playerSplits.js";
 import { computeMatchupEdge, computeScoringEnvironment, equalSplitCohortShare, pooledShare } from "../lib/factors/playerPbp.js";
 import { computeScheduleFactor, computeStarterChangeFactor } from "../lib/factors/schedule.js";
-import { BIG_SPREAD_THRESHOLD } from "../lib/factors/index.js";
+import { BIG_SPREAD_THRESHOLD, findKeyTeammate } from "../lib/factors/index.js";
 import { RUN_PROPS, PASS_PROPS } from "../lib/probability.js";
 import { fetchHistoricalWeather } from "../lib/fetchers/weather.js";
 import { STADIUMS } from "../lib/stadiums.js";
@@ -68,23 +70,77 @@ const BACKTESTED_KEYS = [
   // against nflverse's own historical referee/total/total_line schedule columns, using only games that referee
   // had already called strictly before the one being tested (see refereeFactorAsOf below). ngs_*/pressure_*
   // coefficients stay hand-set for now (see lib/modelCoeffs.js's own comment on those).
-  "referee_over_lean", "referee_under_lean"
+  "referee_over_lean", "referee_under_lean",
+  // Real nflverse historical weekly injury reports (fetchInjuryHistory) finally make these four testable — own
+  // O-line health (oline_injury_penalty), the opponent's secondary/front-seven health (secondary_injury/
+  // front_seven_injury, the pass/run mirrors of each other), and whether a player's own trailing numbers run hot
+  // in games his own "key teammate" (findKeyTeammate) was out/doubtful/questionable that week
+  // (tendency_usage_bump) — see buildInjuryIndex and the per-player-week block below for exactly how each one is
+  // replicated against the SAME position sets and status regexes the live nudges use (lib/factors/injury.js,
+  // lib/factors/playerSplits.js's computeTeammateOutTendency).
+  "oline_injury_penalty", "secondary_injury", "front_seven_injury", "tendency_usage_bump"
 ];
 
 // Why each coefficient NOT in BACKTESTED_KEYS is still hand-set — used by writeCoeffsFile to annotate the
 // generated file so the reason travels with the number instead of living only in this script's memory.
 const HAND_SET_NOTES = {
-  tendency_usage_bump: "not backtestable — no historical injury-report feed",
-  secondary_injury: "not backtestable — no historical injury-report feed",
-  oline_injury_penalty: "not backtestable — no historical injury-report feed",
   steam_move: "not backtestable — no historical odds-movement archive",
   stale_line_value: "not backtestable — no historical multi-book odds archive to replay cross-book corroboration against",
   weather_personal_boost: "not backtestable — no historical weather-forecast archive",
   weather_personal_penalty: "not backtestable — no historical weather-forecast archive",
   practice_trend_down: "not backtestable — no day-by-day historical practice-report archive",
-  practice_trend_up: "not backtestable — no day-by-day historical practice-report archive",
-  front_seven_injury: "not backtestable — no historical injury-report feed (mirrors secondary_injury)"
+  practice_trend_up: "not backtestable — no day-by-day historical practice-report archive"
 };
+
+// Same position sets and status-regex gating as the LIVE nudges (lib/factors/injury.js's
+// computeOLineInjuryFlag/computeOpposingSecondaryInjury/computeOpposingFrontSevenInjury) — copied rather than
+// imported since those live functions read the app's own `injuriesByTeam` shape (one fresh ESPN pull), not this
+// script's historical per-team-per-week CSV rows; same discipline as this file's own normName/scheduleGameScript
+// copies above. Note the asymmetric regex: O-line and the teammate-tendency check both count Questionable as
+// "limited" (LIMITED_RE), while secondary/front-seven only count Out/Doubtful (OUT_DOUBTFUL_RE) — that split is
+// real and intentional live, not a typo, so it's preserved here.
+const OL_POSITIONS = new Set(["T", "G", "C", "OT", "OG", "LT", "RT", "LG", "RG"]);
+const SECONDARY_POSITIONS = new Set(["CB", "S", "FS", "SS", "DB", "NB"]);
+const FRONT_SEVEN_POSITIONS = new Set(["DE", "DT", "NT", "DL", "LB", "ILB", "OLB", "EDGE"]);
+const LIMITED_RE = /out|doubtful|questionable/i;
+const OUT_DOUBTFUL_RE = /out|doubtful/i;
+function countInjured(list, positions, re) {
+  return list.filter(x => positions.has((x.position || "").toUpperCase()) && re.test(x.status || "")).length;
+}
+
+// nflverse's injuries_<season>.csv has one row per player PER PRACTICE-REPORT DAY (Wed/Thu/Fri), not one row per
+// player-week — confirmed live: Chiefs week-1 2024 alone shows several players with a blank report_status on
+// their Wednesday-dated row (still mid-week, no game status decided yet) who'd have a real one by their final
+// report. Collapsing to the row with the latest date_modified per (team, week, player) before counting anything
+// is what gets the real FINAL weekly designation instead of double-counting a player across his own multiple
+// practice-day rows or reading a stale mid-week status. gsis_id is preferred as the join key when present
+// (season-stable, unlike a name that can be spelled differently across files); falls back to normName(full_name)
+// for the handful of rows missing it.
+function buildInjuryIndex(rows) {
+  const latest = new Map(); // `${team}|${week}|${idKey}` -> most-recently-modified row for that player-week
+  for (const r of rows) {
+    const team = normTeam(r.team);
+    const week = Number(r.week);
+    if (!team || isNaN(week)) continue;
+    const idKey = r.gsis_id || normName(r.full_name);
+    if (!idKey) continue;
+    const key = `${team}|${week}|${idKey}`;
+    const cur = latest.get(key);
+    if (!cur || String(r.date_modified || "") > String(cur.date_modified || "")) latest.set(key, r);
+  }
+  const byTeamWeek = new Map();       // `${team}|${week}` -> [{ name, position, status }] (own-team AND opponent lookups both key off this)
+  const statusByTeamWeekName = new Map(); // `${team}|${week}` -> Map(normName(full_name) -> report_status) — for the teammate-tendency join
+  for (const r of latest.values()) {
+    const team = normTeam(r.team);
+    const week = Number(r.week);
+    const key = `${team}|${week}`;
+    if (!byTeamWeek.has(key)) byTeamWeek.set(key, []);
+    byTeamWeek.get(key).push({ name: r.full_name, position: (r.position || "").toUpperCase(), status: r.report_status || "" });
+    if (!statusByTeamWeekName.has(key)) statusByTeamWeekName.set(key, new Map());
+    statusByTeamWeekName.get(key).set(normName(r.full_name), r.report_status || "");
+  }
+  return { byTeamWeek, statusByTeamWeekName };
+}
 
 // Statistical pruning: before this, a factor's coefficient was shrunk only by SAMPLE SIZE (REG_K below) — a
 // factor with a tiny, meaningless lift but a huge N (thousands of rows) barely got shrunk at all, meaning noise
@@ -280,6 +336,14 @@ async function main() {
     const seasonSchedule = schedule.filter(s => Number(s.season) === season);
     const seasonPbp = await fetchPlayByPlay(season, log);
     const seasonSnaps = await fetchSnapCounts(season, log);
+    // Real historical injury reports + a season roster index — the roster index is only ever used as
+    // findKeyTeammate's volume-heuristic fallback input (called with depthChartIndex=null, since per-week
+    // historical depth charts aren't practically available), same fallback path the live app itself uses whenever
+    // its own depth-chart scrape has no entry for a team/position.
+    const seasonRosterRows = await fetchRoster(season, log);
+    const seasonRosterIndex = buildRosterIndex(seasonRosterRows);
+    const seasonInjuryRows = await fetchInjuryHistory(season, log);
+    const injuryIndex = buildInjuryIndex(seasonInjuryRows);
     if (!seasonStatRows.length) { log(`${season}: no stat rows returned, skipping.`); continue; }
 
     for (const week of weeks) {
@@ -298,6 +362,12 @@ async function main() {
       });
       const defCache = new Map(); // (opponent|position) -> computeDefenseVsPosition result, shared across every player facing that matchup this week
       const rzPlaysByTeam = groupRedZonePlaysByTeam(priorPbp);
+      // Injury-flag caches, keyed by team — real injury status is a team-week fact shared by every player on that
+      // team/facing that opponent this week, so (like defCache above) it's computed once per team per week rather
+      // than re-scanned for every individual player row.
+      const oLineCache = new Map();      // own team -> boolean (2+ O-line out/doubtful/questionable)
+      const secondaryCache = new Map();  // opponent team -> boolean (1+ secondary out/doubtful)
+      const frontSevenCache = new Map(); // opponent team -> boolean (1+ front-seven out/doubtful)
 
       for (const row of thisWeekRows) {
         const name = row.player_display_name || row.player_name || row.player;
@@ -327,6 +397,30 @@ async function main() {
         const highSnap = snapPct != null && snapPct >= 0.75;
         const rz = trailingRedZoneShare(rzPlaysByTeam, team, shortForm(name));
         const heavyRedZone = rz != null && rz >= 0.3;
+
+        // Real historical injury reads — own O-line, opponent secondary, opponent front seven (same position
+        // sets/status regexes the live nudges use, see the comment above buildInjuryIndex) — all team-week facts,
+        // so cached once per team per week rather than recomputed for every player on that team/facing that
+        // opponent.
+        if (!oLineCache.has(team)) oLineCache.set(team, countInjured(injuryIndex.byTeamWeek.get(`${team}|${week}`) || [], OL_POSITIONS, LIMITED_RE) >= 2);
+        const oLineFlag = oLineCache.get(team);
+        if (!secondaryCache.has(opponent)) secondaryCache.set(opponent, countInjured(injuryIndex.byTeamWeek.get(`${opponent}|${week}`) || [], SECONDARY_POSITIONS, OUT_DOUBTFUL_RE) >= 1);
+        const secondaryInjuryFlag = secondaryCache.get(opponent);
+        if (!frontSevenCache.has(opponent)) frontSevenCache.set(opponent, countInjured(injuryIndex.byTeamWeek.get(`${opponent}|${week}`) || [], FRONT_SEVEN_POSITIONS, OUT_DOUBTFUL_RE) >= 1);
+        const frontSevenInjuryFlag = frontSevenCache.get(opponent);
+
+        // Teammate-out usage-bump gate: is THIS player's real key teammate (same volume-heuristic fallback the
+        // live app itself falls back to — findKeyTeammate, called with depthChartIndex=null) listed
+        // out/doubtful/questionable this real historical week? Computed once per player-week (not per prop type,
+        // matching every factor above) since it doesn't depend on which prop is being tested — only the actual
+        // beat-your-own-trailing-average comparison inside the prop loop below does.
+        const keyTeammate = findKeyTeammate({ team, position, _logKey: logKey }, seasonRosterIndex, priorGameLogIndex, null);
+        let teammateLimited = false, teammateWeeksSet = null;
+        if (keyTeammate) {
+          const teammateStatus = injuryIndex.statusByTeamWeekName.get(`${team}|${week}`)?.get(keyTeammate) || "";
+          teammateLimited = LIMITED_RE.test(teammateStatus);
+          if (teammateLimited) teammateWeeksSet = new Set((priorGameLogIndex.get(keyTeammate) || []).map(r => Number(r.week)));
+        }
 
         let shortWeek = false, longTravel = false, starterChanged = false;
         // gameWasWet: null = unknown (no roof/venue/date to look up), true/false = a real Open-Meteo answer.
@@ -387,17 +481,37 @@ async function main() {
             record(buckets.referee_over_lean, refFactor.overRate >= 0.6, hit); mark("referee_over_lean", refFactor.overRate >= 0.6);
             record(buckets.referee_under_lean, refFactor.overRate <= 0.4, hit); mark("referee_under_lean", refFactor.overRate <= 0.4);
           }
+          // Own O-line health is ungated live (computeOLineInjuryFlag runs for every prop type, not just
+          // rushing/passing) so it's recorded here the same way, not folded into the RUN_PROPS/PASS_PROPS split
+          // below.
+          record(buckets.oline_injury_penalty, oLineFlag, hit); mark("oline_injury_penalty", oLineFlag);
+          // Teammate-out usage bump is also ungated live (the nudge itself has no propType condition) — the
+          // ACTUAL with/without split below does depend on which prop's stat is being compared, so it's computed
+          // fresh per prop type from the once-per-week teammateWeeksSet gate above, not cached across prop types.
+          let tendencyBump = false;
+          if (teammateLimited && teammateWeeksSet) {
+            const withoutVals = priorPlayerRows.filter(r => !teammateWeeksSet.has(Number(r.week))).map(statFor);
+            if (withoutVals.length >= 1) {
+              const withVals = priorPlayerRows.filter(r => teammateWeeksSet.has(Number(r.week))).map(statFor);
+              tendencyBump = avg(withoutVals) > (avg(withVals) || 0) * 1.15;
+            }
+          }
+          record(buckets.tendency_usage_bump, tendencyBump, hit); mark("tendency_usage_bump", tendencyBump);
 
-          // These five are gated to the same prop types the live nudges themselves are scoped to (RUN_PROPS/
+          // These seven are gated to the same prop types the live nudges themselves are scoped to (RUN_PROPS/
           // PASS_PROPS from lib/probability.js) — recording them against every prop type regardless, the way the
-          // nine factors above do, would mean asking "does bad weather predict a QB's own passing yards beating
+          // ungated factors above do, would mean asking "does bad weather predict a QB's own passing yards beating
           // HIS OWN trailing average" using rows where the nudge could never have fired live in the first place.
+          // secondary_injury/front_seven_injury are pass/run mirrors of each other, same reasoning as
+          // weather_pass_penalty/weather_run_favor and game_script_pass_favor/game_script_run_favor just below.
           if (RUN_PROPS.has(propType)) {
             if (gameWasWet != null) { record(buckets.weather_run_favor, gameWasWet === true, hit); mark("weather_run_favor", gameWasWet === true); }
             if (gameScript.available) { record(buckets.game_script_run_favor, gameScript.isBigFavorite, hit); mark("game_script_run_favor", gameScript.isBigFavorite); }
+            record(buckets.front_seven_injury, frontSevenInjuryFlag, hit); mark("front_seven_injury", frontSevenInjuryFlag);
           } else if (PASS_PROPS.has(propType)) {
             if (gameWasWet != null) { record(buckets.weather_pass_penalty, gameWasWet === true, hit); mark("weather_pass_penalty", gameWasWet === true); }
             if (gameScript.available) { record(buckets.game_script_pass_favor, gameScript.isBigUnderdog, hit); mark("game_script_pass_favor", gameScript.isBigUnderdog); }
+            record(buckets.secondary_injury, secondaryInjuryFlag, hit); mark("secondary_injury", secondaryInjuryFlag);
 
             // venue_edge: only means something once a real dome-vs-outdoor split (2+ games each way) is
             // cross-referenced against which one THIS week's game actually is — same gating as the live nudge in
@@ -541,12 +655,15 @@ ${uncategorized.map(line).join("\n")}\n`
 // See scripts/backtest.js's header for exactly what this backtest can and can't prove, and README's
 // "Probability model" section for the plain-language version.
 export const MODEL_COEFFS = {
-  // Not backtested (scripts/backtest.js only touches the named factor coefficients below) — hand-set at 12
-  // "games" of trust behind the market's own number after checking it against dry-run's thin-vs-deep-sample
-  // regression test: at 6, a bare 2-game 100% streak alone moved the estimate over 12 points off the market,
-  // almost as aggressively as a real 10+3-game trend — exactly the kind of small-sample overreaction the old
-  // point-scoring system was built on. At 12, the same 2-game streak moves it ~7 points while a real deep trend
-  // still moves it ~20.
+  // marketPriorWeight is not backtested (scripts/backtest.js only touches the named factor coefficients below) —
+  // hand-set at 12 "games" of trust behind the market's own number after checking it against dry-run's
+  // thin-vs-deep-sample regression test: at 6, a bare 2-game 100% streak alone moved the estimate over 12 points
+  // off the market, almost as aggressively as a real 10+3-game trend — exactly the kind of small-sample
+  // overreaction the old point-scoring system was built on. At 12, the same 2-game streak moves it ~7 points
+  // while a real deep trend still moves it ~20. tendency_usage_bump/secondary_injury/oline_injury_penalty below,
+  // by contrast, ARE now backtested — against nflverse's real historical weekly injury reports (see
+  // buildInjuryIndex above and this script's own header comment) — steam_move/stale_line_value are the two
+  // still genuinely hand-set in this group (no historical odds-movement/multi-book archive exists to test them).
   marketPriorWeight: ${c.marketPriorWeight},
 
 ${CORE_KEYS.map(line).join("\n")}
@@ -558,11 +675,10 @@ ${CORE_KEYS.map(line).join("\n")}
   // per-player historical forecast archive or day-by-day practice-report history to replay them against.
 ${WEATHER_VENUE_KEYS.map(line).join("\n")}
 
-  // Opposing front-seven injuries (run-game mirror of secondary_injury above) and game-script (Vegas's own
-  // implied spread/total, read as context rather than a bet — see factors/index.js's computeGameScript).
-  // game_script_run_favor/game_script_pass_favor are backtested against nflverse's own historical
-  // spread_line/total_line columns; front_seven_injury stays hand-set for the same reason secondary_injury does
-  // — no historical injury-report archive exists to replay it against.
+  // Opposing front-seven injuries (run-game mirror of secondary_injury above, now backtested the same way — real
+  // nflverse historical injury reports) and game-script (Vegas's own implied spread/total, read as context
+  // rather than a bet — see factors/index.js's computeGameScript), backtested against nflverse's own historical
+  // spread_line/total_line columns.
 ${GAME_SCRIPT_KEYS.map(line).join("\n")}
 
   // Referee tendency, revived as a non-bettable context factor after this build dropped its Totals market (see
