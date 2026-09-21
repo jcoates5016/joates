@@ -1,10 +1,10 @@
 // Runs the full pipeline against the demo dataset — no API keys needed. Confirms every factor category at
 // least runs without throwing, and prints a self-check summary. Player-props only now — game lines/moneylines
 // were removed from this build entirely (see analyze.js/probability.js/parlays.js/README).
-import { runPipeline, buildEdgeBoardHistory } from "../lib/pipeline.js";
+import { runPipeline, buildEdgeBoardHistory, buildPropBetsHistory } from "../lib/pipeline.js";
 import { estimatePropProbability } from "../lib/probability.js";
 import { MODEL_COEFFS } from "../lib/modelCoeffs.js";
-import { gradeCompletedPicks, foldIntoLedger, summarizeLedger } from "../lib/grading.js";
+import { gradeCompletedPicks, gradeCompletedParlays, foldIntoLedger, summarizeLedger } from "../lib/grading.js";
 import { buildRosterIndex, buildDepthChartIndex, resolvePlayer } from "../lib/identity.js";
 import { findKeyTeammate, computeGameScript } from "../lib/factors/index.js";
 import { computeOpposingFrontSevenInjury, computeInjuryEscalations } from "../lib/factors/injury.js";
@@ -19,7 +19,6 @@ import { fitJointLogisticWithWaldTest } from "../lib/regularizedFit.js";
 import { computeBestAcrossBooks, extractGameContext } from "../lib/analyze.js";
 import { buildDemoData } from "../lib/demoData.js";
 import { fetchNFLEvents } from "../lib/fetchers/odds.js";
-import { annotatePropsWithAI, annotateScoutingTakes, selectAiEligible, roundForHash, createSpendGuard, estimateCostUsd } from "../lib/ai.js";
 import { classifyKickoffWindow, summarizeEvents, buildAllParlays, buildSameGameParlays, buildSlateParlays, RISK_TIERS, MIN_LEG_PROBABILITY, MEGA_TARGET_DECIMAL, MEGA_MIN_LEGS, NUKE_LEGS } from "../lib/parlays.js";
 import { americanToDecimal } from "../lib/oddsMath.js";
 import { buildTopPicks, pickTopReasons, pickBlurb, PICK_CATEGORIES } from "../lib/topPicks.js";
@@ -28,7 +27,7 @@ const SEASON = 2026;
 
 const snapshot = await runPipeline({
   demo: true, currentSeason: SEASON, historySeasons: [SEASON, SEASON - 1, SEASON - 2],
-  selectedWeek: 5, situationalNotes: [], aiOn: false, scoutOn: false
+  selectedWeek: 5, situationalNotes: []
 });
 
 console.log("=== STATS ===");
@@ -610,6 +609,63 @@ const limitedHistory = buildEdgeBoardHistory(manyEdgeBoardPicks, 3);
 const edgeBoardLimitWorks = limitedHistory.picks.length === 3 && limitedHistory.total === 3 && limitedHistory.picks[0].oddID === "eb-9";
 console.log("buildEdgeBoardHistory's limit caps the returned list to the most recent N picks (should be true):", edgeBoardLimitWorks, limitedHistory.picks.map(p => p.oddID));
 
+// --- Prop Bets history (lib/pipeline.js's buildPropBetsHistory) ---
+// The unfiltered sibling of buildEdgeBoardHistory above — every graded pick counts here, Edge-Board-flagged or
+// not, since the whole point (Jon's ask) is seeing "which bets from the edge board, which from the prop bets"
+// as two separate, honest views rather than the Edge Board's own narrower subset.
+const propBetsHistoryResult = buildPropBetsHistory(edgeBoardFixture);
+const propBetsHistoryWorks = propBetsHistoryResult.total === 3 && propBetsHistoryResult.hits === 2 &&
+  propBetsHistoryResult.picks[0].oddID === "not-eb" && // most recent kickoff first (2026-10-12T18:00 beats eb-miss's 2026-10-12T17:00)
+  propBetsHistoryResult.picks.some(p => p.oddID === "not-eb") && !propBetsHistoryResult.picks.some(p => p.oddID === "eb-ungraded");
+console.log("buildPropBetsHistory counts every graded pick regardless of wasEdgeBoard, sorted most-recent-first (should be true):", propBetsHistoryWorks, propBetsHistoryResult);
+
+// --- Parlay grading (lib/grading.js's gradeCompletedParlays) ---
+// Fail-fast design: a parlay with any confirmed-miss leg grades as a loss immediately, even while its other
+// legs' games haven't kicked off yet — no reason to make Jon wait out a whole slate to learn a Thursday-night
+// leg already busted it. A hit, by contrast, needs every leg's game to have graded AND hit.
+const parlayGameLog = new Map([
+  ["parlay leg a", [{ season: 2026, week: 5, receiving_yards: 90 }]], // clears its 59.5 line -> hit
+  ["parlay leg b", [{ season: 2026, week: 5, receiving_yards: 40 }]], // misses its 59.5 line -> miss
+  ["parlay leg c", [{ season: 2026, week: 5, rushing_yards: 120 }]]   // clears its 79.5 line -> hit
+]);
+function fakeLeg(oddID, playerKey, propType, line, kickoffIso) {
+  return { oddID, playerKey, player: playerKey, propType, propLabel: propType, line, side: "over", kickoff: kickoffIso, season: 2026, week: 5, graded: false, hit: null, actualValue: null };
+}
+// Parlay 1: one leg already kicked off & graded as a miss (leg B), one leg's game hasn't reached the grading
+// delay yet (leg A, kicked off 6h before `now`) — must grade hit:false immediately without waiting on leg A.
+const failFastParlay = {
+  key: "test:fail-fast", contextLabel: "Test", tierLabel: "Low Risk", book: "draftkings", combinedAmerican: 250, combinedProb: 0.3,
+  season: 2026, week: 5, kickoff: "2026-10-10T06:00:00Z", graded: false, hit: null, gradedAt: null,
+  legs: [fakeLeg("pl-a", "parlay leg a", "rec_yds", 59.5, "2026-10-10T06:00:00Z"), fakeLeg("pl-b", "parlay leg b", "rec_yds", 59.5, "2026-10-05T17:00:00Z")]
+};
+// Parlay 2: both legs already final and both hit -> must grade hit:true.
+const fullHitParlay = {
+  key: "test:full-hit", contextLabel: "Test", tierLabel: "Low Risk", book: "draftkings", combinedAmerican: 250, combinedProb: 0.3,
+  season: 2026, week: 5, kickoff: "2026-10-05T17:00:00Z", graded: false, hit: null, gradedAt: null,
+  legs: [fakeLeg("pl-c", "parlay leg a", "rec_yds", 59.5, "2026-10-05T17:00:00Z"), fakeLeg("pl-d", "parlay leg c", "rush_yds", 79.5, "2026-10-05T17:00:00Z")]
+};
+// Parlay 3: its only leg hasn't reached the grading delay yet -> must stay ungraded (pending), not miss or hit.
+const pendingParlay = {
+  key: "test:pending", contextLabel: "Test", tierLabel: "Low Risk", book: "draftkings", combinedAmerican: 250, combinedProb: 0.3,
+  season: 2026, week: 5, kickoff: "2026-10-10T06:00:00Z", graded: false, hit: null, gradedAt: null,
+  legs: [fakeLeg("pl-e", "parlay leg a", "rec_yds", 59.5, "2026-10-10T06:00:00Z")]
+};
+const testParlays = [failFastParlay, fullHitParlay, pendingParlay];
+const gradedParlaysNow = gradeCompletedParlays(testParlays, parlayGameLog, now);
+const parlayFailFastWorks = failFastParlay.graded === true && failFastParlay.hit === false &&
+  failFastParlay.legs.find(l => l.oddID === "pl-b").graded === true && failFastParlay.legs.find(l => l.oddID === "pl-a").graded !== true;
+const parlayFullHitWorks = fullHitParlay.graded === true && fullHitParlay.hit === true &&
+  fullHitParlay.legs.every(l => l.graded === true && l.hit === true);
+const parlayPendingWorks = pendingParlay.graded !== true && pendingParlay.hit === null;
+const parlayGradingWorks = parlayFailFastWorks && parlayFullHitWorks && parlayPendingWorks && gradedParlaysNow.length === 2;
+console.log("gradeCompletedParlays fails fast on any confirmed-miss leg, only confirms a hit once every leg graded+hit, and leaves a not-yet-final parlay pending (should be true):",
+  parlayGradingWorks, { failFastParlay, fullHitParlay, pendingParlay });
+// Re-grading the same parlays a second time must never re-process an already-graded one (same double-count
+// guard as gradeCompletedPicks) — the still-pending one is the only one left to (still not) grade.
+const regradedParlaysNow = gradeCompletedParlays(testParlays, parlayGameLog, now);
+const parlayRegradeGuardWorks = regradedParlaysNow.length === 0;
+console.log("Already-graded parlays are never re-graded on a later pass (should be true):", parlayRegradeGuardWorks);
+
 // --- Top Picks (lib/topPicks.js) ---
 // Category grouping, the quality bar (same as Edge Board's), sort-by-edge, and the limit cap — all in one
 // synthetic "rush_yds" slate with deliberate disqualifiers mixed in (low confidence, suspect, team mismatch,
@@ -988,127 +1044,6 @@ globalThis.fetch = realFetch;
 const oddsResilienceWorks = oddsFetchCallCount === 2 && oddsResult.length === 1 && oddsResult[0].eventID === "e1";
 console.log("A single unavailable bookmakerID is dropped and the request retried, not a total failure (should be true):", oddsResilienceWorks, `calls=${oddsFetchCallCount}`);
 
-// --- AI annotation concurrency (lib/ai.js) ---
-// Regression guard for a real live incident: right after this session's probability-model rebuild, every row's
-// AI-note cache hash changed at once (the hash is of the content actually sent to Claude, and that shape
-// changed), so a fully cold cache sent every batch, across every annotation pass, strictly one after another —
-// a live refresh ran past 13 minutes still waiting on sequential Anthropic round-trips. Any future change that
-// shifts enough rows' content causes the same full-cache-miss again, so batches must run several at a time
-// (bounded, not unlimited) rather than one at a time.
-const realAiFetch = globalThis.fetch;
-let aiCallsInFlight = 0, aiMaxConcurrent = 0, aiCallCount = 0;
-globalThis.fetch = async (url) => {
-  if (!String(url).includes("api.anthropic.com")) return realAiFetch(url);
-  aiCallCount++;
-  aiCallsInFlight++;
-  aiMaxConcurrent = Math.max(aiMaxConcurrent, aiCallsInFlight);
-  await new Promise(r => setTimeout(r, 30));
-  aiCallsInFlight--;
-  const fakeResults = Array.from({ length: 30 }, (_, i) => ({ id: i, tag: "lean-over", note: "synthetic test note" }));
-  return { ok: true, status: 200, json: async () => ({ content: [{ text: JSON.stringify(fakeResults) }] }) };
-};
-// 65 rows at annotatePropsWithAI's batch size of 30 makes 3 batches — enough to prove they overlap.
-// `_aiSelected: true` stands in for pipeline.js's real top-AI_NOTE_LIMIT-by-modelProb selection (see the cost
-// controls test below) — annotatePropsWithAI only considers rows already marked this way.
-const syntheticProps = Array.from({ length: 65 }, (_, i) => ({
-  oddID: `p-${i}`, player: `Demo Player ${i}`, team: "KC", opponent: "BUF", propLabel: "Receiving yards", side: "over", line: 49.5,
-  bestBook: "draftkings", bestPrice: -110, suspect: false, teamMismatch: false, factors: {}, _aiSelected: true
-}));
-await annotatePropsWithAI(syntheticProps, "fake-key", {}, () => {});
-globalThis.fetch = realAiFetch;
-const aiConcurrencyWorks = aiCallCount === 3 && aiMaxConcurrent >= 2;
-console.log("AI annotation batches run concurrently, not strictly one-at-a-time (should be true):", aiConcurrencyWorks, `calls=${aiCallCount} maxConcurrent=${aiMaxConcurrent}`);
-
-// --- Anthropic cost controls (lib/ai.js) ---
-// Regression guard for a real cost review: AI notes used to go out for every non-suspect card on the board,
-// on a schedule running every 30 minutes, with the AI model itself set to the most expensive tier — a genuine
-// spend problem. selectAiEligible must pick only the real top AI_NOTE_LIMIT props by modelProb ("most likely to
-// hit"), and must still exclude a suspect/mismatched/unscored row even if its raw modelProb would otherwise put
-// it in the top slice.
-const manyProps = Array.from({ length: 60 }, (_, i) => ({
-  oddID: `p-${i}`, suspect: false, teamMismatch: false, model: { available: true }, modelProb: i / 100 // 0.00..0.59
-}));
-const edgeCaseProps = [
-  { oddID: "p-high-suspect", suspect: true, teamMismatch: false, model: { available: true }, modelProb: 0.95 }, // high prob but suspect -> excluded
-  { oddID: "p-high-mismatch", suspect: false, teamMismatch: true, model: { available: true }, modelProb: 0.93 }, // high prob but team mismatch -> excluded
-  { oddID: "p-high-unscored", suspect: false, teamMismatch: false, model: { available: false }, modelProb: null } // model never resolved -> excluded
-];
-const selected = selectAiEligible([...manyProps, ...edgeCaseProps], 50);
-const selectedIds = new Set(selected.map(r => r.oddID));
-// The top 50 props by modelProb (i=59 down to i=10) — the 3 edge-case rows never qualify at all, so they can't
-// take a slot away from a real, scoreable prop the way an eligible "always makes the cut" row used to.
-const top50PropIds = new Set(manyProps.slice(10, 60).map(r => r.oddID));
-const aiSelectionWorks = selected.length === 50 &&
-  !selectedIds.has("p-high-suspect") && !selectedIds.has("p-high-mismatch") && !selectedIds.has("p-high-unscored") &&
-  [...top50PropIds].every(id => selectedIds.has(id)) && !selectedIds.has("p-0") && !selectedIds.has("p-9") &&
-  manyProps.filter(r => r._aiSelected).length === 50;
-console.log("selectAiEligible keeps only the top AI_NOTE_LIMIT props by real modelProb, excluding suspect/mismatched/unscored regardless of their raw probability (should be true):", aiSelectionWorks, `selected=${selected.length}`);
-
-// Regression guard for the cache-loosening fix: two content objects that differ only by noise (a price moving a
-// cent, a rate drifting a fraction of a point) must hash identically via roundForHash, while a genuinely
-// different value must not.
-const noisyA = { price: -110, rate: 0.601, wind: 11, note: "x" };
-const noisyB = { price: -111, rate: 0.609, wind: 12, note: "x" };
-const realChange = { price: -110, rate: 0.75, wind: 11, note: "x" };
-const cacheLoosening = JSON.stringify(roundForHash(noisyA)) === JSON.stringify(roundForHash(noisyB)) &&
-  JSON.stringify(roundForHash(noisyA)) !== JSON.stringify(roundForHash(realChange));
-console.log("roundForHash absorbs trivial noise but still catches a real change (should be true):", cacheLoosening, roundForHash(noisyA), roundForHash(realChange));
-
-// Regression guard for the new daily Anthropic spend cap: real, current per-million-token pricing (Haiku 4.5
-// $1/$5, Sonnet 5 $2/$10, Opus 5 $5/$25) computed from the API's own token-usage response, never a payload-size
-// guess — and an unrecognized future model name still gets a conservative estimate rather than silently costing $0.
-const millionTokUsage = { input_tokens: 1_000_000, output_tokens: 1_000_000 };
-const costEstimatesAreCorrect =
-  Math.abs(estimateCostUsd("claude-haiku-4-5-20251001", millionTokUsage) - 6) < 0.0001 &&
-  Math.abs(estimateCostUsd("claude-sonnet-5-20250929", millionTokUsage) - 12) < 0.0001 &&
-  Math.abs(estimateCostUsd("claude-opus-5-20250915", millionTokUsage) - 30) < 0.0001 &&
-  estimateCostUsd("some-future-model", millionTokUsage) > 0 &&
-  estimateCostUsd("claude-haiku-4-5", null) === 0;
-console.log("estimateCostUsd prices Haiku/Sonnet/Opus correctly from real token usage, estimates conservatively for an unknown model, and costs $0 with no usage (should be true):", costEstimatesAreCorrect);
-
-// The spend guard must actually flip to exhausted once today's recorded spend reaches the cap (a best-effort
-// stop point checked between waves of concurrent AI calls, not a mid-batch kill switch — it can overshoot by
-// one in-flight wave, which is a documented, deliberate tradeoff, not a bug), and must roll over to a fresh $0
-// ledger on a new UTC calendar day, archiving the prior day's total into history rather than discarding it.
-const freshGuard = createSpendGuard({ date: null, spentUsd: 0, callCount: 0, history: [] }, 5);
-const notExhaustedBelowCap = freshGuard.exhausted === false;
-freshGuard.record(3);
-freshGuard.record(2.5);
-const spendGuardCapWorks = notExhaustedBelowCap && freshGuard.exhausted === true &&
-  freshGuard.snapshot().callCount === 2 && Math.abs(freshGuard.snapshot().spentUsd - 5.5) < 0.001;
-console.log("Spend guard stays open below the cap, then flips exhausted once recorded spend reaches it (should be true):", spendGuardCapWorks, freshGuard.snapshot());
-
-const todayIso = new Date().toISOString().slice(0, 10);
-const yesterdayLedger = { date: "2020-01-01", spentUsd: 4.87, callCount: 40, history: [] };
-const rolloverGuard = createSpendGuard(yesterdayLedger, 5);
-const rolloverWorks = rolloverGuard.exhausted === false && rolloverGuard.snapshot().date === todayIso &&
-  rolloverGuard.snapshot().spentUsd === 0 && rolloverGuard._ledger.history.some(h => h.date === "2020-01-01" && h.spentUsd === 4.87);
-console.log("A new UTC calendar day resets the spend guard to $0 and archives the prior day's total into history, rather than carrying its spend forward (should be true):", rolloverWorks, rolloverGuard.snapshot());
-
-// Regression guard for the scouting-takes throttle: cacheOnly mode must reuse whatever's already cached (for
-// free) but make ZERO fresh Anthropic calls for anything not already sitting in cache, even though those rows
-// are otherwise eligible. Uncached rows just stay unset until the next full (non-throttled) run.
-const realScoutFetch = globalThis.fetch;
-let scoutCallCount = 0;
-globalThis.fetch = async (url) => {
-  if (!String(url).includes("api.anthropic.com")) return realScoutFetch(url);
-  scoutCallCount++;
-  return { ok: true, status: 200, json: async () => ({ content: [{ text: JSON.stringify([{ id: 0, note: "fresh" }]) }] }) };
-};
-const scoutRowCached = { oddID: "sc-cached", _aiSelected: true, teamMismatch: false, suspect: false, propType: "rec_yds", player: "A", team: "KC", opponent: "BUF", propLabel: "Receiving yards" };
-const scoutRowUncached = { oddID: "sc-fresh", _aiSelected: true, teamMismatch: false, suspect: false, propType: "rec_yds", player: "B", team: "KC", opponent: "BUF", propLabel: "Receiving yards" };
-const scoutCache = {};
-// Prime the cache for scoutRowCached by running once, uncached (cacheOnly: false), with only that row present.
-await annotateScoutingTakes([scoutRowCached], "fake-key", scoutCache, () => {}, { cacheOnly: false });
-const callsAfterPriming = scoutCallCount;
-// Now the "throttled" run: both rows present, cacheOnly: true. The cached row should be reapplied for free;
-// the new row should be skipped entirely, with no additional Anthropic call.
-scoutRowCached.scouting = null; // clear so we can tell whether the cache-only pass actually re-applied it
-await annotateScoutingTakes([scoutRowCached, scoutRowUncached], "fake-key", scoutCache, () => {}, { cacheOnly: true });
-const scoutingThrottleWorks = scoutCallCount === callsAfterPriming && !!scoutRowCached.scouting && scoutRowUncached.scouting === undefined;
-globalThis.fetch = realScoutFetch;
-console.log("Scouting throttle (cacheOnly) reuses cached notes for free and skips uncached rows without a new call (should be true):", scoutingThrottleWorks, `calls=${scoutCallCount}`, scoutRowCached.scouting, scoutRowUncached.scouting);
-
 // --- Same Game / Slate / cross-game parlays (lib/parlays.js) — fixed absolute-probability-band tiers ---
 // Regression guard for the kickoff-window classifier: the real live bug this guards against is a hardcoded UTC
 // offset, which would get exactly ONE of these two dates wrong. Oct 25, 2026 and Nov 1, 2026 are both real
@@ -1321,8 +1256,9 @@ console.log("Joint logistic fit + Wald test rejects pure noise, keeps a smaller 
 
 if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
   !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !staleLineValueWorks || !frontSevenInjuryFactorWorks || !frontSevenNudgeFires || !gameContextIsCorrect || !noOddsContextWorks || !stringPayloadNudgeWorks || !gameScriptWorks || !gameScriptNudgesWork || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks || !edgeBoardHistoryWorks || !edgeBoardLimitWorks ||
-  !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks || !aiConcurrencyWorks ||
-  !aiSelectionWorks || !cacheLoosening || !costEstimatesAreCorrect || !spendGuardCapWorks || !rolloverWorks || !scoutingThrottleWorks || !newCoeffsPresent ||
+  !propBetsHistoryWorks || !parlayGradingWorks || !parlayRegradeGuardWorks ||
+  !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks ||
+  !newCoeffsPresent ||
   !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
   !crossGameMegaNuke.ok || !allSgpMegaNukeValid || !allSlateMegaNukeValid || !demo5MegaCanPoolAcrossBands ||
   !slateGameCountsAreCorrect || !slateFillsEveryTierAcrossGames || !lateSlateFillsEveryTierAcrossGames || !thursdayGameNeverJoinsASlate || !tierLadderIsContinuous ||

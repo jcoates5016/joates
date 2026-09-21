@@ -1,20 +1,18 @@
 name: Refresh APEX Edge data
 
 on:
-  # No `schedule:` trigger on purpose — this used to run every 30 minutes automatically, which (combined with
-  # every prop/game-line getting an AI note) was the main driver of a real Anthropic cost problem. Refreshes are
-  # manual-only now: either "Run workflow" here, or the site's "Refresh Now" button (which fires this same
-  # workflow_dispatch via netlify/functions/trigger-refresh.js) — nothing runs on its own anymore. Re-adding a
-  # `schedule:` block here is how a future auto-refresh would come back if that tradeoff changes.
+  # No `schedule:` trigger on purpose — this used to run every 30 minutes automatically, which was the main
+  # driver of a real cost/usage problem (see README's "Manual-only refresh" section for the full history).
+  # Refreshes are manual-only now: either "Run workflow" here, or the site's "Refresh Now" button (which fires
+  # this same workflow_dispatch via netlify/functions/trigger-refresh.js) — nothing runs on its own anymore.
+  # Re-adding a `schedule:` block here is how a future auto-refresh would come back if that tradeoff changes.
   workflow_dispatch: {}
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    # Bumped from 20: a live cold-cache run (every AI note needing regeneration at once, right after the
-    # probability-model rebuild changed every row's cache-hash — see the CONCURRENCY comment in lib/ai.js) ran
-    # past 13 minutes before batches were parallelized. Kept as a safety margin, not the expected runtime —
-    # a normal warm-cache refresh should finish in well under this.
+    # The full pipeline (odds, nflverse + play-by-play, weather) is data-fetch-bound, not compute-bound — 25
+    # minutes is a safety margin, not the expected runtime; a normal refresh finishes well under this.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -25,8 +23,6 @@ jobs:
       - run: node scripts/refresh.js
         env:
           SPORTSGAMEODDS_API_KEY: ${{ secrets.SPORTSGAMEODDS_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
           CURRENT_SEASON: ${{ secrets.CURRENT_SEASON }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
           NETLIFY_BLOBS_TOKEN: ${{ secrets.NETLIFY_BLOBS_TOKEN }}

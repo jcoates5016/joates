@@ -86,10 +86,6 @@
   .ec-reasoning{margin:14px 0 0;font-size:14px;line-height:1.55;color:#d6d6da;}
   .ec-model{margin-top:10px;}
   .ec-model .chip{font-weight:600;}
-  .ec-ai{margin-top:10px;padding:11px 13px;background:var(--card2);border-radius:var(--radius-sm);font-size:13px;}
-  .ec-ai-tag{display:inline-block;background:var(--blue);color:#001838;font-weight:700;font-size:10px;padding:2px 8px;border-radius:20px;margin-right:7px;text-transform:uppercase;letter-spacing:.02em;}
-  .ec-scout{margin-top:8px;padding:11px 13px;background:var(--amber-dim);border-radius:var(--radius-sm);font-size:12.5px;}
-  .ec-scout .label{color:var(--amber);font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.03em;display:block;margin-bottom:4px;}
   .ec-expand{margin-top:12px;background:var(--card2);border:none;color:var(--text);border-radius:999px;padding:6px 13px;font-size:11.5px;font-weight:600;cursor:pointer;}
   .ec-detail{margin-top:14px;padding-top:14px;border-top:1px solid var(--border);}
 
@@ -172,7 +168,6 @@
       <span class="badge none" id="modeBadge">Loading</span>
       <button class="primary" id="refreshBtn">Refresh Now</button>
       <span class="lastrun" id="lastRun"></span>
-      <span class="lastrun" id="spendStatus" title="Only a triggered refresh (this button, or a scheduled GitHub Actions run) spends anything — just having this page open costs $0. See Setup for details."></span>
     </div>
   </header>
 
@@ -188,7 +183,10 @@
 
   <!-- TOP PICKS -->
   <section class="view active" id="view-picks">
-    <div class="picks-intro">The single sharpest, most mispriced pick in each category this week — sorted by real edge (model probability vs. the market's own price), same medium/high-confidence bar as the Edge Board. Every reason shown is a real computed factor, never a guess.</div>
+    <div class="picks-intro">The single sharpest, most mispriced pick in each category this week — sorted by real edge (model probability vs. the market's own price), same medium/high-confidence bar as the Edge Board. Every reason shown is a real computed factor, never a guess. Pick a game below to instead see every prop from that matchup, across every category.</div>
+    <div class="filters">
+      <select id="picksGameFilter"><option value="">All games — top pick per category</option></select>
+    </div>
     <div id="topPicksPanel"></div>
   </section>
 
@@ -200,6 +198,7 @@
     <div id="edgeBoardHistoryPanel"></div>
     <div class="filters">
       <input id="edgeSearch" placeholder="Search player, team, matchup…">
+      <select id="edgeGameFilter"><option value="">All games</option></select>
     </div>
     <div class="card-list" id="edgeList"></div>
   </section>
@@ -213,8 +212,10 @@
   <!-- PLAYER PROPS -->
   <section class="view" id="view-props">
     <div class="stats-strip" id="propsStats"></div>
+    <div id="propBetsHistoryPanel"></div>
     <div class="filters">
       <input id="propTeamFilter" placeholder="Filter by team or player…">
+      <select id="propGameFilter"><option value="">All games</option></select>
       <select id="propTypeFilter"><option value="">All prop types</option></select>
       <select id="propSortFilter"><option value="mispriced">Sort: Real edge (model vs. market)</option><option value="edge">Sort: Best price vs. consensus</option><option value="factors">Sort: Most factors</option></select>
     </div>
@@ -223,6 +224,7 @@
 
   <!-- PARLAYS -->
   <section class="view" id="view-parlays">
+    <div id="parlayHistoryPanel"></div>
     <div class="seg" id="parlaySubtabSeg">
       <button class="active" data-subtab="risk">Risk Tiers</button>
       <button data-subtab="sgp">Same Game</button>
@@ -255,13 +257,12 @@
         Team offense &amp; defense: EPA/play (both sides), success rate (both sides), pressure rate created/allowed, third/fourth-down rate (both sides), red-zone TD rate (both sides), pace, turnovers/game.<br><br>
         Environment: live weather forecast (wind/precip/temp) scored against the run/pass split (personal history first, positional read as fallback), historical wet/dry split, dome/outdoor + venue split cross-referenced against this week's actual roof, altitude flag.<br><br>
         Schedule: rest days, short week, travel distance, time-zone shift, primetime, neutral-site/international.<br><br>
-        Injury/personnel: self injury status (hard override), O-line injury count, practice-participation trend (direction-scored — worsening penalizes, improving helps), starter-QB-change detection.<br><br>
-        Speculative-only scouting take (no free in-season data source exists for this — clearly labeled, never scored): coverage-scheme/personnel tendencies, revenge-game and contract-year narrative.
+        Injury/personnel: self injury status (hard override), O-line injury count, practice-participation trend (direction-scored — worsening penalizes, improving helps), starter-QB-change detection.
       </div>
     </div>
     <div class="setup-block">
       <div class="heading">Where the refresh actually runs</div>
-      <div class="body">This site (Netlify) only serves the frontend, reads the latest saved snapshot, and — when you click "Refresh Now" — fires a GitHub Actions workflow. The full pipeline (odds, nflverse + play-by-play, weather, AI) runs on GitHub Actions, manually only (no automatic schedule — see the README's "Manual-only refresh" section for why), and saves its result straight to this site's Netlify Blobs store. See the project README for why it's on GitHub Actions rather than a Netlify Background Function (those require a paid Netlify Pro plan; GitHub Actions doesn't).</div>
+      <div class="body">This site (Netlify) only serves the frontend, reads the latest saved snapshot, and — when you click "Refresh Now" — fires a GitHub Actions workflow. The full pipeline (odds, nflverse + play-by-play, weather) runs on GitHub Actions, manually only (no automatic schedule — see the README's "Manual-only refresh" section for why), and saves its result straight to this site's Netlify Blobs store. See the project README for why it's on GitHub Actions rather than a Netlify Background Function (those require a paid Netlify Pro plan; GitHub Actions doesn't).</div>
     </div>
     <div class="setup-block">
       <div class="heading">Environment variables (Netlify site)</div>
@@ -269,15 +270,15 @@
     </div>
     <div class="setup-block">
       <div class="heading">Secrets (GitHub repo → Settings → Secrets and variables → Actions)</div>
-      <div class="body"><code class="kv">SPORTSGAMEODDS_API_KEY</code> <code class="kv">ANTHROPIC_API_KEY</code> <code class="kv">CURRENT_SEASON</code> (optional) <code class="kv">ANTHROPIC_MODEL</code> (optional) <code class="kv">NETLIFY_SITE_ID</code> <code class="kv">NETLIFY_BLOBS_TOKEN</code></div>
+      <div class="body"><code class="kv">SPORTSGAMEODDS_API_KEY</code> <code class="kv">CURRENT_SEASON</code> (optional) <code class="kv">NETLIFY_SITE_ID</code> <code class="kv">NETLIFY_BLOBS_TOKEN</code></div>
     </div>
     <div class="setup-block">
-      <div class="heading">What actually costs Anthropic credits</div>
-      <div class="body">Loading this page costs $0 — it only reads the latest saved snapshot from Netlify Blobs, no AI calls involved. Refreshes are manual-only (no schedule runs on its own): the only things that spend anything are clicking "Refresh Now" above, or manually dispatching the GitHub Actions workflow — each one runs the AI notes/scouting-takes/parlay-takes passes once. A hard daily cap (<code class="kv">ANTHROPIC_DAILY_CAP_USD</code>, default $5, set as a GitHub Actions secret/variable to change it) tracks real spend from the API's own token-usage response and skips all AI calls for the rest of the UTC day once it's reached — the spend total next to "Refresh Now" above shows where today stands. This is a best-effort cap, not a hard guarantee: it's checked between waves of concurrent AI calls, so a refresh already mid-flight when the cap is hit can overshoot by that one wave rather than cutting off mid-call.</div>
+      <div class="heading">What actually costs anything</div>
+      <div class="body">Loading this page costs $0 — it only reads the latest saved snapshot from Netlify Blobs. Refreshes are manual-only (no schedule runs on its own): clicking "Refresh Now" above, or manually dispatching the GitHub Actions workflow, pulls fresh odds/nflverse/weather data — all free-tier data sources at this app's usage level. There's no AI layer in this build (no Anthropic API calls anywhere in the pipeline) and nothing here spends real money on its own.</div>
     </div>
     <div class="setup-block">
       <div class="heading">Odds data budget (Rookie tier)</div>
-      <div class="body">100,000 objects/month, 50 requests/minute, odds refreshed upstream about every 3 minutes. The GitHub Actions schedule runs every 30 minutes — well within budget — but object cost scales with events × markets per call, so keep an eye on actual usage in the SportsGameOdds dashboard for the first week or two and tune the cron schedule if needed.</div>
+      <div class="body">100,000 objects/month, 50 requests/minute, odds refreshed upstream about every 3 minutes. Refreshes are manual-only, so budget scales with how often "Refresh Now" (or the GitHub Actions workflow) actually gets clicked — object cost scales with events × markets per call, so keep an eye on actual usage in the SportsGameOdds dashboard if refresh frequency picks up.</div>
     </div>
   </section>
 
@@ -538,7 +539,7 @@ async function refreshNow(){
   const tick = () => { btn.innerHTML = `<span class="spinner"></span>Refreshing… ${Math.round((Date.now()-started)/1000)}s`; };
   tick();
   const tickTimer = setInterval(tick, 1000);
-  statusEl.textContent = "Refresh triggered on GitHub Actions — pulling odds, nflverse stats + play-by-play, weather, and running AI analysis. This can take a few minutes, plus a bit of queue time for the runner to start.";
+  statusEl.textContent = "Refresh triggered on GitHub Actions — pulling odds, nflverse stats + play-by-play, and weather, then running the full factor engine. This can take a few minutes, plus a bit of queue time for the runner to start.";
   statusEl.classList.remove("err");
   try{
     const triggerRes = await fetch("/.netlify/functions/trigger-refresh", { method:"POST", headers: { "x-refresh-secret": secret } });
@@ -609,27 +610,46 @@ function render(){
   typeSel.innerHTML = `<option value="">All prop types</option>` + types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
   typeSel.value = prevType;
 
+  renderGameFilterOptions();
   renderTopPicks();
   renderInjuryWatch();
   renderTrackRecord();
   renderEdgeBoardHistory();
-  renderSpendStatus();
+  renderPropBetsHistory();
   applyEdgeFilters();
   applyPropFilters();
   renderParlays();
+  renderParlayHistory();
 }
 
-// Anthropic daily spend cap transparency (lib/ai.js's createSpendGuard, wired through lib/pipeline.js). Page
-// loads never cost anything — this only moves when someone clicks Refresh Now or the scheduled GitHub Actions
-// run fires — so this is reporting a running daily total, not a live meter tied to this page being open.
-function renderSpendStatus(){
-  const el = document.getElementById("spendStatus");
-  const spend = snapshot.anthropicSpend;
-  if (!spend){ el.textContent = ""; return; }
-  const pct = spend.capUsd ? spend.spentUsd / spend.capUsd : 0;
-  el.textContent = `Anthropic spend today: $${fmtNum(spend.spentUsd,2)} / $${fmtNum(spend.capUsd,2)}` +
-    (pct >= 1 ? " — cap reached, AI notes paused until tomorrow (UTC)" : "");
-  el.style.color = pct >= 1 ? "var(--red)" : (pct >= 0.8 ? "var(--amber)" : "");
+/* ---------------------------------------------------------------------- */
+/* Per-game filter — shared across Top Picks, Edge Board, Player Props    */
+/* ---------------------------------------------------------------------- */
+
+// One option per real game this week (deduped by eventId), built straight from propRows the same way
+// lib/parlays.js's summarizeEvents groups legs server-side — "AWAY @ HOME" labeled, sorted by kickoff.
+function gameOptions(){
+  const byId = new Map();
+  for (const r of snapshot.propRows || []){
+    if (!r.eventId || byId.has(r.eventId)) continue;
+    byId.set(r.eventId, { eventId: r.eventId, label: `${r.away || "—"} @ ${r.home || "—"}`, kickoff: r.kickoff });
+  }
+  return [...byId.values()].sort((a,b) => new Date(a.kickoff||0) - new Date(b.kickoff||0));
+}
+
+function renderGameFilterOptions(){
+  const games = gameOptions();
+  const opts = games.map(g => `<option value="${esc(g.eventId)}">${esc(g.label)}${g.kickoff ? ` — ${esc(fmtKickoff(g.kickoff))}` : ''}</option>`).join("");
+  [
+    { id: "edgeGameFilter", allLabel: "All games" },
+    { id: "propGameFilter", allLabel: "All games" },
+    { id: "picksGameFilter", allLabel: "All games — top pick per category" }
+  ].forEach(({ id, allLabel }) => {
+    const sel = document.getElementById(id);
+    const prev = sel.value;
+    sel.innerHTML = `<option value="">${esc(allLabel)}</option>` + opts;
+    sel.value = [...sel.options].some(o => o.value === prev) ? prev : "";
+  });
 }
 
 // Edge Board history: of what was actually flagged as a real Edge Board edge the moment it was first surfaced
@@ -651,6 +671,59 @@ function renderEdgeBoardHistory(){
     <div class="tr-headline"><b>${h.hits}/${h.total}</b> Edge Board picks hit, most recent first</div>
     <div class="tr-tiers">${rows}</div>
     <div class="tr-note">Only counts picks that were a real Edge Board edge the moment they were first surfaced — not ones that only later drifted into range, or fell out of it, as the model updated through the week.</div>
+  </div>`;
+}
+
+// Prop Bets history: the unfiltered sibling of Edge Board history above — every graded pick ever saved from the
+// Player Props tab, Edge-Board-flagged or not (lib/pipeline.js's buildPropBetsHistory). Edge Board picks show up
+// in both panels on purpose — this is the honest full picture, that one is the flagged-edge subset of it.
+function renderPropBetsHistory(){
+  const el = document.getElementById("propBetsHistoryPanel");
+  const h = snapshot.propBetsHistory;
+  if (!h?.total){
+    el.innerHTML = `<div class="track-record empty">No graded Prop Bets history yet — this fills in once props shown here actually kick off and grade (usually about a day after the game).</div>`;
+    return;
+  }
+  const rows = h.picks.map(p => {
+    const market = p.line != null ? `${esc(p.propLabel||p.propType)} ${esc(p.side||'')} ${p.line}` : esc(p.propLabel||p.propType);
+    return `<div class="tr-tier"><span class="tr-tier-label">${esc(p.player)}</span><span>${market}</span><span class="chip ${p.hit?'hit':'warn'}">${p.hit?'✓ Hit':'✗ Miss'}</span><span class="tr-dim">${esc(fmtKickoff(p.kickoff))}${p.wasEdgeBoard ? ' · also an Edge Board pick' : ''}</span></div>`;
+  }).join("");
+  el.innerHTML = `<div class="track-record">
+    <div class="tr-headline"><b>${h.hits}/${h.total}</b> Prop Bets picks hit, most recent first</div>
+    <div class="tr-tiers">${rows}</div>
+    <div class="tr-note">Every graded prop shown on this tab, not just the ones that also cleared the Edge Board's own edge/confidence bar — see the Edge Board tab for that narrower, flagged-edge subset on its own.</div>
+  </div>`;
+}
+
+// Parlay track record: every saved parlay attempt (Risk Tiers/Same Game/Slates — lib/pipeline.js's
+// buildGradableParlays) that has actually graded, fail-fast on any confirmed-miss leg or fully hit once every
+// leg's game is final (lib/grading.js's gradeCompletedParlays). Shows each leg's own hit/miss so a miss is
+// checkable down to which specific leg broke it.
+function renderParlayHistory(){
+  const el = document.getElementById("parlayHistoryPanel");
+  const h = snapshot.parlayHistory;
+  if (!h?.total){
+    el.innerHTML = `<div class="track-record empty">No graded parlay history yet — this fills in once a saved parlay's legs actually kick off and grade (a miss can show up as soon as any one leg busts; a hit only once every leg's game is final).</div>`;
+    return;
+  }
+  const rows = h.parlays.map(p => {
+    const legsSummary = p.legs.map(l => {
+      const market = l.line != null ? `${esc(l.propLabel||l.propType)} ${l.line}` : esc(l.propLabel||l.propType);
+      return `<span class="chip ${l.graded ? (l.hit ? 'hit' : 'warn') : 'info'}" title="${esc(l.player||'')}">${esc(l.player||'?')} ${market} ${l.graded ? (l.hit?'✓':'✗') : '…'}</span>`;
+    }).join("");
+    return `<div class="tr-tier" style="flex-direction:column;align-items:flex-start;">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:baseline;">
+        <span class="tr-tier-label">${esc(p.tierLabel)} · ${esc(p.contextLabel||'')}</span>
+        <span class="chip ${p.hit?'hit':'warn'}">${p.hit?'✓ Hit':'✗ Miss'}</span>
+        <span class="tr-dim">${fmtOdds(p.combinedAmerican)} · ${esc(fmtKickoff(p.kickoff))}</span>
+      </div>
+      <div style="margin-top:4px;">${legsSummary}</div>
+    </div>`;
+  }).join("");
+  el.innerHTML = `<div class="track-record">
+    <div class="tr-headline"><b>${h.hits}/${h.total}</b> parlays hit, most recent first</div>
+    <div class="tr-tiers">${rows}</div>
+    <div class="tr-note">A parlay grades as a miss the moment any one leg's game finishes and misses — it doesn't wait on the rest of the slate. It only grades as a hit once every leg's own game is final and every leg hit.</div>
   </div>`;
 }
 
@@ -678,6 +751,25 @@ function pickCardHTML(p){
 
 function renderTopPicks(){
   const el = document.getElementById("topPicksPanel");
+  const game = document.getElementById("picksGameFilter").value;
+  // A specific game is selected: switch from the precomputed top-5-per-category view to every prop tied to
+  // that one matchup, ranked by real edge — same card style as the Edge Board, just scoped to one game instead
+  // of pooled across the whole slate. This is what actually answers "let me see per-game props in this tab,"
+  // since the categorized Top Picks are a fixed top-5 slice server-side and usually won't happen to include any
+  // given single game.
+  if (game){
+    const rows = snapshot.propRows.filter(r => r.eventId === game && r.model?.available)
+      .sort((a,b) => (b.trueEdge ?? -9) - (a.trueEdge ?? -9));
+    const g = gameOptions().find(x => x.eventId === game);
+    cardSeq = 0;
+    const cardsHtml = rows.length ? rows.map(r => edgeCardHTML(r)).join("") : `<div class="empty">No scored props for this game yet.</div>`;
+    el.innerHTML = `<div class="pick-category">
+      <div class="pick-category-head"><h2>${esc(g?.label || "This game")}</h2><span>${rows.length} prop${rows.length===1?'':'s'}</span></div>
+      <div class="card-list">${cardsHtml}</div>
+    </div>`;
+    wireExpanders(el);
+    return;
+  }
   const tp = snapshot.topPicks;
   if (!tp?.categories?.length){ el.innerHTML = `<div class="empty">Nothing here yet — check back after the next refresh.</div>`; return; }
   el.innerHTML = tp.categories.map(c => `
@@ -687,6 +779,7 @@ function renderTopPicks(){
     </div>
   `).join("");
 }
+document.getElementById("picksGameFilter").addEventListener("input", renderTopPicks);
 
 // Injury Watch: lib/factors/injury.js's computeInjuryEscalations — every player whose EARLIEST status seen this
 // week was Questionable but whose status as of this refresh has worsened to Doubtful or Out. A separate tab per
@@ -836,11 +929,6 @@ function modelSummaryHTML(r){
   </div>`;
 }
 
-function scoutingHTML(r){
-  if (!r.scouting) return "";
-  return `<div class="ec-scout"><span class="label">Speculative scouting take — not computed, general football knowledge only</span>${esc(r.scouting.note)}</div>`;
-}
-
 let cardSeq = 0;
 function edgeCardHTML(r){
   const idx = cardSeq++;
@@ -875,8 +963,6 @@ function edgeCardHTML(r){
     ${modelSummaryHTML(r)}
     <p class="ec-reasoning">${reasoning}</p>
     ${last5ChecklistHTML(r.factors)}
-    ${r.ai ? `<div class="ec-ai"><span class="ec-ai-tag">${esc((r.ai.tag||'').replace('-',' '))}</span>${esc(r.ai.note)}</div>` : ''}
-    ${scoutingHTML(r)}
     <button class="ec-expand" data-i="${idx}">Full breakdown ▾</button>
     <div class="ec-detail" id="detail-${idx}" hidden>${detail}</div>
   </div>`;
@@ -905,6 +991,7 @@ function renderCardList(el, rows){
 /* ---------------------------------------------------------------------- */
 
 document.getElementById("edgeSearch").addEventListener("input", applyEdgeFilters);
+document.getElementById("edgeGameFilter").addEventListener("input", applyEdgeFilters);
 
 function buildEdgeBoard(){
   return snapshot.mispriced.slice().sort((a,b) => (b.trueEdge ?? (b.bestEdge||0)) - (a.trueEdge ?? (a.bestEdge||0)));
@@ -913,8 +1000,10 @@ function buildEdgeBoard(){
 function applyEdgeFilters(){
   if (!snapshot) return;
   const q = document.getElementById("edgeSearch").value.toLowerCase();
+  const game = document.getElementById("edgeGameFilter").value;
   let rows = buildEdgeBoard();
   if (q) rows = rows.filter(r => `${r.player} ${r.team} ${r.opponentDisp||r.opponent}`.toLowerCase().includes(q));
+  if (game) rows = rows.filter(r => r.eventId === game);
   rows = rows.slice(0, 60);
   renderCardList(document.getElementById("edgeList"), rows);
 }
@@ -927,15 +1016,16 @@ function applyPropFilters(){
   if (!snapshot) return;
   const q = document.getElementById("propTeamFilter").value.toLowerCase();
   const type = document.getElementById("propTypeFilter").value;
+  const game = document.getElementById("propGameFilter").value;
   const sf = document.getElementById("propSortFilter").value;
-  let rows = snapshot.propRows.filter(r => (!q || r.player.toLowerCase().includes(q) || (r.team||'').toLowerCase().includes(q)) && (!type || r.propLabel===type));
+  let rows = snapshot.propRows.filter(r => (!q || r.player.toLowerCase().includes(q) || (r.team||'').toLowerCase().includes(q)) && (!type || r.propLabel===type) && (!game || r.eventId===game));
   const factorCount = r => r.factors ? Object.values(r.factors).filter(f=>f&&(f.available||(Array.isArray(f)&&f.length))).length : 0;
   if (sf==="edge") rows.sort((a,b)=>(b.bestEdge??-9)-(a.bestEdge??-9));
   if (sf==="mispriced") rows.sort((a,b)=>(b.trueEdge??-9)-(a.trueEdge??-9));
   if (sf==="factors") rows.sort((a,b)=>factorCount(b)-factorCount(a));
   renderCardList(document.getElementById("propsList"), rows);
 }
-["propTeamFilter","propTypeFilter","propSortFilter"].forEach(id => document.getElementById(id).addEventListener("input", applyPropFilters));
+["propTeamFilter","propGameFilter","propTypeFilter","propSortFilter"].forEach(id => document.getElementById(id).addEventListener("input", applyPropFilters));
 
 /* ---------------------------------------------------------------------- */
 /* Parlays                                                                 */
@@ -969,9 +1059,10 @@ function parlayVariants(p){
 }
 
 // Every parlay tier object — cross-game, one per Same Game Parlay, one per slate window — carries a stable
-// `_cacheKey` assigned server-side (pipeline.js, shared with the AI-note cache: see annotateParlaysWithAI in
-// ai.js). Reused here as the shuffle-variant index key and the lookup key on a shuffle click, since plain
-// `tier.key` ("low"/"medium"/...) repeats across every game's own SGP and would collide constantly.
+// `_cacheKey` assigned server-side (pipeline.js, also what identifies a parlay in the saved parlay-tracking
+// ledger — see buildGradableParlays there). Reused here as the shuffle-variant index key and the lookup key on
+// a shuffle click, since plain `tier.key` ("low"/"medium"/...) repeats across every game's own SGP and would
+// collide constantly.
 function allParlayTierObjects(){
   return [
     ...(snapshot.parlays || []),
@@ -993,7 +1084,6 @@ function parlayCardHTML(p){
     <div style="font-size:13px;">$100 stake → <b style="color:var(--mint);">$${v.payout}</b> profit if it hits · naive combined probability ${fmtPct(v.combinedProb)}</div>
     ${v.correlated ? '<span class="tag tag-warn" style="margin-top:8px;display:inline-block;">Shares a game across legs</span>' : ''}
     ${parlayWriteupHTML(v)}
-    ${v.ai ? `<div class="ec-ai"><span class="ec-ai-tag">AI take</span>${esc(v.ai.note)}</div>` : ''}
     ${variants.length > 1 ? `<button class="ec-shuffle" data-tier="${esc(p._cacheKey)}">🔀 Shuffle this build (${idx + 1}/${variants.length})</button>` : ''}
   </div>`;
 }

@@ -6,9 +6,9 @@ and totals/game lines were deliberately removed from this build so every ounce o
 grading individual props). That's a market-scope choice, not a data gap: **this build fully tracks and scores
 defensive matchup quality** — opponent-vs-position rank, EPA matchup edge (this offense vs. that defense), full
 team defensive stats — because a real edge on a player prop depends on how good the opponent's defense actually
-is, not just how good the offense is in a vacuum. Every factor here is either a real computed number (backed by
-a verified free data source) or an explicitly-labeled AI "scouting take" when no free in-season data exists for
-it — nothing is silently faked or guessed as if it were computed.
+is, not just how good the offense is in a vacuum. Every factor here is a real computed number, backed by a
+verified free data source — nothing is silently faked or guessed as if it were computed, and there's no AI/LLM
+layer anywhere in this build filling gaps with narrative in place of a real number (see "No AI layer" below).
 
 Ranking now runs on an actual probability estimate, not a point score — see "Probability model" below for how
 `lib/probability.js` turns all of this into `modelProb`/`marketProb`/`edge`/`confidence` per prop, how
@@ -168,7 +168,7 @@ not disproven.
 `computeBestAcrossBooks` has long told a genuinely mispriced, corroborated outlier book (`staleValue`) apart
 from a likely data error (`suspect`) — see its own comment for exactly how (a majority of the tracked panel
 agreeing with the consensus is what makes it real, not a shared glitch). Until now that distinction only
-decided whether a prop got excluded from Mispriced Bets, AI notes, and parlays (`suspect` did, `staleValue`
+decided whether a prop got excluded from Mispriced Bets and parlays (`suspect` did, `staleValue`
 didn't) — a real, corroborated signal that never actually influenced `modelProb`, the number every ranking and
 parlay-tier decision is made on. `lib/probability.js` now applies a `stale_line_value` nudge scaled by how far
 past the threshold the corroborated edge runs (same magnitude-scaling-with-a-cap discipline `steam_move`
@@ -323,7 +323,7 @@ even when every individual factor coefficient feeding it is itself real and corr
 re-tuning individual nudges fixes it. Standard Platt scaling (Platt, 1999) fits a small 2-parameter logistic
 transform, `calibratedProb = sigmoid(A * logit(rawProb) + B)`, from real `(rawProb, actually hit or missed)` pairs
 pulled from the live ledger, and `lib/pipeline.js` applies it to every prop's `modelProb`/`trueEdge` — before
-anything downstream reads them (AI note selection, Mispriced Bets ranking, parlay tiers, Top Picks, the frontend)
+anything downstream reads them (Mispriced Bets ranking, parlay tiers, Top Picks, the frontend)
 — so every consumer sees the same corrected number rather than some seeing raw and others calibrated depending on
 where in the pipeline they happen to read it.
 
@@ -375,6 +375,39 @@ last week, what hit" — not "of whatever still looks like an edge today," which
 question to get a good-looking answer to. Shown on the Edge Board tab, right under the existing calibration
 track-record panel; empty on a fresh deploy for the same honest reason that panel is.
 
+### Prop Bets history and parlay tracking
+
+`wasEdgeBoard` and `buildEdgeBoardHistory` above answer "of what the Edge Board specifically flagged, what hit."
+Two more tracking views answer two different honest questions alongside it, without deduplicating against it —
+Edge Board picks are a real subset of both, and showing up in more than one panel is intentional, not a bug.
+
+**Prop Bets history.** `lib/pipeline.js` also exports `buildPropBetsHistory(picks, limit = 60)` — the same idea
+as `buildEdgeBoardHistory` just above, but WITHOUT filtering by `wasEdgeBoard`: every graded pick ever saved,
+Edge Board pick or not. Exposed on the snapshot as `propBetsHistory`, rendered in a `propBetsHistoryPanel` panel
+at the top of the Player Props tab.
+
+**Parlay tracking**, built from scratch — there was no parlay-outcome tracking of any kind before this.
+`lib/store.js` gained `loadWeeklyParlays`/`saveWeeklyParlays`, the same per-(season, week) Blobs-backed pattern
+the existing `loadWeeklyPicks`/`saveWeeklyPicks` already used for individual picks. `lib/pipeline.js` gained
+`buildGradableParlays(parlayAttempts, season, week)`, which builds the saveable/gradeable shape of a parlay from
+the same `allParlayAttempts` list that already existed for parlay-building (cross-game, every game's Same Game
+Parlay, and every slate's parlays), keyed by each parlay's own existing stable `_cacheKey`. `runPipeline` then
+saves/grades/merges parlays the exact same "capture once, never let a fresh snapshot clobber an already-graded
+result" way it already did for individual picks, exposing the result as `parlayHistory` (`{ parlays, hits, total
+}`) on the snapshot. Rendered in a `parlayHistoryPanel` panel at the top of the Parlays tab, showing each graded
+parlay's tier/context label, combined odds, hit/miss, and a per-leg hit/miss breakdown so a miss is checkable
+down to exactly which leg broke it.
+
+**Grading a parlay is a fail-fast design, on purpose.** `lib/grading.js` factored its existing per-pick grading
+logic into a shared `gradeLeg(leg, gameLogIndex, now)` helper — wait `GRADE_DELAY_HOURS` (20h) after kickoff,
+then check the real final stat against the line — and added `gradeCompletedParlays(parlays, gameLogIndex, now)`
+on top of it. A parlay is graded `hit: false` the moment ANY of its legs individually grades as a miss — it does
+NOT wait for every leg's game to finish first, the way a sportsbook itself would settle it early once one leg is
+dead. A parlay can only be graded `hit: true` once EVERY leg's game has graded AND every leg hit. This is a
+deliberate asymmetry, not an oversight: a single missed leg already tells you the parlay lost, so there's no
+reason to wait on the rest of the slate to say so, but nothing short of every leg posting a real, confirmed hit
+can call the whole thing a win.
+
 ### Top Picks
 
 A quick-glance dashboard (`lib/topPicks.js`, the app's new default landing tab) — the sharpest, most mispriced
@@ -402,6 +435,20 @@ padding with something invented — every reason on a Top Pick card is either a 
 the edge, then the chosen reasons woven into one sentence, plus an optional third sentence only when the sample
 behind the pick is thin enough to be worth flagging. A category with nothing that clears the bar this week shows
 its own honest empty state rather than being hidden or padded out with a weaker pick just to fill five slots.
+
+### Per-game filter
+
+The Edge Board, Player Props, and Top Picks tabs each got a "game" dropdown filter (`edgeGameFilter`,
+`propGameFilter`, `picksGameFilter`), on top of whatever filters each tab already had (team/player search, prop
+type, sort). It's populated from a `gameOptions()` helper in `public/index.html` that dedupes `propRows` by
+`eventId` and labels each option `"{away} @ {home}"` with kickoff time.
+
+On Top Picks specifically, selecting a game does more than filter the existing board: it switches the view from
+the normal "top 5 picks per category" layout into a flat, edge-sorted list of every scored prop for that one
+game, reusing the same edge-card rendering the Edge Board uses. That's necessary rather than cosmetic — the
+precomputed top-5-per-category picks are drawn from the whole week's slate, so they usually won't happen to
+include any one specific game at all, and a per-category filter on top of them would mostly just show empty
+categories.
 
 ## What this build computes
 
@@ -516,14 +563,40 @@ its own honest empty state rather than being hidden or padded out with a weaker 
   next-ranked player at that position over the old volume/targets-carries guess, falling back to that guess only
   where the scrape has no entry for a team/position.
 
-### The one speculative bucket
+### The one gap this build doesn't fill
 
-Nflverse's participation dataset (which would make real personnel groupings and pass-rush counts computable)
-was confirmed discontinued for in-season release partway through 2023, so coverage-scheme and personnel-package
-content can't be computed — it lives only in the explicitly-labeled AI "scouting take," alongside revenge-game
-and contract-year narrative. This is genuinely speculative, never scored, never treated as computed. The UI
-renders it in a visually distinct dashed amber box labeled "Speculative scouting take — not computed, general
-football knowledge only," separate from every other factor.
+Nflverse's participation dataset (which would make real personnel groupings and pass-rush counts computable) was
+confirmed discontinued for in-season release partway through 2023, so coverage-scheme and personnel-package
+content isn't included in this build at all — there's no free data source to compute it from, and (see "No AI
+layer" below) no AI layer left to speculate about it in its place either. Revenge-game and contract-year
+narrative are gone for the same reason. This is a real, documented gap, not a bug: every factor this app does
+show is a real computed number, and this one is honestly left out rather than being faked, guessed, or backed by
+AI narrative standing in for missing data.
+
+## No AI layer
+
+This build has zero AI/LLM involvement anywhere, by the owner's explicit direction to scrap that layer entirely
+— read that as "this app is AI-free now," not as "AI removed, something lost." `lib/ai.js` (which used to
+generate a per-prop analytical note, the speculative "scouting take" described just above, and parlay rationale,
+all via the Anthropic API) is deleted outright, along with the AI note cache, the Anthropic daily-spend guard,
+and every `ANTHROPIC_*` env var. `runPipeline` no longer accepts an API key or an "AI on"/"scouting on" flag, does
+no AI annotation or spend tracking of any kind, and the snapshot it returns no longer carries an `anthropicSpend`
+field.
+
+Nothing about the app's real analytical claims changes because of this: every one of them — the matchup edge, the
+form/usage/venue/weather nudges, the model probability, the reasoning paragraph under every prop card
+(`propReasoning` in `public/index.html`) and every parlay's write-up (`parlayWriteupHTML`) — was already a real
+computed number before this change, too. The AI layer only ever added narrative flavor text on top of that math;
+it never fed anything the math itself depended on. The one place removing it left an actual, honest gap is the
+speculative bucket described just above — that content simply isn't shown anymore, rather than being faked,
+guessed, or backed by AI standing in for missing data.
+
+Two real features landed in the same pass this AI layer came out, both covered in their usual place above:
+
+- **A per-game filter** on the Edge Board, Player Props, and Top Picks tabs — see "Per-game filter" above.
+- **Source-tagged bet tracking** — a Prop Bets history panel and real parlay-outcome tracking (with a deliberate
+  fail-fast grading rule), alongside the existing Edge Board history — see "Prop Bets history and parlay
+  tracking" above.
 
 ## Parlays
 
@@ -590,18 +663,12 @@ qualifying for Mega or Nuke *and* one of Low/Medium/High is expected, not a bug:
 The frontend's shuffle control still works exactly as before — it just reshuffles within each tier's own
 already-computed, already-disjoint leg pool, so shuffling never breaks the band guarantee.
 
-Every parlay (cross-game, every game's SGP, and both slates) shares one Anthropic call for its rationale
-(`annotateParlaysWithAI`), using the same caching engine as the other AI note types — a parlay's note is only
-regenerated when its actual legs/odds change, not on every refresh. This mattered more once Same Game Parlays
-and slate parlays joined the board: with a full week's slate that can be a couple dozen parlays in one payload
-instead of the original 4, so caching keeps the added coverage from meaningfully increasing Anthropic spend.
-
 ## Architecture
 
 The refresh pipeline runs on **GitHub Actions**, not as a Netlify function. Netlify was the original plan —
 via a Background Function, which gets roughly a 15-minute budget instead of a normal function's ~10-26
 seconds, and this pipeline (odds + several nflverse files including full play-by-play + a weather forecast per
-outdoor game + multiple sequential Claude calls) needs that room. But Background Functions turned out to
+outdoor game) needs that room. But Background Functions turned out to
 require a paid Netlify Pro plan (confirmed by hitting a 403 on the free plan, and by Netlify's own support
 forum: https://answers.netlify.com/t/netlify-docs-say-level-0-supports-background-functions-this-error-says-nope/88326),
 so the pipeline moved to GitHub Actions instead, which has no comparable per-run time limit at this scale and
@@ -635,7 +702,6 @@ is free for this workload.
 | nflverse (GitHub releases) | weekly player stats, rosters, snap counts, full schedule, full play-by-play, ranked depth charts | Free |
 | ESPN | injury reports | Free |
 | Open-Meteo | weather forecast | Free, no key |
-| Anthropic API | AI analytical notes + scouting takes | Pay-as-you-go |
 
 ### Odds budget
 
@@ -658,111 +724,28 @@ slower to move its line than the rest of the field, which is real, bettable valu
 identical past that threshold. The raw fields stay visible on every flagged row specifically so this can be
 told apart by eye.
 
-### AI note caching
-
-`lib/store.js`'s `loadAiCache`/`saveAiCache` keep a small per-(season, week) cache in Blobs: a content hash of
-exactly what got sent to Claude for each row (keyed by its market `oddID`), plus the note that came back. A row
-whose real inputs haven't changed since the last refresh reuses the stored note instead of spending another API
-call; only rows with genuinely new or changed factors get sent. Stale entries (a finished game, a line no longer
-offered) are pruned from the cache every refresh so it can't grow unbounded across a season. Each refresh's log
-line reports how many notes were reused vs. freshly generated.
-
-A cold cache (every row's content hash changed at once — which happens for the whole board any time the
-probability model or a factor's shape changes, confirmed live right after an earlier session's model rebuild)
-means every row needs a fresh note in the same refresh. Rows within the props annotation pass run several at a
-time (`CONCURRENCY = 4` in `lib/ai.js`) instead of strictly one after another — a live cold-cache refresh ran
-past 13 minutes before this fix, almost entirely spent waiting on sequential Anthropic round-trips. The
-concurrency cap is deliberate, not laziness: fully parallel would trade a slow refresh for a burst of 429s
-against Anthropic's own per-minute rate limit.
-
-### Anthropic cost controls
-
-A real cost review (every non-suspect card getting a note, on a 30-minute auto-refresh schedule, on the most
-expensive Claude tier) led to four changes, all in `lib/ai.js` unless noted:
-
-- **Cheaper model.** `ANTHROPIC_MODEL` now defaults to `claude-haiku-4-5-20251001` instead of a Sonnet snapshot.
-  Every one of these calls (prop notes, scouting takes, parlay rationale) is a "cite the real numbers you're
-  given in a sentence or two" task, never deep reasoning, so Haiku's quality is indistinguishable here for a
-  fraction of the per-token cost.
-- **Only the top 50 rows get a note at all.** `selectAiEligible(propRows, limit)` (called once in
-  `lib/pipeline.js` right after every row's `modelProb` is computed) ranks the pool of non-suspect,
-  non-mismatched, model-scored props by real `modelProb` descending — i.e. genuinely "most likely to hit," not
-  best edge/value — and marks the top `AI_NOTE_LIMIT` (50 by default) rows with `_aiSelected = true`.
-  `annotatePropsWithAI` only considers rows carrying that flag, so the other rows on the board simply don't get
-  an AI note (they still get every non-AI factor and the model's own probability/edge numbers — nothing else
-  about them is degraded). Raise or lower the cap by passing a different `limit` at that call site.
-- **Looser cache matching.** `roundForHash(content)` rounds every number in a row's content before it's hashed
-  for cache-comparison purposes (the full-precision content is still what's actually sent to Claude on a cache
-  miss): values within ±1.5 (rates, probabilities, edges) round to the nearest 0.02, mid-range values up to ±20
-  (a prop's own line, wind speed) round to the nearest 2, everything larger (prices, yardage) rounds to the
-  nearest 5. A book's price ticking by a cent or a forecast's wind estimate drifting by a notch no longer forces
-  a fresh Anthropic call for a note that would say the same thing anyway.
-- **Scouting takes are throttled to once a day.** They're the purely speculative bucket and barely change week to
-  week, so there's no reason to pay to regenerate them on every refresh. `lib/pipeline.js` tracks
-  `aiCache.scoutingMeta.lastFullRunAt`; when less than `SCOUTING_THROTTLE_HOURS` (24) have passed,
-  `annotateScoutingTakes` runs in `{ cacheOnly: true }` mode — rows whose content hasn't changed still get their
-  existing note reapplied for free, but nothing new is sent to Claude until the throttle window is up.
-
-### What actually spends money (and the hard daily cap)
-
-**Loading this page costs $0.** `netlify/functions/data.js` only reads the latest saved snapshot out of Netlify
-Blobs — no Anthropic call happens on page load, on a page refresh, or while the page just sits open in a tab.
-The only two things that spend anything are clicking **Refresh Now**, and manually dispatching the GitHub
-Actions workflow — both fire the exact same `workflow_dispatch` run, and per "Manual-only refresh" below, nothing
-fires on its own schedule anymore.
-
-On top of the four controls above, every refresh now enforces a hard daily spend ceiling: `estimateCostUsd`
-(`lib/ai.js`) prices every Claude response from the API's own `usage.input_tokens`/`usage.output_tokens` fields
-— never a guess from payload size — against real, current per-million-token pricing (Haiku 4.5 $1 in/$5 out,
-Sonnet $2/$10, Opus $5/$25; an unrecognized future model name still gets a conservative estimate rather than
-silently costing $0 in the ledger). `createSpendGuard` tracks a running total in a UTC-calendar-day ledger
-(persisted in Blobs via `loadSpendLedger`/`saveSpendLedger`, rolling over to a fresh $0 total — and archiving the
-prior day's total into a 30-day history — at midnight UTC), checked before every wave of concurrent AI calls in
-`annotateWithCache`. Once the day's spend reaches `ANTHROPIC_DAILY_CAP_USD` (a GitHub Actions secret/variable;
-defaults to **$5/day** if unset), every remaining AI call for that refresh — and any refresh triggered later the
-same UTC day — is skipped, logged, and the props/parlays/scouting notes simply go out without a fresh AI note
-(nothing else about the board degrades). **This is a best-effort cap, not a hard guarantee**: it's checked
-between waves of concurrent calls (`CONCURRENCY = 4`), not before each individual call, so a wave already in
-flight when the cap is crossed can still complete — meaning a single refresh can overshoot the cap by, at most,
-the cost of one wave of already-started calls. In practice that overshoot is small and bounded (a handful of
-cents, not dollars), but it's a real, documented limit worth knowing about rather than a promise this can never
-go a cent over $5 on a given day. The running total is shown on the Edge Board next to "Refresh Now," and
-explained in the Setup tab.
-
-**Should you just remove the AI notes entirely instead of capping them?** Worth weighing directly, since it was
-the other option on the table:
-- *For removing them*: it's the only way to guarantee **exactly** $0/day, no best-effort caveats at all. Every
-  other factor on this board (matchup, form, usage, injury, weather, venue, game-script, red-zone share, and so
-  on) is fully computed and scored with zero ongoing cost — the AI notes are a genuinely optional layer on top
-  of a board that already works without them; `propReasoning`'s plain-English writeup for every card is built
-  entirely from real computed factors already, with no AI involved.
-- *Against removing them*: the AI notes and scouting takes are the only place a couple of things live today —
-  the labeled-speculative scouting take (coverage-scheme reads, revenge-game/contract-year narrative — see "The
-  one speculative bucket" above, which has no computed alternative at all since the underlying NFL data doesn't
-  exist), and the parlay rationale write-up layer (`annotateParlaysWithAI`) alongside the always-present
-  computed `parlayWriteupHTML`. Removing the AI layer means losing those, not just a nice-to-have restatement of
-  numbers already on the card.
-- *The cap chosen here* keeps both, while making the actual dollar exposure small, bounded, and visible — a $5/day
-  ceiling, hit only on days with an actual triggered refresh, with real-time transparency on the site itself.
-  Lowering `ANTHROPIC_DAILY_CAP_USD` further (or to `0`, which functions as an effective full removal without
-  deleting any code) is a one-line env-var change if the tradeoff above lands differently than expected.
-
 ### Manual-only refresh
 
-`.github/workflows/refresh.yml` no longer has a `schedule:` trigger — only `workflow_dispatch`. Combined with
-"every card gets a note," an automatic 30-minute cadence was the single biggest driver of Anthropic spend, since
-it multiplied every one of the controls above by "however many times a day this ran on its own." Refreshes now
-only happen when triggered on purpose: the GitHub Actions "Run workflow" button, or the site's **Refresh Now**
-button (same `workflow_dispatch` call, via `netlify/functions/trigger-refresh.js`). Nothing runs on a schedule
-anymore. If that tradeoff changes later, re-adding a `schedule:` block to that workflow file is all it takes to
-bring auto-refresh back.
+`.github/workflows/refresh.yml` no longer has a `schedule:` trigger — only `workflow_dispatch`. Loading this page
+costs nothing at all: `netlify/functions/data.js` only reads the latest saved snapshot out of Netlify Blobs, on
+page load, on a page refresh, or while the page just sits open in a tab. The only thing that costs anything is
+actually running the pipeline — clicking **Refresh Now**, or manually dispatching the GitHub Actions workflow,
+both firing the exact same `workflow_dispatch` run — which spends a real GitHub Actions run (compute minutes) and
+real usage against the SportsGameOdds monthly object budget (see "Odds budget" above). An automatic 30-minute
+cadence would spend both of those whether or not anyone actually needed fresh data, "however many times a day
+this ran on its own," which is why refreshes now only happen when triggered on purpose: the GitHub Actions "Run
+workflow" button, or the site's **Refresh Now** button (same `workflow_dispatch` call, via
+`netlify/functions/trigger-refresh.js`). Nothing runs on a schedule anymore. If that tradeoff changes later,
+re-adding a `schedule:` block to that workflow file is all it takes to bring auto-refresh back.
 
-**Trigger endpoint access control.** `netlify/functions/trigger-refresh.js` is a public URL on the open
-internet — Netlify functions don't get any access control by default. Until this was caught during a real cost
-review, that meant anyone who found the URL (a bot scanning for exposed Netlify functions, a scraper, anything)
-could `POST` to it directly and set off a real, paid GitHub Actions run with live Anthropic calls, with zero
-involvement from you — indistinguishable from a phantom auto-refresh from the outside. The daily spend cap
-above limits the damage per day, but a cap is a ceiling, not a lock. The endpoint now requires a `REFRESH_SECRET`
+### Securing the refresh endpoint
+
+`netlify/functions/trigger-refresh.js` is a public URL on the open internet — Netlify functions don't get any
+access control by default. Until this was caught during a real review, that meant anyone who found the URL (a
+bot scanning for exposed Netlify functions, a scraper, anything) could `POST` to it directly and set off a real,
+paid GitHub Actions run, with zero involvement from you — indistinguishable from a phantom auto-refresh from the
+outside, and a real cost (GitHub Actions compute minutes, plus usage against the SportsGameOdds monthly object
+budget) each time it happened. The endpoint now requires a `REFRESH_SECRET`
 you set yourself (see the environment variables section below) sent as an `x-refresh-secret` header; a request
 without the right value gets a flat 401 before it ever touches the GitHub API, and if `REFRESH_SECRET` isn't set
 at all, every request is rejected outright rather than silently staying open. The site's own "Refresh Now"
@@ -777,13 +760,7 @@ Split across two places now, since two different systems run this.
 **GitHub repo → Settings → Secrets and variables → Actions → New repository secret:**
 
 - `SPORTSGAMEODDS_API_KEY` — required for live data.
-- `ANTHROPIC_API_KEY` — required for AI analytical notes, scouting takes, and parlay rationale. Without it,
-  everything still computes; you just won't get AI commentary.
 - `CURRENT_SEASON` — optional, defaults to 2026.
-- `ANTHROPIC_MODEL` — optional, defaults to `claude-haiku-4-5-20251001` (see "Anthropic cost controls" above for
-  why Haiku).
-- `ANTHROPIC_DAILY_CAP_USD` — optional, defaults to `5` (dollars/day). See "What actually spends money (and the
-  hard daily cap)" above.
 - `NETLIFY_SITE_ID` — your Netlify site's ID (Site configuration → General → Site details → Site ID).
 - `NETLIFY_BLOBS_TOKEN` — a Netlify personal access token (User settings → Applications → New access token).
   This is what lets the GitHub Actions job write into the same Blobs store your Netlify site reads from.
@@ -799,7 +776,7 @@ Split across two places now, since two different systems run this.
 - `GH_BRANCH` — optional, defaults to `main`.
 - `REFRESH_SECRET` — required. A password you make up (any random string works — a password manager's generator
   is fine). Gates `trigger-refresh.js` so a random request from the open internet can't fire a paid refresh —
-  see "Trigger endpoint access control" above. The site's "Refresh Now" button will prompt you for this value
+  see "Securing the refresh endpoint" above. The site's "Refresh Now" button will prompt you for this value
   the first time you click it on a given browser and remember it after that.
 
 ## Deploying
@@ -810,7 +787,7 @@ Split across two places now, since two different systems run this.
    work).
 3. Add the four `GH_*` environment variables plus `REFRESH_SECRET` above in Netlify's Site configuration →
    Environment variables, then redeploy (Deploys → Trigger deploy) so the functions pick them up.
-4. Add the six secrets above in the GitHub repo's Settings → Secrets and variables → Actions.
+4. Add the four secrets above in the GitHub repo's Settings → Secrets and variables → Actions.
 5. Kick off a first run manually: GitHub repo → Actions tab → "Refresh APEX Edge data" workflow → Run workflow.
    Watch it in the Actions tab — a green check means it wrote a snapshot to Blobs; a red X will show you
    exactly which step failed and why.
@@ -865,10 +842,10 @@ second look before trusting it. Rather than excluding every such row outright, i
 tracked books *corroborate* the move: if at least 2 other books have a price for this same market and roughly
 two-thirds of them agree with the field's consensus within `CORROBORATION_TOLERANCE` (4%), the outlier price is
 real, bettable **stale-line value** (`row.staleValue`) — a book that's simply slower to update than the rest of
-the field, not a data error — and it's kept in Mispriced Bets, AI commentary, and parlay legs, marked with a
+the field, not a data error — and it's kept in Mispriced Bets and parlay legs, marked with a
 blue "📈 stale-line value" badge so it's clearly called out rather than blending in with an ordinary edge.
 Without that corroboration, the row is flagged `suspect` — almost certainly a side/price mismatch somewhere in
-the feed — and excluded from Mispriced Bets, AI commentary, and parlay legs. It still shows on the Edge Board
+the feed — and excluded from Mispriced Bets and parlay legs. It still shows on the Edge Board
 with a struck-through red "⚠ unverified" badge so you can review the raw fields (also logged) rather than the
 row just silently disappearing.
 
@@ -966,19 +943,18 @@ lib/
                    scripts/backtest.js's own coefficient-selection engine (see "Joint estimation" above)
   calibration.js   Platt-scaling recalibration — fits/applies a logistic correction to modelProb from the live
                    graded-picks ledger (see "Platt-scaling recalibration" above)
-  grading.js       results ledger: grades completed picks, computes closing-line value (CLV), folds both into
-                   the all-time calibration ledger
+  grading.js       results ledger: grades completed picks AND parlays via a shared gradeLeg primitive (a parlay
+                   fails fast the moment any one leg misses — see "Prop Bets history and parlay tracking" above),
+                   computes closing-line value (CLV), folds graded picks into the all-time calibration ledger
   parlays.js       fixed-probability-band (Low/Medium/High) plus Mega (combined-payout target) and Nuke
                    (plus-money-and-55%+ value) parlay builder — cross-game, Same Game Parlays, and the two
                    Sunday slate windows (see "Parlays" above)
-  ai.js            two AI buckets: real-number analytical notes, and speculative scouting takes (plus cached
-                   parlay rationale, shared across all three parlay types above)
   topPicks.js      Top Picks tab: top-5-per-category ranking, reason selection, and write-up (see "Top Picks" above)
   pipeline.js      orchestrates one full refresh end to end
-  doRefresh.js     wires env vars + notes into runPipeline, saves the resulting snapshot
-  store.js         Netlify Blobs wrapper (snapshot, notes, injury/price history, AI note cache — now including
-                   parlays, weekly picks, calibration ledger) — works both from inside a deployed Netlify
-                   function and standalone (GitHub Actions)
+  doRefresh.js     wires env vars into runPipeline, saves the resulting snapshot
+  store.js         Netlify Blobs wrapper (snapshot, notes, injury/price history, weekly picks, weekly parlays,
+                   calibration ledger) — works both from inside a deployed Netlify function and standalone
+                   (GitHub Actions)
 netlify/functions/
   data.js          serves the latest snapshot
   notes.js         load/save situational notes
