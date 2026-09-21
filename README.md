@@ -162,6 +162,29 @@ the practice-participation trend — whatever actually drove the number), not ju
 Every card still has a "Full breakdown" expander underneath with every computed factor, for anyone who wants the
 raw numbers.
 
+
+### The wasEdgeBoard bug — most of history never got a real recommendation decision
+
+For most of this app's life, `lib/pipeline.js`'s merge logic had a subtle bug: when a previously-seen pick got
+refreshed, `if (existing) p.wasEdgeBoard = existing.wasEdgeBoard;` copied the OLD value forward unconditionally
+— including when that old value was `undefined` because the pick's very first save never set it. Once a pick
+landed in that state it could never self-correct, because every later refresh just copied the same `undefined`
+forward again. Since the Edge Board only ever treats a truthy `wasEdgeBoard` as a real recommendation, an
+`undefined` pick behaved exactly like a correctly-rejected one — except it wasn't necessarily correctly
+rejected at all, it was just never decided.
+
+An audit (`scripts/audit-wasedgeboard.js`) found 531 of 559 graded picks (95%) in this state. Backfilling them
+(`scripts/backfill-wasedgeboard.js`, recomputing wasEdgeBoard from each pick's saved edge/confidence against
+today's minEdgeFor() rule — the one thing this can't recover is teamMismatch/suspect, since those were never
+persisted) turned up 215 additional real historical recommendations, hitting at 35.3%. Combined with the 14
+picks that were always correctly tracked, the honest all-time recommended-only track record is 229 picks,
+83 hits (36.2%) — a real, much larger sample than the 14 this was originally judged on, and a coherent one:
+high confidence (40.3%) now outperforms medium (22.6%), the ordering you'd actually expect.
+
+The underlying bug is fixed (`lib/pipeline.js`'s merge line now only preserves wasEdgeBoard when it's actually
+`true` or `false`, letting it recompute normally otherwise), so this was a one-time backfill, not a recurring
+maintenance task.
+
 ## Probability model — how picks are actually ranked
 
 Every prior version of this build ranked picks with `computeMispricedScore`: a hand-tuned point total (+7 if
