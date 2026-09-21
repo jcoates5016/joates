@@ -87,10 +87,42 @@ confirm this is still pregame" fails exactly the same way "confirmed already sta
 pick's `line`/`pickPrice` is captured once, the first time that `oddID` is ever saved (see "The results ledger"
 below), this bug could permanently bake a live number into a graded pick before this fix existed — if your
 season-to-date track record looks worse than expected, some of it may be picks that were only ever captured
-mid-game under the old behavior. There's no way to retroactively tell which ones from the stored data alone; the
-practical fix is this filter going forward, and a clean reset of the results ledger (`calibration-ledger.json`,
-`picks-*.json`, `parlays-*.json` in the `apex-edge-history` Blobs store) if you want a track record you can trust
-isn't mixing in that noise.
+mid-game under the old behavior.
+
+Every pick/parlay saved from this fix onward also carries a `capturedAt` timestamp (`buildGradablePicks` /
+`buildGradableParlays`, both in `lib/pipeline.js`), set once and preserved forever by the same merge logic that
+protects `pickPrice`/`pickBook`. Its presence alone proves the pick was built from an event that had already
+passed `filterPregameEvents` — permanent, no heuristic needed for anything saved going forward. See "Cleaning up
+live-line contamination in old data" below for how to deal with what was already saved before this fix existed.
+
+### Cleaning up live-line contamination in old data
+
+`scripts/clean-live-line-contamination.js` is a one-off maintenance script for exactly the situation above: old
+picks/parlays saved before the `capturedAt` fix existed, where some unknown fraction may have been captured
+mid-game instead of pregame. It goes through every stored `picks-*.json` / `parlays-*.json` file in the
+`apex-edge-history` Blobs store and, for anything with no `capturedAt` already proving it pregame, falls back to
+checking `lib/store.js`'s per-week price-history series: if a prop has at least one recorded price snapshot from
+before its own kickoff, it must have already been on the board — and therefore already captured — during a real
+pregame refresh, so it's kept; otherwise the first (and only) time this app ever saw it was already mid-game or
+later, so it's dropped. A parlay is only kept whole if every one of its legs passes. This can't be perfect (the
+price-history series only keeps the last 12 snapshots per prop, so a prop refreshed more than 12 times before its
+own kickoff could look contaminated when it wasn't), but it errs toward dropping real data rather than keeping
+bad data.
+
+It's **safe by default** — run it with no flags and it only prints what it would keep/drop and the resulting
+rebuilt all-time hit rate, without writing anything. Add `--apply` to actually rewrite the stored data and rebuild
+`calibration-ledger.json` from the survivors, once the dry-run numbers look right:
+
+```
+NETLIFY_SITE_ID=... NETLIFY_BLOBS_TOKEN=... node scripts/clean-live-line-contamination.js
+NETLIFY_SITE_ID=... NETLIFY_BLOBS_TOKEN=... node scripts/clean-live-line-contamination.js --apply
+```
+
+Same two values GitHub Actions already uses for the real refresh — `NETLIFY_SITE_ID` is visible any time in
+Netlify's site settings, `NETLIFY_BLOBS_TOKEN` is a personal access token (reuse the one already generated, or
+make a fresh one in Netlify's user settings just for this one run). Since `--apply` permanently rewrites the live
+results ledger, always read the dry-run output first — it lists exactly which picks/parlays would be dropped and
+why, plus the rebuilt hit rate broken down by confidence tier.
 
 The frontend leads with an **Edge Board**: a ranked feed of the sharpest player-prop edges, each with a
 plain-English paragraph explaining *why* it's an edge (the matchup, the usage, the form, the weather, the venue,
