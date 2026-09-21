@@ -68,6 +68,30 @@ recognizes that specific error shape (`"The bookmakerID <id> is unavailable at y
 drops just the offending ID, and retries with the rest, logging which one it dropped so it can be removed from
 `lib/analyze.js`'s `BOOKS` permanently once confirmed (which is exactly how Fanatics was found and removed above).
 
+### Pregame-only filtering
+
+Real live bug, confirmed from an actual bad result: a refresh run mid-game pulled SportsGameOdds' current
+odds for a game already underway, and the pipeline treated that as a fresh pregame edge. Once a game kicks off,
+a book's own "line" for a player prop is no longer a fixed pregame market — it's continuously adjusted against
+what the player has already produced in the game so far, and can move well away from where it opened
+(SportsGameOdds keeps serving it as long as the book still has it up). Reading that as a sharp edge, or —worse —
+letting it be the number a pick gets graded against, compares the model's pregame read to a completely different,
+in-play question and drags the whole track record down with noise that has nothing to do with whether the model
+is actually any good.
+
+`filterPregameEvents` (`lib/pipeline.js`) fixes this at the source: every refresh drops any event whose kickoff
+isn't still in the future, before a single prop row gets built from it — a game simply disappears from the board
+the moment it kicks off, live or after. An event with no resolvable kickoff time is dropped too, not kept; "can't
+confirm this is still pregame" fails exactly the same way "confirmed already started" does. This only runs live
+(`!demo` — demo mode's fixture events use fixed future dates and have no "live" state to filter). Because a
+pick's `line`/`pickPrice` is captured once, the first time that `oddID` is ever saved (see "The results ledger"
+below), this bug could permanently bake a live number into a graded pick before this fix existed — if your
+season-to-date track record looks worse than expected, some of it may be picks that were only ever captured
+mid-game under the old behavior. There's no way to retroactively tell which ones from the stored data alone; the
+practical fix is this filter going forward, and a clean reset of the results ledger (`calibration-ledger.json`,
+`picks-*.json`, `parlays-*.json` in the `apex-edge-history` Blobs store) if you want a track record you can trust
+isn't mixing in that noise.
+
 The frontend leads with an **Edge Board**: a ranked feed of the sharpest player-prop edges, each with a
 plain-English paragraph explaining *why* it's an edge (the matchup, the usage, the form, the weather, the venue,
 the practice-participation trend — whatever actually drove the number), not just a table of raw stat chips.

@@ -1,7 +1,7 @@
 // Runs the full pipeline against the demo dataset — no API keys needed. Confirms every factor category at
 // least runs without throwing, and prints a self-check summary. Player-props only now — game lines/moneylines
 // were removed from this build entirely (see analyze.js/probability.js/parlays.js/README).
-import { runPipeline, buildEdgeBoardHistory, buildPropBetsHistory } from "../lib/pipeline.js";
+import { runPipeline, buildEdgeBoardHistory, buildPropBetsHistory, filterPregameEvents } from "../lib/pipeline.js";
 import { estimatePropProbability } from "../lib/probability.js";
 import { MODEL_COEFFS } from "../lib/modelCoeffs.js";
 import { gradeCompletedPicks, gradeCompletedParlays, foldIntoLedger, summarizeLedger } from "../lib/grading.js";
@@ -1044,6 +1044,24 @@ globalThis.fetch = realFetch;
 const oddsResilienceWorks = oddsFetchCallCount === 2 && oddsResult.length === 1 && oddsResult[0].eventID === "e1";
 console.log("A single unavailable bookmakerID is dropped and the request retried, not a total failure (should be true):", oddsResilienceWorks, `calls=${oddsFetchCallCount}`);
 
+// --- Pregame-only event filter (lib/pipeline.js's filterPregameEvents) ---
+// Regression guard for a real live bug: a refresh run mid-game was pulling SportsGameOdds' continuously
+// market-adjusted IN-PLAY line for a game already underway and treating it as a fresh pregame edge — then
+// permanently baking that live number into a pick's saved grading record the first time it got captured. Must
+// keep only events whose kickoff is still in the future, and must drop (not keep) anything whose kickoff can't
+// even be resolved, since "can't confirm it's pregame" is not the same as "confirmed pregame."
+const pregameNow = new Date("2026-10-05T18:00:00Z");
+const pregameFixtureEvents = [
+  { eventID: "not-started", status: { startsAt: "2026-10-05T19:00:00Z" } },  // 1h from now -> kept
+  { eventID: "already-live", status: { startsAt: "2026-10-05T17:00:00Z" } }, // kicked off 1h ago -> dropped
+  { eventID: "just-kicked", status: { startsAt: "2026-10-05T18:00:00Z" } },  // kicking off at this exact instant -> dropped (not strictly in the future)
+  { eventID: "no-kickoff-at-all", status: {} },                             // unresolvable -> dropped, not kept
+  { eventID: "garbage-kickoff", status: { startsAt: "not-a-real-date" } }    // unparseable -> dropped, not kept
+];
+const pregameFilterResult = filterPregameEvents(pregameFixtureEvents, pregameNow);
+const pregameFilterWorks = pregameFilterResult.length === 1 && pregameFilterResult[0].eventID === "not-started";
+console.log("filterPregameEvents keeps only events that haven't kicked off yet, dropping already-live and unresolvable-kickoff events alike (should be true):", pregameFilterWorks, pregameFilterResult.map(e => e.eventID));
+
 // --- Same Game / Slate / cross-game parlays (lib/parlays.js) — fixed absolute-probability-band tiers ---
 // Regression guard for the kickoff-window classifier: the real live bug this guards against is a hardcoded UTC
 // offset, which would get exactly ONE of these two dates wrong. Oct 25, 2026 and Nov 1, 2026 are both real
@@ -1256,7 +1274,7 @@ console.log("Joint logistic fit + Wald test rejects pure noise, keeps a smaller 
 
 if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefense || !anyMatchupEdge || !anyScoringEnv || !anyAnytimeTd || !anytimeTdKeptOnlyYesNo || !mahomesTdHitRateIsZero || !recYdsRateIsCorrect || !tdPropGradesAgainstRealLine || !last10ShapeIsCorrect || !last3IsCurrentSeasonOnly || !rate10IsCorrect || !mahomesTendencyIsSkipped || !anyParlayHasAlternates || !widerBookCoverageWorks || !secondaryInjuryWorks || !venueSplitIsRealStat || !venueNudgeFiresOnRealRow ||
   !redZoneShareIsReal || !modelShapeIsSane || !outOverrideWorks || !thinSampleStaysNearMarket || !deepSampleMovesFurther || !weatherNudgesWork || !venueNudgeWorks || !practiceTrendWorks || !steamMagnitudeScalingWorks || !staleLineValueWorks || !frontSevenInjuryFactorWorks || !frontSevenNudgeFires || !gameContextIsCorrect || !noOddsContextWorks || !stringPayloadNudgeWorks || !gameScriptWorks || !gameScriptNudgesWork || !staleVsSuspectWorks || !anySuspectOrStaleFieldPresent || !mispricedSortedByTrueEdge || !mispricedAllClearBar || !gradingWorks || !clvWorks || !ledgerMathIsCorrect || !ledgerClvIsCorrect || !regradeGuardWorks || !edgeBoardHistoryWorks || !edgeBoardLimitWorks ||
-  !propBetsHistoryWorks || !parlayGradingWorks || !parlayRegradeGuardWorks ||
+  !propBetsHistoryWorks || !parlayGradingWorks || !parlayRegradeGuardWorks || !pregameFilterWorks ||
   !rosterIndexPicksLatestWeek || !depthChartIndexWorks || !resolvePlayerPrefersDepthChartOnConflict || !noConflictWhenBothSourcesAgree || !keyTeammateUsesDepthChartRank || !keyTeammateStillSkipsQb || !anyPropHasDepthChartRole || !rosterConflictsStatIsPresent || !oddsResilienceWorks ||
   !newCoeffsPresent ||
   !dstSafetyWorks || !demoEventWindowsAreCorrect || !allSgpRespectBandsAndDisjoint || !allSlatesRespectBandsAndDisjoint || !crossGameFillsEveryTier || !sgpReportsShortfallHonestly ||
