@@ -475,7 +475,7 @@ function propReasoning(r){
   if (f.starterChange?.available && f.starterChange.changed){
     caution.push({ w:8, t:`This week's starter differs from ${r.team||"the team"}'s usual QB (${f.starterChange.usualStarter}, ${f.starterChange.usualStarterGames} starts) — recent form may not carry over.` });
   }
-    // Same bad-weather threshold and run/pass split lib/probability.js's weather nudge actually scores — see
+  // Same bad-weather threshold and run/pass split lib/probability.js's weather nudge actually scores — see
   // isBadWeather/RUN_PROPS/PASS_PROPS there. Personal wet/dry history (the block above) already covers the case
   // where a specific player's own numbers cut against the generic positional read. weather_run_favor is now
   // backtested against real nflverse history too (once a real run had network access to Open-Meteo's historical
@@ -889,16 +889,40 @@ function renderTrackRecord(){
     el.innerHTML = `<div class="track-record empty">No graded picks yet — the results ledger fills in as this week's games finish (picks grade out roughly a day after kickoff). Check back once real games are on the board; a model is only as good as what it's actually checked against.</div>`;
     return;
   }
+  // Per-tier calibration display (lib/calibration.js's fitPlattScalingByTier) — the ACTUALLY APPLIED live
+  // correction is fit on the `all` ledger (the broadest real sample; see lib/pipeline.js), so that's what's
+  // shown here even though this row is inside the `recommended`-scoped block — this is what's really running,
+  // not a separately-computed number that could drift out of sync with it. A below 1 means that tier's raw
+  // estimates have been running hot (overconfident) and this is actively pulling them back down toward what's
+  // actually happened; not-yet-available means that tier hasn't cleared MIN_CALIBRATION_PICKS on its own yet and
+  // is falling back to the pooled global correction in the meantime.
   const tierRow = (ledger, key, label) => {
     const b = ledger.byConfidence[key];
     if (!b || !b.attempts) return "";
-    return `<div class="tr-tier"><span class="tr-tier-label">${label}</span><span>${b.hits}/${b.attempts} hit (${fmtPct(b.hitRate)})</span><span class="tr-dim">avg model est. ${fmtPct(b.avgModelProb)} · brier ${fmtNum(b.brier,3)}</span></div>`;
+    const calib = all?.calibrationByTier?.[key];
+    const calibText = calib?.available
+      ? `· recalibration: A=${fmtNum(calib.A,2)} B=${fmtNum(calib.B,2)} (n=${calib.n})`
+      : `· recalibration: not enough ${label.toLowerCase()} picks yet (n=${calib?.n ?? 0}), using pooled fallback`;
+    return `<div class="tr-tier"><span class="tr-tier-label">${label}</span><span>${b.hits}/${b.attempts} hit (${fmtPct(b.hitRate)})</span><span class="tr-dim">avg model est. ${fmtPct(b.avgModelProb)} · brier ${fmtNum(b.brier,3)} ${calibText}</span></div>`;
+  };
+  // Edge-size breakdown (lib/grading.js's byEdgeBucket) — this was already being computed every refresh and
+  // folded into the ledger, but never actually shown anywhere. It's the single most direct way to check whether
+  // a bigger STATED edge is actually more reliable, independent of the coarser high/medium/low confidence label
+  // (which lib/probability.js's confidenceTier sets from own-evidence SAMPLE SIZE, not from any backtested
+  // accuracy check — a real gap worth being able to see for yourself rather than take on faith).
+  const EDGE_BUCKET_ORDER = ["0-3pt", "3-6pt", "6-10pt", "10-15pt", "15pt+"];
+  const edgeRow = (ledger, key) => {
+    const b = ledger.byEdgeBucket?.[key];
+    if (!b || !b.attempts) return "";
+    return `<div class="tr-tier"><span class="tr-tier-label">${key} real edge</span><span>${b.hits}/${b.attempts} hit (${fmtPct(b.hitRate)})</span><span class="tr-dim">avg model est. ${fmtPct(b.avgModelProb)} · brier ${fmtNum(b.brier,3)}</span></div>`;
   };
   const recommendedBlock = rec?.hasData
     ? `<div class="track-record">
         <div class="tr-headline"><b>${rec.totals.hits}/${rec.totals.attempts}</b> actual recommended picks hit (${fmtPct(rec.totals.hitRate)}) — updated ${new Date(rec.updatedAt).toLocaleString()}</div>
         <div class="tr-tiers">${tierRow(rec,"high","High confidence")}${tierRow(rec,"medium","Medium confidence")}${tierRow(rec,"low","Low confidence")}</div>
-        <div class="tr-note">Only picks that actually cleared the Edge Board's real edge bar — this is the number that answers "is this app worth trusting," not every prop it ever looked at.</div>
+        <div class="tr-note">Only picks that actually cleared the Edge Board's real edge bar — this is the number that answers "is this app worth trusting," not every prop it ever looked at. Each tier now gets its own recalibration fit instead of one pooled correction for everything — see the per-tier note above.</div>
+        <div class="tr-headline tr-dim" style="margin-top:14px;">Hit rate by stated edge size — does a bigger number actually mean more reliable?</div>
+        <div class="tr-tiers">${EDGE_BUCKET_ORDER.map(k => edgeRow(rec, k)).join("")}</div>
       </div>`
     : `<div class="track-record empty">No recommended (Edge Board) picks have graded yet — check back once a full week of real recommendations has played out.</div>`;
   const allBlock = all?.hasData

@@ -11,7 +11,7 @@ import { computeOpposingFrontSevenInjury, computeInjuryEscalations } from "../li
 import { computeTeammateOutTendency, computeFormFactor, computeUsageFactor } from "../lib/factors/playerSplits.js";
 import { computeRefereeFactor, REFEREE_POOL_K } from "../lib/factors/referee.js";
 import { computePlayerRedZoneShare, REDZONE_POOL_K } from "../lib/factors/playerPbp.js";
-import { fitPlattScaling, applyPlattScaling, MIN_CALIBRATION_PICKS, MAX_CALIBRATION_SAMPLE } from "../lib/calibration.js";
+import { fitPlattScaling, applyPlattScaling, fitPlattScalingByTier, applyTieredPlattScaling, MIN_CALIBRATION_PICKS, MAX_CALIBRATION_SAMPLE } from "../lib/calibration.js";
 import { computeNgsPassing, computeNgsRushing, computeNgsReceiving, buildNgsIndex } from "../lib/factors/nextgenstats.js";
 import { computePressureFactor } from "../lib/factors/pressure.js";
 import { computeQbrTrend, buildQbrIndex, QBR_ELITE_THRESHOLD, QBR_POOR_THRESHOLD } from "../lib/factors/qbr.js";
@@ -263,6 +263,36 @@ const cappingWorks = cappingLedger.recentForCalibration.length === MAX_CALIBRATI
 console.log("Ledger's recentForCalibration sample stays capped at MAX_CALIBRATION_SAMPLE via a rolling window, not growing unbounded (should be true):",
   cappingWorks, cappingLedger.recentForCalibration.length);
 
+// recentForCalibrationByTier must fold the SAME picks into their own per-confidence-tier bucket alongside the
+// pooled one, and stay independently capped at MAX_CALIBRATION_SAMPLE per tier — this is what
+// fitPlattScalingByTier below actually fits against, so if this fold is wrong, per-tier calibration silently
+// fits on the wrong (or empty) data.
+const tieredLedger = {};
+foldIntoLedger(tieredLedger, [
+  ...Array.from({ length: 60 }, () => ({ modelProb: 0.7, hit: Math.random() < 0.5, confidence: "high", edge: 0.05 })),
+  ...Array.from({ length: MAX_CALIBRATION_SAMPLE + 20 }, () => ({ modelProb: 0.5, hit: Math.random() < 0.5, confidence: "medium", edge: 0.05 }))
+]);
+const tieredFoldWorks = tieredLedger.recentForCalibrationByTier.high.length === 60 &&
+  tieredLedger.recentForCalibrationByTier.medium.length === MAX_CALIBRATION_SAMPLE &&
+  tieredLedger.recentForCalibrationByTier.low.length === 0 &&
+  tieredLedger.recentForCalibration.length === MAX_CALIBRATION_SAMPLE; // pooled sample stays capped too, same as before
+console.log("recentForCalibrationByTier splits picks into their own confidence-tier bucket and stays independently capped (should be true):",
+  tieredFoldWorks, { high: tieredLedger.recentForCalibrationByTier.high.length, medium: tieredLedger.recentForCalibrationByTier.medium.length, low: tieredLedger.recentForCalibrationByTier.low.length });
+
+// applyTieredPlattScaling must prefer a tier-specific fit when one is available, fall back to the pooled global
+// fit when that tier is too thin, and fall back further to the raw probability when NEITHER is available — the
+// exact three-level fallback lib/pipeline.js relies on to phase per-tier correction in gradually.
+const richTierSamples = { high: overconfidentSample, medium: [], low: [] }; // reuse the systematic-overconfidence sample from above
+const tierFits = fitPlattScalingByTier(richTierSamples);
+const globalFallbackFit = fitPlattScaling(overconfidentSample); // stands in for "the pooled fit" in this test
+const highUsesOwnTier = applyTieredPlattScaling(0.9, "high", tierFits, globalFallbackFit);
+const mediumFallsBackToGlobal = applyTieredPlattScaling(0.9, "medium", tierFits, globalFallbackFit);
+const noFitsAtAllStaysRaw = applyTieredPlattScaling(0.63, "high", { high: { available: false } }, { available: false });
+const tieredFallbackWorks = highUsesOwnTier.source === "tier:high" && mediumFallsBackToGlobal.source === "global" &&
+  noFitsAtAllStaysRaw.source === "none" && noFitsAtAllStaysRaw.calibratedProb === 0.63;
+console.log("Per-tier calibration prefers its own tier's fit, falls back to the pooled fit, then to the raw probability, in that order (should be true):",
+  tieredFallbackWorks, { highUsesOwnTier, mediumFallsBackToGlobal, noFitsAtAllStaysRaw });
+
 // --- Probability model (lib/probability.js) ---
 // Regression guard for the point-score -> real-probability rework: every prop with a usable market number gets
 // a modelProb in [0,1], and trueEdge is exactly modelProb - marketProb, not some other derived quantity.
@@ -292,6 +322,37 @@ const thinSampleStaysNearMarket = thinSampleResult.available && Math.abs(thinSam
 const deepSampleMovesFurther = deepSampleResult.available && deepSampleResult.edge > thinSampleResult.edge;
 console.log("A 2-game hot streak barely moves off the market number and is flagged low-confidence (should be true):", thinSampleStaysNearMarket, thinSampleResult);
 console.log("A real 10+3-game trend moves the estimate further than a 2-game fluke (should be true):", deepSampleMovesFurther, deepSampleResult.edge, thinSampleResult.edge);
+
+// Nudge magnitude cap: several kept coefficients are real but explicitly flagged as "likely shares credit with a
+// correlated factor" (see lib/modelCoeffs.js's own comments on matchup_edge/high_scoring_env/starter_change/
+// secondary_injury/front_seven_injury) — when many of them fire on the same pick, their combined log-odds
+// contribution is capped at NUDGE_CAP=1.5 rather than left to compound unboundedly. Firing every currently-real,
+// same-signed nudge at once on a synthetic factors object should land noticeably short of what an uncapped sum
+// would produce, and modelProb must still land at a sane, non-collapsed number rather than pinned to the edge of
+// the probability range.
+const manyNudgesFactors = {
+  form: { available: true, n_last3: 5, rate_last3: 0.8, n_last10: 10, rate_last10: 0.8, n_vsOpp: 4, rate_vsOpp: 0.8 },
+  usage: { available: true, snapPct: 0.9, targetShare: 0.3 },
+  redZone: { available: true, redZoneShare: 0.5, goalLineShare: 0.5 },
+  matchupEdge: { available: true, edge: 0.1 },
+  scoringEnvironment: { available: true, combinedEpaPerPlay: 0.2 },
+  starterChange: { available: true, changed: true, usualStarter: "Someone Else", usualStarterGames: 10 },
+  schedule: { available: true, shortWeek: true, travelMiles: 2000 }
+};
+const manyNudgesResult = estimatePropProbability(manyNudgesFactors, 0.5);
+const uncappedSumWouldBe = manyNudgesResult.rawNudgeSum;
+const NUDGE_CAP_EXPECTED = 1.5;
+const capActuallyFired = Math.abs(uncappedSumWouldBe) > NUDGE_CAP_EXPECTED;
+const cappedCorrectly = manyNudgesResult.available && capActuallyFired === manyNudgesResult.nudgeCapped &&
+  manyNudgesResult.modelProb > 0.05 && manyNudgesResult.modelProb < 0.98; // sane, not pinned to the extreme edge
+console.log("Stacking every real, same-signed nudge at once reports whether the NUDGE_CAP actually fired, and modelProb stays sane either way (should be true):",
+  cappedCorrectly, { uncappedSumWouldBe, nudgeCapped: manyNudgesResult.nudgeCapped, modelProb: manyNudgesResult.modelProb });
+
+// A single, modest, real nudge case (well under the cap) must be completely unaffected by the cap's existence —
+// the cap should never touch a normal pick, only an unusually large pile-up of correlated factors.
+const oneNudgeResult = estimatePropProbability({ form: { available: true, n_last3: 5, rate_last3: 0.8, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.5);
+const capNeverTouchesNormalPicks = oneNudgeResult.available && oneNudgeResult.nudgeCapped === false;
+console.log("A single modest nudge is never affected by the cap (should be true):", capNeverTouchesNormalPicks, oneNudgeResult.rawNudgeSum);
 
 // --- New factor nudges (lib/probability.js) — unit-tested directly with synthetic factors, since the demo
 // pipeline can't exercise weather (gated `!demo`) or practice trend (injuryHistory stays [] in demo mode). ---

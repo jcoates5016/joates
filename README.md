@@ -162,29 +162,6 @@ the practice-participation trend — whatever actually drove the number), not ju
 Every card still has a "Full breakdown" expander underneath with every computed factor, for anyone who wants the
 raw numbers.
 
-
-### The wasEdgeBoard bug — most of history never got a real recommendation decision
-
-For most of this app's life, `lib/pipeline.js`'s merge logic had a subtle bug: when a previously-seen pick got
-refreshed, `if (existing) p.wasEdgeBoard = existing.wasEdgeBoard;` copied the OLD value forward unconditionally
-— including when that old value was `undefined` because the pick's very first save never set it. Once a pick
-landed in that state it could never self-correct, because every later refresh just copied the same `undefined`
-forward again. Since the Edge Board only ever treats a truthy `wasEdgeBoard` as a real recommendation, an
-`undefined` pick behaved exactly like a correctly-rejected one — except it wasn't necessarily correctly
-rejected at all, it was just never decided.
-
-An audit (`scripts/audit-wasedgeboard.js`) found 531 of 559 graded picks (95%) in this state. Backfilling them
-(`scripts/backfill-wasedgeboard.js`, recomputing wasEdgeBoard from each pick's saved edge/confidence against
-today's minEdgeFor() rule — the one thing this can't recover is teamMismatch/suspect, since those were never
-persisted) turned up 215 additional real historical recommendations, hitting at 35.3%. Combined with the 14
-picks that were always correctly tracked, the honest all-time recommended-only track record is 229 picks,
-83 hits (36.2%) — a real, much larger sample than the 14 this was originally judged on, and a coherent one:
-high confidence (40.3%) now outperforms medium (22.6%), the ordering you'd actually expect.
-
-The underlying bug is fixed (`lib/pipeline.js`'s merge line now only preserves wasEdgeBoard when it's actually
-`true` or `false`, letting it recompute normally otherwise), so this was a one-time backfill, not a recurring
-maintenance task.
-
 ### The `wasEdgeBoard` bug — most of history never got a real recommendation decision
 
 `lib/pipeline.js`'s merge step, on every refresh, used to carry a graded pick's `wasEdgeBoard` flag forward with
@@ -221,6 +198,23 @@ baseline), the same "raise the bar on the specific tier the real data flagged as
 bad as Anytime TD was. This is a reasoned starting point, not itself backtested (no historical `wasEdgeBoard`
 ledger existed before this fix created one) — worth revisiting once more real medium-confidence recommendation
 data accumulates under it.
+
+### Confidence tiers measure sample size, not accuracy — instrumentation laid for re-tiering
+
+`confidenceTier(effectiveN, hasMatchupData)` sets "high" purely from `effectiveN >= 8 && hasMatchupData` and
+"medium" from `effectiveN >= 3` — that's how much trailing sample the model had to work with, never how reliable
+that tier has actually been. A real live check found this mislabeling in action: "high confidence" picks (82
+graded) had a Brier score of 0.290 — worse than a flat uninformative 50/50 guess's 0.25 — meaning the tier calling
+itself most trustworthy had, up to that point, been less reliable than a coin flip. The honest fix is to re-tier
+confidence off real backtested reliability instead of raw sample size, but that can't be done retroactively:
+existing historical picks were never saved with `effectiveN`, so there's no way to go back and check where the
+`effectiveN >= 8` cutoff really should sit. `lib/probability.js` now returns, and `lib/pipeline.js`'s
+`buildGradablePicks` now persists, `effectiveN`, `nudgeCapped`, and `rawNudgeSum` on every newly-saved pick going
+forward — the groundwork for a future pass (once enough new graded data accumulates under this instrumentation)
+that checks whether `effectiveN >= 8` is actually where real reliability jumps, and whether nudge-capped picks
+perform differently from uncapped ones. Until that data exists, treat "high confidence" as "the model had a lot of
+trailing sample to work with," not as a promise about hit rate — the per-tier Platt-scaling recalibration above and
+`scripts/refit-live-ledger.js` are what correct for and measure the gap between the two in the meantime.
 
 ## Probability model — how picks are actually ranked
 
@@ -306,11 +300,11 @@ against real multi-season nflverse history, and overwrites `lib/modelCoeffs.js` 
 to backtest against real historical market lines. Instead it walks forward through each season week by week
 (using only data from weeks strictly before the one being tested — no lookahead) and checks whether a player beat
 his *own trailing average* for that stat, a reasonable stand-in for "the market already prices in a player's
-normal level" but a genuinely easier question than "beat the real closing line." Coefficients with no historical
-feed at all (opponent secondary injuries, opponent front-seven injuries, O-line injuries, a teammate-out usage
-bump, market steam, real cross-book stale-line value, personal weather history — none of which nflverse, ESPN's
-injury feed, or this odds tier publishes historically) are left at hand-set defaults and reported as untested,
-not disproven.
+normal level" but a genuinely easier question than "beat the real closing line." Coefficients with genuinely no
+historical feed at all (market steam, real cross-book stale-line value, personal weather history — none of which
+any source this app uses publishes historically) are left at hand-set defaults and reported as untested, not
+disproven.
+
 **Real historical injury reports now backtest four more factors.** `lib/fetchers/nflverse.js`'s
 `fetchInjuryHistory` pulls nflverse's own real weekly injury-report archive
 (`injuries_<season>.csv` — verified live before coding against it, same discipline every fetcher in that file
@@ -504,7 +498,7 @@ across everything it's ever looked at) — just not the headline number. If "hig
 don't hit more than "medium" or "low" ones do after enough real weeks, the tiers aren't earning their name, and
 that will show up here rather than staying a permanent unknown.
 
-### Platt-scaling recalibration — closing the loop a second time
+### Platt-scaling recalibration — closing the loop a second time, now fit per confidence tier
 
 The results ledger above answers "is any of this actually working." `lib/calibration.js` is what actually DOES
 something with that answer, beyond just displaying it. `lib/probability.js`'s blend can be systematically over-
@@ -518,25 +512,90 @@ anything downstream reads them (Mispriced Bets ranking, parlay tiers, Top Picks,
 — so every consumer sees the same corrected number rather than some seeing raw and others calibrated depending on
 where in the pipeline they happen to read it.
 
+**This now fits a separate correction per confidence tier, not one pooled correction for everything.** A real
+live check found the pooled fit was hiding a serious problem: "high confidence" picks (82 graded, 42.0% hit rate,
+Brier 0.290 — worse than a flat 50/50 guess's 0.25) and "medium confidence" picks (12 graded, 21.8% hit rate) are
+wrong in different ways and by different amounts, so one global `(A, B)` correction was necessarily compromising
+between two different problems instead of fixing either one. `lib/calibration.js`'s `fitPlattScalingByTier(recentForCalibrationByTier)`
+fits `high`/`medium`/`low` independently from `lib/grading.js`'s `foldIntoLedger`, which now buckets every graded
+pick's `(modelProb, hit)` sample into its own tier's array (`ledger.recentForCalibrationByTier.{high,medium,low}`)
+in addition to the existing pooled `recentForCalibration`, each independently FIFO-capped at `MAX_CALIBRATION_SAMPLE`
+(500) the same way the pooled one always was. `applyTieredPlattScaling(rawProb, tier, fitsByTier, fallbackFit)` then
+picks the best available correction for each pick with a 3-level fallback: that pick's own tier's fit if it has
+enough real samples yet (`source: "tier:<tier>"`), else the pooled global fit as a fallback while that tier's own
+sample is still thin (`source: "global"`), else the raw probability completely unchanged if neither has enough data
+yet (`source: "none"`). `lib/pipeline.js` fits both `tierCalibrations` and a `globalCalibration` fallback every
+refresh and applies them this way to every prop row. The Track Record panel's per-tier rows on the dashboard now
+show each tier's own `A`/`B`/`n` (or "not enough picks yet, using pooled fallback") next to its hit rate, so which
+correction is actually live for a given tier is never hidden.
+
 This needs real per-pick `(modelProb, hit)` pairs to fit, which the ledger's existing aggregate buckets
 (`totals`/`byConfidence`/`byEdgeBucket`, all just running sums) structurally can't provide — you can't
-reconstruct a scatter plot from its own mean and count. `ledger.recentForCalibration` is the one deliberate
-exception to "raw counters only, never grows with the number of weeks" (see `lib/store.js`'s own comment on that
-design): a rolling window of the most recent `MAX_CALIBRATION_SAMPLE` (500) graded picks' raw `(modelProb, hit)`
-pairs, FIFO-trimmed so it stays a fixed, small size forever rather than accumulating an entire season's worth.
-Below `MIN_CALIBRATION_PICKS` (50) real graded picks on record, there's no real fit yet and every prop's
-`modelProb` passes through completely unchanged — a 2-parameter fit off a handful of picks is itself unstable
-enough to do more harm than good, so raw is the honest answer until there's a real sample to correct against.
+reconstruct a scatter plot from its own mean and count. `ledger.recentForCalibration`/`recentForCalibrationByTier`
+are the one deliberate exception to "raw counters only, never grows with the number of weeks" (see `lib/store.js`'s
+own comment on that design): rolling windows of the most recent `MAX_CALIBRATION_SAMPLE` (500) graded picks' raw
+`(modelProb, hit)` pairs, FIFO-trimmed so each stays a fixed, small size forever rather than accumulating an
+entire season's worth. Below `MIN_CALIBRATION_PICKS` (50) real graded picks on record for a given fit, there's no
+real correction from it yet — a 2-parameter fit off a handful of picks is itself unstable enough to do more harm
+than good, so the fallback chain above is what keeps a thin tier from either going uncorrected or getting a wild
+correction off too few points.
 
-Two details keep this from becoming its own source of drift. First, the ledger always fits and folds against the
-RAW, pre-calibration `modelProb` (`rawModelProb`, threaded through from `lib/pipeline.js`'s `buildGradablePicks`),
-never the already-calibrated display value — fitting a correction on top of an already-corrected number would
-compound it refresh over refresh instead of measuring the raw model's actual calibration. Second, each refresh
-applies whatever fit already existed BEFORE folding in that same refresh's newly-graded results, so a pick's own
-just-graded outcome never leaks into the very fit used to score it. The aggregate `totals`/`byConfidence`/
-`byEdgeBucket` aggregate buckets described above still track the CALIBRATED number, deliberately — those exist to
-answer "how did what Jon actually saw and could act on perform," a different question from "is the raw model
-itself calibrated."
+Two details keep this from becoming its own source of drift. First, every fit — pooled and per-tier — always fits
+and folds against the RAW, pre-calibration `modelProb` (`rawModelProb`, threaded through from `lib/pipeline.js`'s
+`buildGradablePicks`), never the already-calibrated display value — fitting a correction on top of an already-
+corrected number would compound it refresh over refresh instead of measuring the raw model's actual calibration.
+Second, each refresh applies whatever fits already existed BEFORE folding in that same refresh's newly-graded
+results, so a pick's own just-graded outcome never leaks into the very fit used to score it. The aggregate
+`totals`/`byConfidence`/`byEdgeBucket` aggregate buckets described above still track the CALIBRATED number,
+deliberately — those exist to answer "how did what Jon actually saw and could act on perform," a different
+question from "is the raw model itself calibrated."
+
+### Nudge-magnitude cap — stopping correlated factors from compounding into false confidence
+
+Several kept coefficients in `lib/modelCoeffs.js` are explicitly commented as sharing credit with a correlated
+factor in the joint fit (`matchup_edge`, `high_scoring_env`, `starter_change`, `secondary_injury`,
+`front_seven_injury`, `weather_run_favor`, `game_script_run_favor`) — they tend to co-fire on the same real pick
+(the same game script, the same bad-weather game, the same injury-thinned unit), and before this change nothing
+stopped 5-6 of them firing together and stacking additively in log-odds space into a confidence level none of them
+individually earned. `lib/probability.js` now sums every nudge's contribution separately (`nudgeSum`) instead of
+applying each one to the running logit immediately, then clamps that total to `NUDGE_CAP = 1.5` log-odds (roughly
+±18 percentage points of probability swing at a 50% baseline) before applying it — generous enough that a normal,
+mostly-independent combination (hot form + high snap share + red-zone role, none of them flagged as correlated)
+sums to around 0.72 and passes through completely untouched, but it stops a pile of correlated same-direction
+factors from pushing a pick's confidence further than the evidence actually supports. Every scored prop now reports
+`nudgeCapped` (whether the cap actually fired on that pick) and `rawNudgeSum` (what the uncapped total would have
+been), both persisted on every saved pick via `buildGradablePicks` for future analysis — `NUDGE_CAP = 1.5` is a
+reasoned starting point, not itself backtested yet; re-run `node scripts/refit-live-ledger.js` (below) periodically
+once enough capped vs. uncapped picks have graded to check whether it's set correctly.
+
+### Refitting against the real live ledger — closing the objective-mismatch gap
+
+`scripts/backtest.js` (above) is a genuinely real, multi-season backtest, but it's built on a proxy target forced
+by a real data limitation: SportsGameOdds' Rookie tier has no historical odds archive, so there's no way to
+backtest against real historical market lines. It measures "did the player beat his own trailing average" — a
+different, EASIER question than "did this beat the market," which is what the live results ledger actually judges
+every week. A factor can genuinely predict a player beating his own recent average while adding zero real edge
+over the market, because the market may already have priced that exact trend in — until now, every coefficient in
+`lib/modelCoeffs.js` had only ever been tested against the easier question.
+
+`scripts/refit-live-ledger.js` (`npm run refit-ledger`, needs `NETLIFY_SITE_ID`/`NETLIFY_BLOBS_TOKEN` in the
+environment) closes that gap using data that didn't exist when `backtest.js` was built: this app's own live
+history of every saved weekly pick (`lib/store.js`'s `loadWeeklyPicks`, enumerable via
+`history.list({ prefix: "picks-" })`), each one carrying its real market probability, real model probability,
+which nudges actually fired (`firedFactors`), and the real graded outcome. It reuses the exact same joint logistic
+fit + Wald significance test `scripts/backtest.js`'s own joint fit uses
+(`lib/regularizedFit.js`'s `fitJointLogisticWithWaldTest`), with one feature per candidate factor (did it fire on
+this pick, 0/1) plus one continuous feature for the market's own `logit(marketProb)` — so every factor's
+coefficient is estimated GIVEN the market's price is already in the model, meaning a "significant" result there
+means real incremental edge over the market's own price, not just correlation with the outcome the market's price
+already explains a lot of. It also prints a plain modelProb-decile-vs-real-hit-rate table, the most direct
+"is the stated number honest" check there is. Read-only — it only prints a report, it never edits
+`lib/modelCoeffs.js` itself. Its own header is explicit about the honest limitation here: the live ledger is still
+young, so with ~20 candidate factors most or all coefficients will likely not clear real significance yet on any
+single run — that's not a bug in the method, it's an honest reflection of how little real graded data exists so
+far. Treat it as a growing diagnostic to re-run every few weeks as more real games grade, not a one-time verdict,
+and don't hand-edit `lib/modelCoeffs.js` off a single run of it the way `scripts/backtest.js`'s multi-season,
+tens-of-thousands-of-rows fit can be trusted more readily.
 
 ### Closing-line value (CLV)
 
@@ -1173,6 +1232,9 @@ scripts/
   refresh.js       runs the real pipeline (used by the GitHub Actions workflow)
   dry-run.js       runs the pipeline against synthetic demo data with a self-check (no keys needed)
   backtest.js      measures each contextual factor against real multi-season history, updates modelCoeffs.js
+  refit-live-ledger.js   read-only: tests every factor against the real live results ledger's "beat the market"
+                   outcomes instead of backtest.js's "beat own trailing average" proxy (see "Refitting against
+                   the real live ledger" above) — `npm run refit-ledger`, needs NETLIFY_SITE_ID/NETLIFY_BLOBS_TOKEN
 public/index.html  the entire frontend
 ```
 
