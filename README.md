@@ -111,7 +111,16 @@ bad data.
 
 It's **safe by default** — run it with no flags and it only prints what it would keep/drop and the resulting
 rebuilt all-time hit rate, without writing anything. Add `--apply` to actually rewrite the stored data and rebuild
-`calibration-ledger.json` from the survivors, once the dry-run numbers look right:
+`calibration-ledger.json` from the survivors, once the dry-run numbers look right. The rebuild produces BOTH
+ledgers described in "The results ledger" above — the full "everything evaluated" one and, nested under it, a
+`.recommended` one folded only from surviving picks where `wasEdgeBoard` was true — so the Track Record panel's
+"recommended" number has real history to show immediately after deploying, rather than starting from zero.
+
+There's a companion, also-read-only diagnostic — `scripts/diagnose-accuracy.js` — for going one level deeper once
+you're past "is this just live-line noise": it breaks the surviving picks down by prop type, confidence tier,
+edge size, and modelProb decile, and separates "everything the app ever evaluated" from "what was actually
+flagged as an Edge Board recommendation" (the same `wasEdgeBoard` split as above). Run it the same way, no flags
+needed (it never writes anything). This is what surfaced the Anytime TD problem described below.
 
 ```
 NETLIFY_SITE_ID=... NETLIFY_BLOBS_TOKEN=... node scripts/clean-live-line-contamination.js
@@ -123,6 +132,29 @@ Netlify's site settings, `NETLIFY_BLOBS_TOKEN` is a personal access token (reuse
 make a fresh one in Netlify's user settings just for this one run). Since `--apply` permanently rewrites the live
 results ledger, always read the dry-run output first — it lists exactly which picks/parlays would be dropped and
 why, plus the rebuilt hit rate broken down by confidence tier.
+
+A third read-only diagnostic, `scripts/analyze-yesterday.js [YYYY-MM-DD] [stake]`, looks at one specific day's
+games: which actual Edge Board recommendations hit, what the app's own saved parlay attempts did, and — as a
+hindsight "what if" number only — what combining every recommended pick that hit into one parlay would have
+paid. A fourth, `scripts/reverse-engineer-yesterday.js [YYYY-MM-DD]`, is the full-universe version of that same
+day (every graded prop, Anytime TD included, not just recommendations), broken down by prop type, confidence,
+edge size, and both the model's and the market's own probability deciles.
+
+### Recording which factors actually fired on each pick (`firedFactors`)
+
+Until this was added, the results ledger recorded WHETHER a pick hit but never WHICH of `lib/probability.js`'s
+real nudges (red-zone share, matchup edge, weather, etc.) were actually behind its number — meaning no amount of
+real graded history piling up could ever answer "do picks where `redzone_share` fired actually hit more than
+ones where it didn't." `buildGradablePicks` (`lib/pipeline.js`) now saves `firedFactors`: just the coefficient
+keys that fired for that specific pick (e.g. `["form_hot", "redzone_share"]`), not the full label/weight — the
+weight each key carried at the time is always recoverable from `lib/modelCoeffs.js`'s `MODEL_COEFFS`, so keeping
+this small was preferred over duplicating that. Captured once, at the same moment as `pickPrice`/`pickBook`, and
+preserved the same "never overwritten by a later refresh" way (a later refresh's factor set — fresh injury news,
+an updated forecast — isn't what the model saw when this pick was actually flagged). Any pick saved before this
+field existed has no `firedFactors` on it; a real per-factor hit-rate breakdown against LIVE results (as opposed
+to `scripts/backtest.js`'s "beat your own trailing average" historical proxy) only becomes possible for picks
+saved after this shipped, and needs a real number of graded weeks before it says anything trustworthy — the same
+"don't draw conclusions from one day" caveat that applies everywhere else in this README.
 
 The frontend leads with an **Edge Board**: a ranked feed of the sharpest player-prop edges, each with a
 plain-English paragraph explaining *why* it's an edge (the matchup, the usage, the form, the weather, the venue,
@@ -363,11 +395,24 @@ also checks whether last week's (or this week's early) picks have finished — a
 nflverse's stat file has actually posted — and grades them hit/miss against the real final stat. Graded picks
 fold into an all-time calibration ledger, bucketed by confidence tier and by edge size, tracking hit rate and
 Brier score (mean squared error between the stated probability and the outcome — lower is better calibrated;
-0.25 is what an uninformative flat 50% guess scores). The Edge Board's track-record panel reads this ledger
-directly. It starts empty on a fresh deploy — that's correct, not a bug, since it takes real games finishing
-before there's anything to grade — and is the only honest answer to "is any of this actually working": if
-"high confidence" picks don't hit more than "medium" or "low" ones do after a few real weeks, the tiers aren't
-earning their name, and that will show up here rather than staying a permanent unknown.
+0.25 is what an uninformative flat 50% guess scores). It starts empty on a fresh deploy — that's correct, not a
+bug, since it takes real games finishing before there's anything to grade.
+
+**Two separate ledgers, not one blended number.** `buildGradablePicks` saves EVERY prop the model can score, for
+ledger/history completeness — not just the ones that actually cleared the real edge bar. Early on, the Track
+Record panel folded ALL of those into one all-time number, which made the model look far worse than it actually
+was: the vast majority of what's tracked was never flagged as a real recommendation in the first place (a real
+live check found only ~3% of everything ever evaluated had actually cleared the Edge Board bar), so blending that
+enormous "background" pool in with the real recommendations buried the number that actually matters. `lib/
+pipeline.js` now folds newly-graded picks into TWO buckets in the same `calibration-ledger.json` — the existing
+one (`calibrationLedger`, unchanged, everything) and a nested `calibrationLedger.recommended` (only picks where
+`wasEdgeBoard` was true) — and `trackRecord` is `{ all, recommended }`, both run through `summarizeLedger`
+independently. The frontend leads with `recommended`: that's the one that answers "is this app worth trusting,"
+since it's the only one built from picks the app actually told anyone to bet. `all` is still shown underneath,
+clearly labeled, since it's real information too (mainly: is the model's probability output calibrated at all,
+across everything it's ever looked at) — just not the headline number. If "high confidence" recommended picks
+don't hit more than "medium" or "low" ones do after enough real weeks, the tiers aren't earning their name, and
+that will show up here rather than staying a permanent unknown.
 
 ### Platt-scaling recalibration — closing the loop a second time
 
@@ -430,6 +475,24 @@ first, and reports a simple hits/total tally. This answers "of what this board a
 last week, what hit" — not "of whatever still looks like an edge today," which is a different and much easier
 question to get a good-looking answer to. Shown on the Edge Board tab, right under the existing calibration
 track-record panel; empty on a fresh deploy for the same honest reason that panel is.
+
+### Anytime TD needs a much bigger edge
+
+A real live diagnostic (`scripts/diagnose-accuracy.js`, run against the real results ledger right after the
+live-line cleanup below) found Anytime TD props hitting at 13.5% real, against the model's own already-modest
+18.8% average confidence on them — by a wide margin the single worst-performing prop type, and, on that same
+data pull, over half of everything the app had ever evaluated. The reason is structural, not a bug: a touchdown
+is a bursty, low-frequency event, and a player's last-10-game TD rate is mostly noise — a couple of recent scores
+reads to the model like a real trend when it usually isn't. `lib/pipeline.js`'s `minEdgeFor(propType)` (module
+scope, right below `MIN_TRUE_EDGE`) is the fix: every prop type needs `MIN_TRUE_EDGE` (3 points) of real edge to
+count as a recommendation EXCEPT Anytime TD, which needs `MIN_TRUE_EDGE_TD` (15 points) — five times the bar.
+Anytime TD still shows up everywhere (Player Props tab, browsable, tracked in the "all" ledger above) and still
+CAN become a real Edge Board recommendation if the evidence is genuinely overwhelming; it just needs to clear a
+much higher wall to get there. `lib/topPicks.js` keeps its own copy of the same two constants and the same
+`minEdgeFor` logic (it's imported BY `pipeline.js`, so it can't import the threshold back) — keep both in sync if
+either ever changes. Parlay legs (`lib/parlays.js`) aren't affected directly by this constant (they gate on a
+flat `modelProb >= 55%` floor instead of `trueEdge`), but Anytime TD's real, low average modelProb (~19%) already
+puts it nowhere near that floor in practice, so no separate parlay-side change was needed.
 
 ### Prop Bets history and parlay tracking
 

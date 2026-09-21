@@ -40,7 +40,7 @@
 //   NETLIFY_SITE_ID=... NETLIFY_BLOBS_TOKEN=... node scripts/clean-live-line-contamination.js
 //   NETLIFY_SITE_ID=... NETLIFY_BLOBS_TOKEN=... node scripts/clean-live-line-contamination.js --apply
 import { getStore } from "@netlify/blobs";
-import { foldIntoLedger } from "../lib/grading.js";
+import { foldIntoLedger, summarizeLedger } from "../lib/grading.js";
 
 const APPLY = process.argv.includes("--apply");
 
@@ -120,17 +120,36 @@ async function main() {
   survivingGradedPicks.sort((a, b) => new Date(a.kickoff) - new Date(b.kickoff));
   const rebuiltLedger = {};
   foldIntoLedger(rebuiltLedger, survivingGradedPicks);
-  const t = rebuiltLedger.totals;
-  const hitRate = t.attempts ? (t.hits / t.attempts) : null;
+  // Same "recommended vs everything" split lib/pipeline.js's trackRecord now keeps live (see its own comment) —
+  // nested under `.recommended` in the same object so a rebuild here matches that same shape exactly. Without
+  // this, the very next deploy's Track Record panel would show a real "all props" number but an empty
+  // "recommended" one, even though real recommended history already exists in what's being kept here.
+  const recommendedPicks = survivingGradedPicks.filter(p => p.wasEdgeBoard);
+  if (recommendedPicks.length) {
+    rebuiltLedger.recommended = {};
+    foldIntoLedger(rebuiltLedger.recommended, recommendedPicks);
+  }
+  // foldIntoLedger's own buckets are raw running sums (attempts/hits/sumModelProb/brierSum/...) — hitRate and
+  // brier only get computed from those sums by summarizeLedger's finalizeBucket. Reading rebuiltLedger.totals
+  // directly here (as an earlier version of this script did) silently prints undefined/NaN for both, even
+  // though the underlying hits/attempts counts are correct.
+  const summary = summarizeLedger(rebuiltLedger);
+  const t = summary.totals;
+  const recSummary = summarizeLedger(rebuiltLedger.recommended || {});
 
   console.log(`\n=== Summary ===`);
   console.log(`Picks:   kept ${totalPicksKept}, dropped ${totalPicksDropped}`);
   console.log(`Parlays: kept ${totalParlaysKept}, dropped ${totalParlaysDropped}`);
-  console.log(`Rebuilt all-time record on surviving pregame-only picks: ${t.hits}/${t.attempts} hit` +
-    (hitRate != null ? ` (${(hitRate * 100).toFixed(1)}%)` : "") + `, brier ${t.brier ?? "n/a"}`);
+  console.log(`Rebuilt all-time record on surviving pregame-only picks (EVERY prop evaluated, not just recommendations): ${t.hits}/${t.attempts} hit` +
+    (t.hitRate != null ? ` (${(t.hitRate * 100).toFixed(1)}%)` : "") + `, brier ${t.brier ?? "n/a"}`);
   for (const tier of ["high", "medium", "low"]) {
-    const b = rebuiltLedger.byConfidence?.[tier];
+    const b = summary.byConfidence?.[tier];
     if (b?.attempts) console.log(`  ${tier} confidence: ${b.hits}/${b.attempts} (${(b.hitRate * 100).toFixed(1)}%)`);
+  }
+  if (recSummary.hasData) {
+    console.log(`Of those, actual Edge Board recommendations only: ${recSummary.totals.hits}/${recSummary.totals.attempts} hit (${(recSummary.totals.hitRate * 100).toFixed(1)}%) — this is the number that actually answers "is this app worth trusting."`);
+  } else {
+    console.log(`No surviving picks were ever flagged as an actual Edge Board recommendation (wasEdgeBoard) — the Track Record panel's "recommended" section will start from zero after this.`);
   }
 
   if (APPLY) {
