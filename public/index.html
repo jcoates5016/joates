@@ -152,6 +152,12 @@
   .pick-blurb{margin:12px 0 0;font-size:13.5px;line-height:1.55;color:#d6d6da;}
   .pick-empty{color:var(--dim);font-size:13px;padding:14px 0;}
 
+  /* Sharp Signals */
+  .sharp-grade .n{font-family:ui-monospace,"SF Mono","SFMono-Regular",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;font-size:18px;font-weight:700;letter-spacing:-.01em;}
+  .sharp-grade .n.up{color:var(--mint);} .sharp-grade .n.down{color:var(--red);}
+  .sharp-meta{color:var(--dim2);font-size:12px;margin-top:8px;}
+  .sharp-books{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;}
+
   @media (max-width:640px){
     .ec-top{flex-direction:column;}
     .ec-edge{font-size:20px;}
@@ -175,6 +181,7 @@
 
   <nav>
     <button class="active" data-view="picks">Top Picks</button>
+    <button data-view="sharp">Sharp Signals</button>
     <button data-view="edge">Edge Board</button>
     <button data-view="watch">Injury Watch</button>
     <button data-view="props">Player Props</button>
@@ -190,6 +197,12 @@
       <select id="picksGameFilter"><option value="">All games — top pick per category</option></select>
     </div>
     <div id="topPicksPanel"></div>
+  </section>
+
+  <!-- SHARP SIGNALS -->
+  <section class="view" id="view-sharp">
+    <div class="picks-intro">Real cross-book price movement — every tracked sportsbook's own open-vs-current price on this week's props, checked for which ones agree. This is line movement, not confirmed bet-percentage data (this app has no source for who's actually betting what) — read it as "the market itself moved on this," not "sharp money confirmed." Only props where at least half the reporting books agree on direction are shown.</div>
+    <div id="sharpSignalsPanel"></div>
   </section>
 
   <!-- EDGE BOARD -->
@@ -682,6 +695,7 @@ function render(){
 
   renderGameFilterOptions();
   renderTopPicks();
+  renderSharpSignals();
   renderInjuryWatch();
   renderTrackRecord();
   renderEdgeBoardHistory();
@@ -850,6 +864,40 @@ function renderTopPicks(){
   `).join("");
 }
 document.getElementById("picksGameFilter").addEventListener("input", renderTopPicks);
+
+// Sharp Signals: real cross-book price movement (lib/sharpSignals.js's buildSharpSignals, off
+// lib/factors/market.js's computeSharpMoneySignal). Everything here is a re-ranking/re-presentation of numbers
+// already computed server-side — same honesty rule as everywhere else: the label text is generated straight off
+// the real per-book breadth/magnitude numbers, never phrased as more than "the market moved."
+function sharpSignalCardHTML(s){
+  const market = s.line != null ? `${esc(s.propLabel)} ${esc(s.side||'')} ${s.line}` : esc(s.propLabel);
+  const book = s.bestBook ? `<span class="pill ${s.bestBook}">${BOOKS[s.bestBook].short}</span> <span class="odds">${fmtOdds(s.bestPrice)}</span>` : "";
+  const dirClass = s.direction > 0 ? "up" : "down";
+  const dirArrow = s.direction > 0 ? "▲" : "▼";
+  const booksHtml = (s.booksMoved || []).map(b => BOOKS[b] ? `<span class="pill ${b}">${BOOKS[b].short}</span>` : "").join("");
+  return `<div class="pick-card">
+    <div class="pick-top">
+      <div>
+        <div class="pick-player">${esc(s.player)}</div>
+        <div class="pick-sub">${esc(s.team||'')} vs ${esc(s.opponent||'—')} · ${market}${book ? ` · ${book}` : ''}${s.kickoff ? ` · ${esc(fmtKickoff(s.kickoff))}` : ''}</div>
+      </div>
+      <div class="pick-grade sharp-grade">
+        <div class="n ${dirClass}">${dirArrow} ${s.sharpScore.toFixed(2)}</div>
+        <div class="l">${Math.round(s.breadth*100)}% of ${s.booksWithData} books</div>
+      </div>
+    </div>
+    <p class="pick-blurb">${esc(s.label)}</p>
+    <div class="sharp-meta">Model ${fmtPct(s.modelProb)} vs. market ${fmtPct(s.marketProb)} (+${fmtPct(s.edge)} edge) · ${esc(s.confidence)} confidence</div>
+    ${booksHtml ? `<div class="sharp-books">${booksHtml}</div>` : ""}
+  </div>`;
+}
+function renderSharpSignals(){
+  const el = document.getElementById("sharpSignalsPanel");
+  const signals = snapshot.sharpSignals?.signals || [];
+  el.innerHTML = signals.length
+    ? `<div class="pick-grid">${signals.map(sharpSignalCardHTML).join("")}</div>`
+    : `<div class="empty">No real cross-book consensus movement this week — nothing wrong, most weeks most props just sit still.</div>`;
+}
 
 // Injury Watch: lib/factors/injury.js's computeInjuryEscalations — every player whose EARLIEST status seen this
 // week was Questionable but whose status as of this refresh has worsened to Doubtful or Out. A separate tab per

@@ -22,6 +22,8 @@ import { fetchNFLEvents } from "../lib/fetchers/odds.js";
 import { classifyKickoffWindow, summarizeEvents, buildAllParlays, buildSameGameParlays, buildSlateParlays, RISK_TIERS, MIN_LEG_PROBABILITY, MEGA_TARGET_DECIMAL, MEGA_MIN_LEGS, NUKE_LEGS } from "../lib/parlays.js";
 import { americanToDecimal } from "../lib/oddsMath.js";
 import { buildTopPicks, pickTopReasons, pickBlurb, PICK_CATEGORIES } from "../lib/topPicks.js";
+import { buildSharpSignals } from "../lib/sharpSignals.js";
+import { computeSharpMoneySignal } from "../lib/factors/market.js";
 
 const SEASON = 2026;
 
@@ -46,7 +48,7 @@ snapshot.logs.forEach(l => console.log(l.msg));
 const factorKeys = Object.keys(snapshot.propRows[0].factors || {});
 const expected = ["form", "tendency", "venue", "weatherHistorical", "weatherForecast", "birthday",
   "usage", "redZone", "twoMinute", "defense", "matchupEdge", "scoringEnvironment", "secondaryInjury", "schedule",
-  "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "staleLineValue", "situationalNote",
+  "starterChange", "selfInjury", "oLineInjury", "practiceTrend", "marketMovement", "sharpMoney", "staleLineValue", "situationalNote",
   "referee", "ngsPassing", "ngsRushing", "ngsReceiving", "pressure", "qbr"];
 const missing = expected.filter(k => !factorKeys.includes(k));
 
@@ -429,16 +431,100 @@ const practiceTrendWorks = trendDown.modelProb < baseline && trendUp.modelProb >
 console.log("Practice-trend nudge scores direction (worsening penalizes, improving helps, flat does nothing) (should be true):", practiceTrendWorks,
   { baseline, down: trendDown.modelProb, up: trendUp.modelProb, flat: trendFlat.modelProb });
 
-// Market steam: scaled by magnitude now, not a flat bump for any move at all — a bigger shortening must move the
-// estimate further than a small one, and the scaling must actually cap out (not blow up) on an extreme move.
-const steamSmall = estimatePropProbability({ marketMovement: { available: true, priceMove: -5 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
-const steamBig = estimatePropProbability({ marketMovement: { available: true, priceMove: -20 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
-const steamExtreme = estimatePropProbability({ marketMovement: { available: true, priceMove: -400 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
-const steamCapMatch = estimatePropProbability({ marketMovement: { available: true, priceMove: -40 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+// Market steam is now a real cross-book signal (f.sharpMoney, from lib/factors/market.js's
+// computeSharpMoneySignal) instead of one book's raw price move — see that module's own header comment for what
+// it can/can't detect. probability.js trusts sharpScore as already-normalized/capped input (the cap itself lives
+// in computeSharpMoneySignal, tested directly below), so this level just checks: bigger sharpScore moves the
+// estimate further, a real signed direction of -1 (consensus moving AWAY from this side) now actually LOWERS the
+// estimate (the old single-book version silently ignored this case entirely and only ever nudged up), and
+// direction 0 (real data, no real movement) does nothing.
+const steamSmall = estimatePropProbability({ sharpMoney: { available: true, direction: 1, sharpScore: 0.25 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const steamBig = estimatePropProbability({ sharpMoney: { available: true, direction: 1, sharpScore: 1 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const steamAway = estimatePropProbability({ sharpMoney: { available: true, direction: -1, sharpScore: 1 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
+const steamNone = estimatePropProbability({ sharpMoney: { available: true, direction: 0, sharpScore: 0 }, form: { available: true, n_last10: 5, rate_last10: 0.5, n_vsOpp: 0, rate_vsOpp: 0 } }, 0.55);
 const steamMagnitudeScalingWorks = steamSmall.modelProb > baseline && steamBig.modelProb > steamSmall.modelProb &&
-  Math.abs(steamExtreme.modelProb - steamCapMatch.modelProb) < 0.0001; // both past the 2x cap -> identical result
-console.log("Market steam is scaled by magnitude and caps out rather than blowing up on an extreme move (should be true):", steamMagnitudeScalingWorks,
-  { baseline, small: steamSmall.modelProb, big: steamBig.modelProb, extreme: steamExtreme.modelProb, capMatch: steamCapMatch.modelProb });
+  steamAway.modelProb < baseline && Math.abs(steamNone.modelProb - baseline) < 0.0001;
+console.log("Cross-book sharp-money signal scales with magnitude, and a real move AWAY from this side now actually lowers the estimate instead of being ignored (should be true):",
+  steamMagnitudeScalingWorks, { baseline, small: steamSmall.modelProb, big: steamBig.modelProb, away: steamAway.modelProb, none: steamNone.modelProb });
+
+// computeSharpMoneySignal itself, straight off fabricated per-book open/current price pairs (the shape
+// row.allBookMovement actually has) — this is where the real breadth/magnitude/cap logic lives, so it needs its
+// own direct tests rather than only being exercised indirectly through estimatePropProbability above.
+const sharpConsensus = computeSharpMoneySignal({
+  draftkings: { openPrice: -110, currentPrice: -140 }, fanduel: { openPrice: -108, currentPrice: -135 },
+  betmgm: { openPrice: -112, currentPrice: -138 }, caesars: { openPrice: -110, currentPrice: -115 } // one laggard (only 5c), still same direction and still past the noise floor
+}, "odd1", {}, "2026-09-21T17:00:00Z");
+const sharpConsensusWorks = sharpConsensus.available && sharpConsensus.direction === 1 && sharpConsensus.breadth === 1 &&
+  sharpConsensus.sharpScore > 0 && /toward this side/.test(sharpConsensus.label);
+console.log("4 books all shortening the same side reads as a real, full-breadth consensus signal (should be true):", sharpConsensusWorks, sharpConsensus);
+
+// 3 of 4 books shorten (toward), 1 lengthens the other way (away) — the majority should still determine direction
+// even with one real book disagreeing, and breadth should honestly reflect only 3 of 4 agreeing, not all 4.
+const sharpMinority = computeSharpMoneySignal({
+  draftkings: { openPrice: -110, currentPrice: -95 }, // lengthened -> away
+  fanduel: { openPrice: -108, currentPrice: -135 }, betmgm: { openPrice: -112, currentPrice: -128 }, caesars: { openPrice: -110, currentPrice: -122 } // all three shortened -> toward
+}, "odd2", {}, "2026-09-21T17:00:00Z");
+const sharpMinorityWorks = sharpMinority.available && sharpMinority.direction === 1 && Math.abs(sharpMinority.breadth - 0.75) < 0.0001;
+console.log("3 of 4 books agreeing correctly sets the direction even with one real book moving the other way, and breadth reflects the true 3-of-4 split (should be true):", sharpMinorityWorks, sharpMinority);
+
+const sharpNoise = computeSharpMoneySignal({
+  draftkings: { openPrice: -110, currentPrice: -111 }, fanduel: { openPrice: -108, currentPrice: -107 }, betmgm: { openPrice: -112, currentPrice: -113 }
+}, "odd3", {}, "2026-09-21T17:00:00Z");
+const sharpNoiseWorks = sharpNoise.available && sharpNoise.direction === 0 && sharpNoise.sharpScore === 0;
+console.log("Real per-book data that's all within the noise floor reports a real zero, not a fake signal (should be true):", sharpNoiseWorks, sharpNoise);
+
+const sharpTooFewBooks = computeSharpMoneySignal({ draftkings: { openPrice: -110, currentPrice: -140 }, fanduel: { openPrice: -108, currentPrice: -135 } }, "odd4", {}, "2026-09-21T17:00:00Z");
+const sharpTooFewBooksWorks = sharpTooFewBooks.available === false && sharpTooFewBooks.booksWithData === 2;
+console.log("Fewer than 3 books with real data honestly reports unavailable rather than a thin fake 'consensus' (should be true):", sharpTooFewBooksWorks, sharpTooFewBooks);
+
+// Extreme per-book moves cap out (SHARP_MAGNITUDE_CAP=2) instead of letting one outlier book's huge move blow up
+// the whole panel's consensus magnitude — three books all moving an extreme amount should land at exactly the
+// same capped sharpScore a merely-big move lands at once every book involved is already past its own cap.
+const sharpExtreme = computeSharpMoneySignal({
+  draftkings: { openPrice: -110, currentPrice: -900 }, fanduel: { openPrice: -108, currentPrice: -950 }, betmgm: { openPrice: -112, currentPrice: -880 }
+}, "odd5", {}, "2026-09-21T17:00:00Z");
+const sharpExtremeWorks = sharpExtreme.available && sharpExtreme.direction === 1 && sharpExtreme.consensusMagnitude === 2 && sharpExtreme.sharpScore === 2;
+console.log("Three books all moving an extreme amount caps at the same ceiling rather than blowing up (should be true):", sharpExtremeWorks, sharpExtreme);
+
+// Velocity: the same total move, but concentrated in the final stretch before kickoff vs. spread evenly across
+// the week, should score a real recency bump vs. a neutral/discounted read — using this app's own price-history
+// snapshot shape ({ t, price }), not the API's single open/current pair.
+const lateBurstHistory = { "odd6|draftkings": [
+  { t: "2026-09-18T00:00:00Z", price: -110 }, { t: "2026-09-20T00:00:00Z", price: -111 },
+  { t: "2026-09-21T12:00:00Z", price: -112 }, { t: "2026-09-21T23:00:00Z", price: -140 }
+] };
+const evenDriftHistory = { "odd7|draftkings": [
+  { t: "2026-09-18T00:00:00Z", price: -110 }, { t: "2026-09-19T12:00:00Z", price: -117 },
+  { t: "2026-09-20T12:00:00Z", price: -124 }, { t: "2026-09-21T23:00:00Z", price: -140 }
+] };
+const sharpLateBurst = computeSharpMoneySignal({ draftkings: { openPrice: -110, currentPrice: -140 }, fanduel: { openPrice: -108, currentPrice: -135 }, betmgm: { openPrice: -112, currentPrice: -138 } },
+  "odd6", lateBurstHistory, "2026-09-22T00:00:00Z");
+const sharpEvenDrift = computeSharpMoneySignal({ draftkings: { openPrice: -110, currentPrice: -140 }, fanduel: { openPrice: -108, currentPrice: -135 }, betmgm: { openPrice: -112, currentPrice: -138 } },
+  "odd7", evenDriftHistory, "2026-09-22T00:00:00Z");
+const velocityWorks = sharpLateBurst.velocityMultiplier > sharpEvenDrift.velocityMultiplier && sharpLateBurst.sharpScore > sharpEvenDrift.sharpScore;
+console.log("The same consensus move reads sharper when it's concentrated right before kickoff than when it drifted evenly across the week (should be true):",
+  velocityWorks, { lateBurstVelocity: sharpLateBurst.velocityMultiplier, evenDriftVelocity: sharpEvenDrift.velocityMultiplier, lateBurstScore: sharpLateBurst.sharpScore, evenDriftScore: sharpEvenDrift.sharpScore });
+
+// buildSharpSignals (lib/sharpSignals.js): only surfaces real, broad (>=50% breadth) consensus moves, ranked
+// strongest first, and leaves a too-thin/no-consensus/unavailable row out entirely rather than padding the list.
+const sharpSignalFixtureRows = [
+  { oddID: "s1", player: "Strong Consensus", team: "KC", opponentDisp: "BUF", propType: "rec_yds", propLabel: "Receiving Yards", line: 60.5, kickoff: "2026-09-22T17:00:00Z",
+    model: { available: true }, modelProb: 0.6, marketProb: 0.5, trueEdge: 0.1, confidence: "high", teamMismatch: false, suspect: false,
+    factors: { sharpMoney: sharpConsensus } },
+  { oddID: "s2", player: "Thin Minority", team: "SF", opponentDisp: "DAL", propType: "rush_yds", propLabel: "Rushing Yards", line: 50.5, kickoff: "2026-09-22T17:00:00Z",
+    model: { available: true }, modelProb: 0.55, marketProb: 0.5, trueEdge: 0.05, confidence: "medium", teamMismatch: false, suspect: false,
+    factors: { sharpMoney: { available: true, direction: 1, breadth: 0.34, consensusMagnitude: 1.5, velocityMultiplier: 1, sharpScore: 0.5, booksMoved: ["draftkings"], booksWithData: 3, label: "below the 50% breadth bar" } } },
+  { oddID: "s3", player: "No Signal", team: "MIA", opponentDisp: "NYJ", propType: "pass_yds", propLabel: "Passing Yards", line: 245.5, kickoff: "2026-09-22T17:00:00Z",
+    model: { available: true }, modelProb: 0.52, marketProb: 0.5, trueEdge: 0.02, confidence: "medium", teamMismatch: false, suspect: false,
+    factors: { sharpMoney: sharpNoise } },
+  { oddID: "s4", player: "Suspect Row", team: "GB", opponentDisp: "CHI", propType: "td", propLabel: "Anytime TD", line: null, kickoff: "2026-09-22T17:00:00Z",
+    model: { available: true }, modelProb: 0.4, marketProb: 0.25, trueEdge: 0.15, confidence: "high", teamMismatch: false, suspect: true,
+    factors: { sharpMoney: sharpExtreme } }
+];
+const sharpSignalsResult = buildSharpSignals(sharpSignalFixtureRows);
+const sharpSignalsWorks = sharpSignalsResult.signals.length === 1 && sharpSignalsResult.signals[0].oddID === "s1";
+console.log("Sharp Signals only surfaces the real, broad-consensus row — excludes the below-breadth-bar, no-signal, and suspect-flagged rows (should be true):",
+  sharpSignalsWorks, sharpSignalsResult.signals.map(s => s.oddID));
 
 // Real cross-book stale-line value (lib/analyze.js's computeBestAcrossBooks -> f.staleLineValue) now actually
 // moves modelProb instead of just decorating a badge on the Mispriced Bets tab — same magnitude-scaling and
@@ -1355,7 +1441,9 @@ if (anyMismatch || !anyRealFactor || missing.length || !anyRedZone || !anyDefens
   !topPicksBasicsWork || !emptyCategoryHandledCleanly || !negativeContributorExcludedAndRankedByWeight || !fallbackFillsToMinimum || !blurbIsWellFormed ||
   !teammateTendencyGatesOnCurrentStatus || !tradeFilterWorks || !thinSampleFallsBackToFullHistory || !escalationWatchWorksCorrectly || !emptyEscalationsOnNoHistory ||
   !refereeFactorWorks || !ngsFactorsWork || !pressureFactorWorks || !qbrFactorWorks || !regularizedFitSaneOnSyntheticData || !redZoneCohortPoolingWorks ||
-  !fallbackToRawWorks || !overconfidenceCorrectionWorks || !noSpuriousCorrectionWorks || !cappingWorks) {
+  !fallbackToRawWorks || !overconfidenceCorrectionWorks || !noSpuriousCorrectionWorks || !cappingWorks ||
+  !tieredFoldWorks || !tieredFallbackWorks || !cappedCorrectly || !capNeverTouchesNormalPicks ||
+  !sharpConsensusWorks || !sharpMinorityWorks || !sharpNoiseWorks || !sharpTooFewBooksWorks || !sharpExtremeWorks || !velocityWorks || !sharpSignalsWorks) {
   console.log("\nFAILED — see above.");
   process.exit(1);
 } else {

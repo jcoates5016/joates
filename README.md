@@ -250,8 +250,9 @@ only moves away from it when there's real, sized evidence to justify the move:
    - **Practice-participation trend** — scores the *direction* of a player's practice-report trend across the
      week (worsening from Full → Limited → DNP penalizes, improving the other way helps), not just whether he's
      listed at all.
-   - **Market steam** — magnitude-scaled now, not a flat boolean: a price that's moved 20 cents gets a bigger
-     nudge than one that's moved 2 cents, capped so a single huge move can't dominate every other signal.
+   - **Market steam** — a real cross-book signal now (`lib/factors/market.js`'s `computeSharpMoneySignal`), not
+     one representative book's own price move. See "Sharp Signals" below for the full detection method and the
+     new dashboard tab built on the same computation.
    - **Opposing front-seven injury** — the run-game mirror of the secondary-injury nudge below: how many of the
      opponent's own DL/LB-family players (`lib/factors/injury.js`'s `FRONT_SEVEN_POSITIONS` — DE/DT/NT/DL/LB/
      ILB/OLB/EDGE) are out or doubtful, applied to that opponent's rushing props. Same deliberately generic
@@ -703,6 +704,41 @@ padding with something invented — every reason on a Top Pick card is either a 
 the edge, then the chosen reasons woven into one sentence, plus an optional third sentence only when the sample
 behind the pick is thin enough to be worth flagging. A category with nothing that clears the bar this week shows
 its own honest empty state rather than being hidden or padded out with a weaker pick just to fill five slots.
+
+### Sharp Signals — real cross-book line movement, not confirmed "sharp money"
+
+A new dashboard tab (`lib/sharpSignals.js`) scanning the whole slate — not per-player, not per-category — for
+props showing real, broad price movement across the tracked book panel. Worth being precise about what this is
+and isn't: SportsGameOdds gives real prices and real line movement, not bet-percentage or handle data, so this app
+has no way to know which side the public is actually betting. "Sharp money" in the classic reverse-line-movement
+sense (the line moving against the public's bet %) isn't something this can detect, and the tab's own copy says so
+plainly — it's labeled as line movement, never as confirmed sharp action.
+
+What it CAN detect, honestly, from real data: `lib/factors/market.js`'s `computeSharpMoneySignal` looks at every
+tracked book's own real open-vs-current price (the odds API's own `openOdds` field, via `lib/analyze.js`'s
+`collectMovement` — already fetched every refresh for all 7 books, previously collapsed down to one representative
+book by a now-removed `summarizeMovement` and never actually read anywhere downstream). For each book with a real
+price pair, a move smaller than 3 cents is treated as noise, not signal; of the books that moved for real, whichever
+direction has the majority becomes the call, and breadth is the honest fraction of the full panel that agrees (a
+2-of-7 move never gets treated as "the market moved," and the Sharp Signals tab only shows props where at least
+half the reporting panel agrees). The consensus books' average move size (capped at 2x a 20-cent reference unit,
+same discipline as every other capped nudge in this app) becomes the magnitude. A bonus multiplier — bounded to
+[0.85x, 1.45x] — checks this app's own weekly price-history snapshots for whichever consensus books have enough of
+them yet, to tell a move concentrated in the final stretch before kickoff from one that drifted evenly across the
+week; with too few of the app's own snapshots yet, this defaults to a neutral 1.0x rather than guessing. The three
+multiply into one `sharpScore`, and every card's label is generated straight off these real numbers (e.g. "3 of 4
+tracked books moved toward this side, averaging 28¢, mostly in the final stretch before kickoff").
+
+**This is also what now feeds the `steam_move` nudge in `lib/probability.js`**, replacing what used to be one
+book's own `f.marketMovement` read. Two real fixes came with the upgrade, not just more books: the old version only
+ever nudged the estimate UP (a price shortening), silently ignoring a real consensus move in the other direction;
+the new version is properly signed, so a real market move away from a side now correctly lowers `modelProb` instead
+of being dropped on the floor. Same honest limitation as before — there's no historical multi-book odds-movement
+archive to backtest this against, so it's still hand-set/unvalidated at the coefficient level (`lib/modelCoeffs.js`'s
+`steam_move` value is unchanged) — but because it still fires into `firedFactors` under that same key,
+`scripts/refit-live-ledger.js` (see "Refitting against the real live ledger" above) will automatically start
+checking whether the richer cross-book version actually beats the market once enough real graded picks carry it,
+with no changes needed to that script.
 
 ### Per-game filter
 
@@ -1218,6 +1254,7 @@ lib/
                    (plus-money-and-55%+ value) parlay builder — cross-game, Same Game Parlays, and the two
                    Sunday slate windows (see "Parlays" above)
   topPicks.js      Top Picks tab: top-5-per-category ranking, reason selection, and write-up (see "Top Picks" above)
+  sharpSignals.js  Sharp Signals tab: ranks real cross-book line movement (see "Sharp Signals" above)
   pipeline.js      orchestrates one full refresh end to end
   doRefresh.js     wires env vars into runPipeline, saves the resulting snapshot
   store.js         Netlify Blobs wrapper (snapshot, notes, injury/price history, weekly picks, weekly parlays,
